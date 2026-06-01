@@ -29,6 +29,10 @@ export class BaseCronometerProvider implements CronometerProvider {
     return this.result("cronometer_capabilities", "ok", capabilitiesForMode(this.mode));
   }
 
+  async readFeaturePage(feature: string, hash: string, input: unknown): Promise<ProviderResult> {
+    return this.unsupported(feature, { hash, input });
+  }
+
   async getDailySummary(input: DateRangeInput): Promise<ProviderResult> {
     return this.unsupported("get_daily_summary", input);
   }

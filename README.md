@@ -118,6 +118,7 @@ The existing lowercase `email` and `password` keys are supported only for local 
 ## Current tool map
 
 - `cronometer_capabilities`
+- `read_cronometer_page`
 - `get_daily_summary`
 - `list_food_entries`
 - `list_biometrics`

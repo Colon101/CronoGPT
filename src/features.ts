@@ -11,6 +11,14 @@ interface FeatureDefinition {
 
 export const FEATURE_DEFINITIONS: FeatureDefinition[] = [
   {
+    id: "read_cronometer_page",
+    group: "capabilities",
+    title: "Read Cronometer page",
+    preferredBackend: "browser",
+    supportedModes: ["mock"],
+    notes: "Generic browser fallback that returns visible text from major Cronometer pages.",
+  },
+  {
     id: "get_daily_summary",
     group: "diary",
     title: "Read daily nutrition summary",
@@ -364,15 +372,63 @@ export const FEATURE_DEFINITIONS: FeatureDefinition[] = [
   },
 ];
 
+const BROWSER_FEATURE_STATUS: Record<string, ProviderStatus> = {
+  read_cronometer_page: "ok",
+  get_daily_summary: "ok",
+  list_food_entries: "ok",
+  list_exercises: "ok",
+  list_biometrics: "ok",
+  list_notes: "ok",
+  search_foods: "ok",
+  resolve_recipe_ingredients: "ok",
+  log_food: "ok",
+  log_exercise: "needs_manual_step",
+  log_biometric: "needs_manual_step",
+  log_note: "needs_manual_step",
+  create_custom_food: "needs_manual_step",
+  list_custom_foods: "ok",
+  create_custom_meal: "needs_manual_step",
+  list_custom_meals: "ok",
+  list_custom_recipes: "ok",
+  create_recipe: "needs_manual_step",
+  get_targets: "ok",
+  get_profile: "ok",
+  set_profile: "needs_manual_step",
+  set_targets: "needs_manual_step",
+  export_data: "ok",
+  get_charts: "ok",
+  get_nutrition_report: "ok",
+  get_print_report: "ok",
+  list_snapshots: "ok",
+  create_snapshot: "needs_manual_step",
+  start_fast: "needs_manual_step",
+  stop_fast: "needs_manual_step",
+  schedule_repeat_item: "needs_manual_step",
+  list_repeat_items: "ok",
+  ask_oracle: "needs_manual_step",
+  suggest_food: "needs_manual_step",
+  get_macro_scheduler: "ok",
+  set_macro_scheduler: "needs_manual_step",
+  get_display_settings: "ok",
+  set_display_settings: "needs_manual_step",
+  list_devices: "ok",
+  connect_device: "needs_manual_step",
+  get_sharing: "ok",
+  set_sharing: "needs_manual_step",
+  get_account: "ok",
+  bulk_delete_entries: "unsupported",
+  delete_account: "unsupported",
+};
+
 export function capabilitiesForMode(mode: BackendMode): Capability[] {
   return FEATURE_DEFINITIONS.map((feature) => {
-    const status: ProviderStatus = feature.supportedModes.includes(mode)
+    const status: ProviderStatus = mode === "browser"
+      ? (BROWSER_FEATURE_STATUS[feature.id] ?? "needs_manual_step")
+      : feature.supportedModes.includes(mode)
       ? mode === "mock"
         ? "dry_run"
         : "ok"
-      : mode === "browser"
-        ? "needs_manual_step"
-        : "unsupported";
+      : "unsupported";
 
     return {
       id: feature.id,

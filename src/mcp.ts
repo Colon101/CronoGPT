@@ -130,6 +130,37 @@ export function createCronoServer() {
     );
   };
 
+  const registerReadPageTool = (
+    name: string,
+    title: string,
+    description: string,
+    inputSchema: Record<string, z.ZodTypeAny>,
+    hash: string,
+  ) => {
+    register(name, title, description, inputSchema, { readOnlyHint: true, openWorldHint: true }, async (args) =>
+      toMcpToolResponse(await provider.readFeaturePage(name, hash, args)),
+    );
+  };
+
+  const cronometerPageHashes: Record<string, string> = {
+    diary: "#diary",
+    customFoods: "#custom-foods",
+    customMeals: "#custom-meals",
+    customRecipes: "#custom-recipes",
+    targetsProfile: "#profile",
+    charts: "#charts",
+    nutritionReport: "#nutrition-report",
+    printReport: "#print-report",
+    snapshots: "#snapshots",
+    fasting: "#fasting",
+    repeatItems: "#repeat-items",
+    macroScheduler: "#macro-scheduler",
+    displaySettings: "#display-settings",
+    devices: "#devices",
+    sharing: "#sharing",
+    account: "#account",
+  };
+
   register(
     "cronometer_capabilities",
     "Show Cronometer capabilities",
@@ -137,6 +168,39 @@ export function createCronoServer() {
     emptyInputSchema,
     { readOnlyHint: true, openWorldHint: false },
     async () => toMcpToolResponse(await provider.capabilities()),
+  );
+
+  register(
+    "read_cronometer_page",
+    "Read Cronometer page",
+    "Reads visible text from a major Cronometer page as a fallback when a specialized parser is not enough.",
+    {
+      section: z.enum([
+        "diary",
+        "customFoods",
+        "customMeals",
+        "customRecipes",
+        "targetsProfile",
+        "charts",
+        "nutritionReport",
+        "printReport",
+        "snapshots",
+        "fasting",
+        "repeatItems",
+        "macroScheduler",
+        "displaySettings",
+        "devices",
+        "sharing",
+        "account",
+      ]),
+      ...dateRangeInputSchema,
+      hint: z.string().optional(),
+    },
+    { readOnlyHint: true, openWorldHint: true },
+    async (args) => {
+      const section = String(args.section);
+      return toMcpToolResponse(await provider.readFeaturePage("read_cronometer_page", cronometerPageHashes[section] ?? "#diary", args));
+    },
   );
 
   register(
@@ -306,13 +370,12 @@ export function createCronoServer() {
     async (args) => toMcpToolResponse(await provider.createCustomFood(args as never)),
   );
 
-  registerFrameworkTool(
+  registerReadPageTool(
     "list_custom_foods",
     "List custom foods",
     "Lists Cronometer Foods > Custom Foods.",
     emptyInputSchema,
-    { readOnlyHint: true, openWorldHint: true },
-    "Custom Foods exists in the live UI; browser read selectors still need verification.",
+    "#custom-foods",
   );
 
   registerFrameworkTool(
@@ -335,22 +398,20 @@ export function createCronoServer() {
     "Custom Meals exists in the live Cronometer UI, but the browser write flow still needs selector verification.",
   );
 
-  registerFrameworkTool(
+  registerReadPageTool(
     "list_custom_meals",
     "List custom meals",
     "Lists Cronometer Foods > Custom Meals.",
     emptyInputSchema,
-    { readOnlyHint: true, openWorldHint: true },
-    "Custom Meals exists in the live UI; browser read selectors still need verification.",
+    "#custom-meals",
   );
 
-  registerFrameworkTool(
+  registerReadPageTool(
     "list_custom_recipes",
     "List custom recipes",
     "Lists Cronometer Foods > Custom Recipes.",
     emptyInputSchema,
-    { readOnlyHint: true, openWorldHint: true },
-    "Custom Recipes exists in the live UI; browser read selectors still need verification.",
+    "#custom-recipes",
   );
 
   register(
@@ -385,13 +446,12 @@ export function createCronoServer() {
     async (args) => toMcpToolResponse(await provider.getTargets(args)),
   );
 
-  registerFrameworkTool(
+  registerReadPageTool(
     "get_profile",
     "Get profile",
     "Reads Cronometer Targets + Profile settings.",
     emptyInputSchema,
-    { readOnlyHint: true, openWorldHint: true },
-    "Targets + Profile exists in the live Cronometer UI; browser read selectors still need verification.",
+    "#profile",
   );
 
   registerFrameworkTool(
@@ -431,40 +491,36 @@ export function createCronoServer() {
     async (args) => toMcpToolResponse(await provider.exportData(args as never)),
   );
 
-  registerFrameworkTool(
+  registerReadPageTool(
     "get_charts",
     "Get charts",
     "Reads Cronometer Trends > Charts configuration or chart data.",
     { ...dateRangeInputSchema, chart: z.string().optional() },
-    { readOnlyHint: true, openWorldHint: true },
-    "Charts exists in the live UI; browser read selectors still need verification.",
+    "#charts",
   );
 
-  registerFrameworkTool(
+  registerReadPageTool(
     "get_nutrition_report",
     "Get nutrition report",
     "Reads Cronometer Trends > Nutrition Report for a date range.",
     dateRangeInputSchema,
-    { readOnlyHint: true, openWorldHint: true },
-    "Nutrition Report exists in the live UI; browser read selectors still need verification.",
+    "#nutrition-report",
   );
 
-  registerFrameworkTool(
+  registerReadPageTool(
     "get_print_report",
     "Get print report",
     "Prepares Cronometer Trends > Print Report for a date range.",
     dateRangeInputSchema,
-    { readOnlyHint: true, openWorldHint: true },
-    "Print Report exists in the live UI; browser export selectors still need verification.",
+    "#print-report",
   );
 
-  registerFrameworkTool(
+  registerReadPageTool(
     "list_snapshots",
     "List snapshots",
     "Lists Cronometer Trends > Snapshots.",
     emptyInputSchema,
-    { readOnlyHint: true, openWorldHint: true },
-    "Snapshots exists in the live UI; browser read selectors still need verification.",
+    "#snapshots",
   );
 
   registerFrameworkTool(
@@ -520,13 +576,12 @@ export function createCronoServer() {
     async (args) => toMcpToolResponse(await provider.scheduleRepeatItem(args as never)),
   );
 
-  registerFrameworkTool(
+  registerReadPageTool(
     "list_repeat_items",
     "List repeat items",
     "Lists Cronometer Foods > Repeat Items.",
     emptyInputSchema,
-    { readOnlyHint: true, openWorldHint: true },
-    "Repeat Items exists in the live UI; browser read selectors still need verification.",
+    "#repeat-items",
   );
 
   registerFrameworkTool(
@@ -547,13 +602,12 @@ export function createCronoServer() {
     "Suggest Food exists in the live UI; submission flow must be verified before enabling.",
   );
 
-  registerFrameworkTool(
+  registerReadPageTool(
     "get_macro_scheduler",
     "Get macro scheduler",
     "Reads Cronometer More > Macro Scheduler.",
     emptyInputSchema,
-    { readOnlyHint: true, openWorldHint: true },
-    "Macro Scheduler exists in the live UI; browser read selectors still need verification.",
+    "#macro-scheduler",
   );
 
   registerFrameworkTool(
@@ -565,13 +619,12 @@ export function createCronoServer() {
     "Macro Scheduler writes are browser-only in this scaffold and must be confirmed before enabling.",
   );
 
-  registerFrameworkTool(
+  registerReadPageTool(
     "get_display_settings",
     "Get display settings",
     "Reads Cronometer More > Display Settings.",
     emptyInputSchema,
-    { readOnlyHint: true, openWorldHint: true },
-    "Display Settings exists in the live UI; browser read selectors still need verification.",
+    "#display-settings",
   );
 
   registerFrameworkTool(
@@ -583,13 +636,12 @@ export function createCronoServer() {
     "Display setting writes are browser-only in this scaffold and must be confirmed before enabling.",
   );
 
-  registerFrameworkTool(
+  registerReadPageTool(
     "list_devices",
     "List devices",
     "Lists Cronometer More > Sync a Device integrations.",
     emptyInputSchema,
-    { readOnlyHint: true, openWorldHint: true },
-    "Sync a Device exists in the live UI and exposes CONNECT actions.",
+    "#devices",
   );
 
   registerFrameworkTool(
@@ -601,13 +653,12 @@ export function createCronoServer() {
     "Device connection opens third-party auth flows; this must stay user-confirmed.",
   );
 
-  registerFrameworkTool(
+  registerReadPageTool(
     "get_sharing",
     "Get sharing",
     "Reads Cronometer More > Sharing settings.",
     emptyInputSchema,
-    { readOnlyHint: true, openWorldHint: true },
-    "Sharing exists in the live UI; browser read selectors still need verification.",
+    "#sharing",
   );
 
   registerFrameworkTool(
@@ -619,13 +670,12 @@ export function createCronoServer() {
     "Sharing writes affect access to health data and must stay explicitly confirmed.",
   );
 
-  registerFrameworkTool(
+  registerReadPageTool(
     "get_account",
     "Get account",
     "Reads non-secret Cronometer account settings.",
     emptyInputSchema,
-    { readOnlyHint: true, openWorldHint: true },
-    "Your Account exists in the live UI; do not expose secrets or payment details to the model.",
+    "#account",
   );
 
   registerFrameworkTool(

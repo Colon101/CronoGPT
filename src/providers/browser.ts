@@ -55,17 +55,14 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   async capabilities(): Promise<ProviderResult<Capability[]>> {
     const browserConfigured = Boolean(this.hasRunnableBrowser() && this.config.email && this.config.password);
-    const capabilities = capabilitiesForMode("mock").map((capability) => {
+    const capabilities = capabilitiesForMode("browser").map((capability) => {
       if (capability.preferredBackend === "manual") {
         return { ...capability, currentBackendStatus: "unsupported" as const };
       }
-      if (capability.preferredBackend === "terra" || capability.preferredBackend === "csv") {
-        return { ...capability, currentBackendStatus: "needs_manual_step" as const };
+      if (!browserConfigured && capability.currentBackendStatus !== "unsupported") {
+        return { ...capability, currentBackendStatus: "not_configured" as const };
       }
-      return {
-        ...capability,
-        currentBackendStatus: browserConfigured ? ("ok" as const) : ("not_configured" as const),
-      };
+      return capability;
     });
 
     return this.result(
@@ -74,6 +71,10 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       capabilities,
       browserConfigured ? undefined : "Set Cronometer credentials and either enable serverless Chromium or provide REMOTE_CHROME_WS_ENDPOINT.",
     );
+  }
+
+  async readFeaturePage(feature: string, hash: string, input: unknown) {
+    return this.readPage(feature, hash, input);
   }
 
   async getDailySummary(input: DateRangeInput) {
