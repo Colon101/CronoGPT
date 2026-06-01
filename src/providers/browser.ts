@@ -92,10 +92,31 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       lastLoginFailure,
       guidance: [
         "Use dryRun=true for validation and previews; dry-run write tools do not open Cronometer.",
+        "Call refresh_cronometer_session before a long browser workflow to warm and verify the current hosted session.",
         "Use resolve_recipe_ingredients with a low limitPerIngredient and maxSeconds for large recipes.",
         "If loginPaused is true, wait or provide durable storage state/remote browser before retrying browser actions.",
         "For the most reliable hosted writes, configure a persistent remote browser or CRONOMETER_STORAGE_STATE_BASE64.",
       ],
+    });
+  }
+
+  async refreshSession(): Promise<ProviderResult> {
+    return this.withPage("refresh_cronometer_session", async (page) => {
+      await this.openApp(page, "#diary");
+      const state = await page.context().storageState();
+      cachedStorageState = state;
+      const visibleText = await this.visibleText(page).catch(() => "");
+      return this.result("refresh_cronometer_session", "ok", {
+        loggedIn: await this.isLoggedIn(page, visibleText),
+        warmStorageStateCached: true,
+        storageStateCookieCount: state.cookies.length,
+        storageStateOriginCount: state.origins.length,
+        visibleSignals: {
+          hasDiary: /\bDiary\b/i.test(visibleText),
+          hasFoods: /\bFoods\b/i.test(visibleText),
+          hasDashboard: /\bDashboard\b/i.test(visibleText),
+        },
+      });
     });
   }
 

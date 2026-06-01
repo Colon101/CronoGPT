@@ -36,6 +36,10 @@ export class BaseCronometerProvider implements CronometerProvider {
     });
   }
 
+  async refreshSession(): Promise<ProviderResult> {
+    return this.unsupported("refresh_cronometer_session");
+  }
+
   async readFeaturePage(feature: string, hash: string, input: unknown): Promise<ProviderResult> {
     return this.unsupported(feature, { hash, input });
   }

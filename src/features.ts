@@ -19,6 +19,14 @@ export const FEATURE_DEFINITIONS: FeatureDefinition[] = [
     notes: "Reports backend configuration, write mode, browser session state, and login cooldown without opening Cronometer.",
   },
   {
+    id: "refresh_cronometer_session",
+    group: "capabilities",
+    title: "Refresh Cronometer browser session",
+    preferredBackend: "browser",
+    supportedModes: ["mock"],
+    notes: "Opens Cronometer once to verify login and warm the hosted browser storage cache without writing diary data.",
+  },
+  {
     id: "read_cronometer_page",
     group: "capabilities",
     title: "Read Cronometer page",
@@ -382,6 +390,7 @@ export const FEATURE_DEFINITIONS: FeatureDefinition[] = [
 
 const BROWSER_FEATURE_STATUS: Record<string, ProviderStatus> = {
   cronometer_runtime_status: "ok",
+  refresh_cronometer_session: "ok",
   read_cronometer_page: "ok",
   get_daily_summary: "ok",
   list_food_entries: "ok",

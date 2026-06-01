@@ -180,6 +180,15 @@ export function createCronoServer() {
   );
 
   register(
+    "refresh_cronometer_session",
+    "Refresh Cronometer browser session",
+    "Opens Cronometer once to verify login and warm the hosted browser storage cache. Does not write diary data.",
+    emptyInputSchema,
+    { readOnlyHint: true, openWorldHint: true },
+    async () => toMcpToolResponse(await provider.refreshSession()),
+  );
+
+  register(
     "read_cronometer_page",
     "Read Cronometer page",
     "Reads visible text from a major Cronometer page as a fallback when a specialized parser is not enough.",

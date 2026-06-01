@@ -75,6 +75,16 @@ CRONOMETER_LOGIN_BACKOFF_MS=900000
 
 Food logs write directly when `CRONOMETER_ENABLE_WRITES=true` unless the tool call sets `dryRun=true`. Set `CRONOMETER_REQUIRE_FOOD_CONFIRMATION=true` to restore the older second-step confirmation behavior. Other write tools still require `dryRun=false` and `confirmed=true`. Dry-run write previews return without opening Cronometer, so recipe/custom-food validation does not burn browser login attempts. Set `CRONOMETER_ENABLE_WRITES=false` for read-only dry-run mode.
 
+To create a durable Cronometer session for Vercel, run this locally after confirming `.env` has the Cronometer credentials:
+
+```bash
+npm run storage:cronometer
+vercel env add CRONOMETER_STORAGE_STATE_BASE64 production < .cronometer-storage-state.base64
+vercel deploy --prod
+```
+
+The generator writes `.cronometer-storage-state.json` and `.cronometer-storage-state.base64` with mode `0600`; both are ignored by git. Set `HEADLESS=false` if Cronometer requires an interactive verification step. The MCP tool `refresh_cronometer_session` can warm and verify the hosted session without writing diary data, but it is not a substitute for durable storage on cold Vercel instances.
+
 For more reliable read data, add Terra:
 
 ```text
@@ -119,6 +129,7 @@ The existing lowercase `email` and `password` keys are supported only for local 
 
 - `cronometer_capabilities`
 - `cronometer_runtime_status`
+- `refresh_cronometer_session`
 - `read_cronometer_page`
 - `get_daily_summary`
 - `list_food_entries`

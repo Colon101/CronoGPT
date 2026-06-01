@@ -28,6 +28,20 @@ Other write tools require `CRONOMETER_ENABLE_WRITES=true` plus both call argumen
 { "dryRun": false, "confirmed": true }
 ```
 
+## Durable Cronometer session
+
+Vercel serverless instances are cold-started and should not be trusted to keep Cronometer login state forever. Prefer either a persistent remote browser endpoint or a generated Playwright storage state:
+
+```bash
+npm run storage:cronometer
+vercel env add CRONOMETER_STORAGE_STATE_BASE64 production < .cronometer-storage-state.base64
+vercel deploy --prod
+```
+
+The storage-state files are gitignored and should not be pasted into chat or committed. If Cronometer requires a browser verification step, rerun with `HEADLESS=false`.
+
+Use `cronometer_runtime_status` to inspect whether production has durable storage configured, and `refresh_cronometer_session` to warm the current hosted instance before a long browser workflow.
+
 ## Optional read API
 
 If you add Terra, read tools can use a supported API path instead of scraping the web UI:

@@ -155,6 +155,7 @@ export interface CronometerProvider {
   readonly mode: BackendMode;
   capabilities(): Promise<ProviderResult<Capability[]>>;
   runtimeStatus(): Promise<ProviderResult>;
+  refreshSession(): Promise<ProviderResult>;
   readFeaturePage(feature: string, hash: string, input: unknown): Promise<ProviderResult>;
   getDailySummary(input: DateRangeInput): Promise<ProviderResult>;
   listFoodEntries(input: DateRangeInput): Promise<ProviderResult>;
