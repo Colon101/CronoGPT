@@ -240,7 +240,7 @@ export function createCronoServer() {
   register(
     "log_food",
     "Log food",
-    "Adds a food to the Cronometer diary. Requires user confirmation before real writes.",
+    "Adds a food to the Cronometer diary. For explicit food-log requests, writes directly when server writes are enabled. Use dryRun=true only for previews or ambiguity.",
     {
       date: z.string().optional(),
       meal: z.string().optional(),
@@ -250,7 +250,6 @@ export function createCronoServer() {
       unit: z.string().optional(),
       timestamp: z.string().optional(),
       dryRun: z.boolean().optional(),
-      confirmed: z.boolean().optional(),
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     async (args) => toMcpToolResponse(await provider.logFood(args as never)),

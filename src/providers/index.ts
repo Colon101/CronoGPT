@@ -37,6 +37,7 @@ export function createProviderFromEnv(): CronometerProvider {
       storageState: env("CRONOMETER_STORAGE_STATE_BASE64") ?? env("CRONOMETER_STORAGE_STATE"),
       serverlessChromium: env("CRONOMETER_SERVERLESS_CHROMIUM") !== "false",
       writeEnabled: env("CRONOMETER_ENABLE_WRITES") === "true",
+      requireFoodConfirmation: env("CRONOMETER_REQUIRE_FOOD_CONFIRMATION") === "true",
       navigationTimeoutMs: Number(env("CRONOMETER_NAVIGATION_TIMEOUT_MS") ?? 20000),
       loginBackoffMs: Number(env("CRONOMETER_LOGIN_BACKOFF_MS") ?? 15 * 60 * 1000),
     });

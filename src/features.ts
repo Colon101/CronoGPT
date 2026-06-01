@@ -88,7 +88,7 @@ export const FEATURE_DEFINITIONS: FeatureDefinition[] = [
     title: "Log food",
     preferredBackend: "browser",
     supportedModes: ["mock"],
-    notes: "Write action. Requires confirmation and browser automation or partner API access.",
+    notes: "Write action. Food logs write directly when server writes are enabled; use dryRun=true for previews or ambiguity.",
   },
   {
     id: "log_exercise",

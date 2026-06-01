@@ -25,6 +25,7 @@ export interface BrowserConfig {
   storageState?: string;
   serverlessChromium: boolean;
   writeEnabled: boolean;
+  requireFoodConfirmation: boolean;
   navigationTimeoutMs: number;
   loginBackoffMs: number;
 }
@@ -115,11 +116,27 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   async logFood(input: FoodLogInput & { confirmed?: boolean }) {
     return this.withPage("log_food", async (page) => {
       const preview = await this.searchFoodUi(page, input.query, 5);
-      if (input.dryRun !== false || !input.confirmed || !this.config.writeEnabled) {
+      const shouldWrite =
+        this.config.writeEnabled &&
+        input.dryRun !== true &&
+        input.confirmed !== false &&
+        (!this.config.requireFoodConfirmation || input.confirmed === true);
+
+      if (!shouldWrite) {
+        const reason = !this.config.writeEnabled
+          ? "Cronometer writes are disabled on the server."
+          : input.dryRun === true
+            ? "Dry-run preview requested."
+            : input.confirmed === false
+              ? "The request explicitly declined confirmation."
+              : "Food log confirmation is required by CRONOMETER_REQUIRE_FOOD_CONFIRMATION.";
         return this.result("log_food", "dry_run", {
           input: safeInput(input),
           preview,
-          nextStep: "Call again with dryRun=false and confirmed=true after the user confirms the exact food, amount, unit, date, and meal.",
+          reason,
+          nextStep: this.config.writeEnabled
+            ? "Call again without dryRun=true to write the explicit food log."
+            : "Set CRONOMETER_ENABLE_WRITES=true to allow Cronometer diary writes.",
         });
       }
 
