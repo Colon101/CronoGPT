@@ -48,6 +48,23 @@ interface BrowserSession {
   page: Page;
 }
 
+interface ParsedStorageState {
+  cookies: Array<{
+    name: string;
+    value: string;
+    domain: string;
+    path: string;
+    expires: number;
+    httpOnly: boolean;
+    secure: boolean;
+    sameSite: "Strict" | "Lax" | "None";
+  }>;
+  origins: Array<{
+    origin: string;
+    localStorage: Array<{ name: string; value: string }>;
+  }>;
+}
+
 const CRONOMETER_ORIGIN = "https://cronometer.com";
 const CRONOMETER_PAGE_HASHES = {
   diary: "#diary",
@@ -67,12 +84,21 @@ const CRONOMETER_PAGE_HASHES = {
   sharing: "#sharing",
   account: "#account",
 } as const;
-let cachedStorageState: unknown;
+let cachedStorageState: ParsedStorageState | undefined;
 let loginBackoffUntil = 0;
 let lastLoginFailure: string | undefined;
 let browserQueue: Promise<void> = Promise.resolve();
 let activeBrowserJobs = 0;
 let queuedBrowserJobs = 0;
+
+interface StorageStateInfo {
+  configured: boolean;
+  usable: boolean;
+  source: "warm-cache" | "env" | "none" | "invalid";
+  cookieCount?: number;
+  originCount?: number;
+  state?: ParsedStorageState;
+}
 
 export class BrowserCronometerProvider extends BaseCronometerProvider {
   constructor(private readonly config: BrowserConfig) {
@@ -102,6 +128,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   async runtimeStatus(): Promise<ProviderResult> {
     const now = Date.now();
     const loginPaused = now < loginBackoffUntil;
+    const storageStateInfo = this.storageStateInfo();
     return this.result("cronometer_runtime_status", "ok", {
       provider: this.name,
       mode: this.mode,
@@ -110,6 +137,10 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       hasRemoteBrowser: Boolean(this.config.remoteWsEndpoint),
       serverlessChromium: this.config.serverlessChromium,
       storageStateConfigured: Boolean(this.config.storageState),
+      storageStateUsable: storageStateInfo.usable,
+      storageStateSource: storageStateInfo.source,
+      storageStateCookieCount: storageStateInfo.cookieCount,
+      storageStateOriginCount: storageStateInfo.originCount,
       warmStorageStateCached: Boolean(cachedStorageState),
       writeEnabled: this.config.writeEnabled,
       requireFoodConfirmation: this.config.requireFoodConfirmation,
@@ -798,17 +829,49 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     return Boolean(this.config.remoteWsEndpoint || this.config.serverlessChromium);
   }
 
-  private storageState() {
-    if (cachedStorageState) return cachedStorageState;
-    if (!this.config.storageState) return undefined;
+  private storageState(): ParsedStorageState | undefined {
+    return this.storageStateInfo().state;
+  }
+
+  private storageStateInfo(): StorageStateInfo {
+    if (cachedStorageState) {
+      const stats = storageStateStats(cachedStorageState);
+      return {
+        configured: Boolean(this.config.storageState),
+        usable: stats.usable,
+        source: "warm-cache",
+        state: cachedStorageState,
+        cookieCount: stats.cookieCount,
+        originCount: stats.originCount,
+      };
+    }
+    if (!this.config.storageState) return { configured: false, usable: false, source: "none" };
     const raw = this.config.storageState.trim();
     try {
-      return JSON.parse(raw.startsWith("{") ? raw : Buffer.from(raw, "base64url").toString("utf8"));
+      const state = JSON.parse(raw.startsWith("{") ? raw : Buffer.from(raw, "base64url").toString("utf8"));
+      const stats = storageStateStats(state);
+      return {
+        configured: true,
+        usable: stats.usable,
+        source: stats.usable ? "env" : "invalid",
+        state: stats.state,
+        cookieCount: stats.cookieCount,
+        originCount: stats.originCount,
+      };
     } catch {
       try {
-        return JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
+        const state = JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
+        const stats = storageStateStats(state);
+        return {
+          configured: true,
+          usable: stats.usable,
+          source: stats.usable ? "env" : "invalid",
+          state: stats.state,
+          cookieCount: stats.cookieCount,
+          originCount: stats.originCount,
+        };
       } catch {
-        return undefined;
+        return { configured: true, usable: false, source: "invalid" };
       }
     }
   }
@@ -881,6 +944,27 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, message: string):
 function isTransientAutomationError(message: string) {
   if (/Too Many Attempts|captcha|robot|verify|invalid|incorrect|two.factor|2fa|login is paused/i.test(message)) return false;
   return /Target page|context.*closed|browser.*closed|browser.*disconnected|Execution context|Navigation timeout|Timeout .* exceeded|Timed out|Protocol error|net::ERR|ECONNRESET|EPIPE/i.test(message);
+}
+
+function storageStateStats(state: unknown): {
+  usable: boolean;
+  cookieCount: number;
+  originCount: number;
+  state?: ParsedStorageState;
+} {
+  if (!state || typeof state !== "object") {
+    return { usable: false, cookieCount: 0, originCount: 0 };
+  }
+  const maybeState = state as { cookies?: unknown[]; origins?: unknown[] };
+  const cookieCount = Array.isArray(maybeState.cookies) ? maybeState.cookies.length : 0;
+  const originCount = Array.isArray(maybeState.origins) ? maybeState.origins.length : 0;
+  const usable = (cookieCount > 0 || originCount > 0) && Array.isArray(maybeState.cookies) && Array.isArray(maybeState.origins);
+  return {
+    usable,
+    cookieCount,
+    originCount,
+    state: usable ? (state as ParsedStorageState) : undefined,
+  };
 }
 
 function delay(ms: number) {

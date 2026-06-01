@@ -8,6 +8,7 @@
     "dev": "tsx src/server.ts",
     "start": "node dist/src/server.js",
     "storage:cronometer": "node scripts/generate-cronometer-storage-state.mjs",
+    "smoke:production": "node scripts/smoke-production.mjs",
     "inspect": "npx @modelcontextprotocol/inspector@latest --server-url http://localhost:${PORT:-8787}/mcp --transport http"
   },
   "dependencies": {

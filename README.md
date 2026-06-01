@@ -81,6 +81,12 @@ Browser-backed tools are serialized inside each warm serverless instance to redu
 
 Before a long ChatGPT workflow, call `cronometer_stability_check`. It verifies hosted login, Diary readability, and a small food search in one queued browser job without writing data.
 
+Run the no-write production smoke test after deploys:
+
+```bash
+npm run smoke:production
+```
+
 To create a durable Cronometer session for Vercel, run this locally after confirming `.env` has the Cronometer credentials:
 
 ```bash
