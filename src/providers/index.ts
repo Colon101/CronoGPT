@@ -40,6 +40,8 @@ export function createProviderFromEnv(): CronometerProvider {
       requireFoodConfirmation: env("CRONOMETER_REQUIRE_FOOD_CONFIRMATION") === "true",
       navigationTimeoutMs: Number(env("CRONOMETER_NAVIGATION_TIMEOUT_MS") ?? 20000),
       loginBackoffMs: Number(env("CRONOMETER_LOGIN_BACKOFF_MS") ?? 15 * 60 * 1000),
+      operationTimeoutMs: Number(env("CRONOMETER_OPERATION_TIMEOUT_MS") ?? 55000),
+      browserRetryCount: Number(env("CRONOMETER_BROWSER_RETRY_COUNT") ?? 1),
     });
   }
 

@@ -31,6 +31,8 @@ export interface BrowserConfig {
   requireFoodConfirmation: boolean;
   navigationTimeoutMs: number;
   loginBackoffMs: number;
+  operationTimeoutMs: number;
+  browserRetryCount: number;
 }
 
 interface SearchResult {
@@ -67,6 +69,9 @@ const CRONOMETER_PAGE_HASHES = {
 let cachedStorageState: unknown;
 let loginBackoffUntil = 0;
 let lastLoginFailure: string | undefined;
+let browserQueue: Promise<void> = Promise.resolve();
+let activeBrowserJobs = 0;
+let queuedBrowserJobs = 0;
 
 export class BrowserCronometerProvider extends BaseCronometerProvider {
   constructor(private readonly config: BrowserConfig) {
@@ -107,6 +112,10 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       warmStorageStateCached: Boolean(cachedStorageState),
       writeEnabled: this.config.writeEnabled,
       requireFoodConfirmation: this.config.requireFoodConfirmation,
+      activeBrowserJobs,
+      queuedBrowserJobs,
+      operationTimeoutMs: this.config.operationTimeoutMs,
+      browserRetryCount: this.config.browserRetryCount,
       loginPaused,
       loginPauseSecondsRemaining: loginPaused ? Math.ceil((loginBackoffUntil - now) / 1000) : 0,
       lastLoginFailure,
@@ -679,6 +688,26 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       );
     }
 
+    return enqueueBrowserJob(() => this.withPageAttemptWithRetry(feature, handler));
+  }
+
+  private async withPageAttemptWithRetry(feature: string, handler: (page: Page) => Promise<ProviderResult>): Promise<ProviderResult> {
+    const attempts = Math.max(1, Math.min(this.config.browserRetryCount + 1, 3));
+    let lastResult: ProviderResult | undefined;
+
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const result = await this.withPageAttempt(feature, handler, attempt);
+      lastResult = result;
+      if (result.status !== "error" || attempt >= attempts || !isTransientAutomationError(result.warning ?? "")) {
+        return result;
+      }
+      await delay(350 * attempt);
+    }
+
+    return lastResult ?? this.result(feature, "error", undefined, "Browser automation failed before producing a result.", "browser");
+  }
+
+  private async withPageAttempt(feature: string, handler: (page: Page) => Promise<ProviderResult>, attempt: number): Promise<ProviderResult> {
     let session: BrowserSession | undefined;
     try {
       if (Date.now() < loginBackoffUntil && !this.storageState()) {
@@ -691,13 +720,13 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           "browser",
         );
       }
-      session = await this.newSession();
-      const result = await handler(session.page);
+      session = await withTimeout(this.newSession(), this.config.operationTimeoutMs, `Timed out opening Cronometer browser session after ${this.config.operationTimeoutMs}ms.`);
+      const result = await withTimeout(handler(session.page), this.config.operationTimeoutMs, `Timed out running ${feature} after ${this.config.operationTimeoutMs}ms.`);
       cachedStorageState = await session.context.storageState().catch(() => cachedStorageState);
       return result;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown browser automation error";
-      return this.result(feature, "error", undefined, message, "browser");
+      return this.result(feature, "error", { attempt }, message, "browser");
     } finally {
       await session?.context.close().catch(() => undefined);
       await session?.browser.close().catch(() => undefined);
@@ -772,6 +801,46 @@ async function clickByText(page: Page, label: string | RegExp) {
     return true;
   }
   return false;
+}
+
+async function enqueueBrowserJob<T>(task: () => Promise<T>): Promise<T> {
+  queuedBrowserJobs += 1;
+  const run = browserQueue
+    .catch(() => undefined)
+    .then(async () => {
+      queuedBrowserJobs -= 1;
+      activeBrowserJobs += 1;
+      try {
+        return await task();
+      } finally {
+        activeBrowserJobs -= 1;
+      }
+    });
+  browserQueue = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(message)), ms);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function isTransientAutomationError(message: string) {
+  if (/Too Many Attempts|captcha|robot|verify|invalid|incorrect|two.factor|2fa|login is paused/i.test(message)) return false;
+  return /Target page|context.*closed|browser.*closed|browser.*disconnected|Execution context|Navigation timeout|Timeout .* exceeded|Timed out|Protocol error|net::ERR|ECONNRESET|EPIPE/i.test(message);
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function runUiStep(page: Page, step: UiFlowStep) {

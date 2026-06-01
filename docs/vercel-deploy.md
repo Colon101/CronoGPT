@@ -16,11 +16,15 @@ CRONOMETER_ENABLE_WRITES=true
 CRONOMETER_REQUIRE_FOOD_CONFIRMATION=false
 CRONOMETER_NAVIGATION_TIMEOUT_MS=45000
 CRONOMETER_LOGIN_BACKOFF_MS=900000
+CRONOMETER_OPERATION_TIMEOUT_MS=55000
+CRONOMETER_BROWSER_RETRY_COUNT=1
 ```
 
 `REMOTE_CHROME_WS_ENDPOINT` is optional when serverless Chromium is enabled. Browserless or another remote Chrome CDP endpoint is still the better production choice because Vercel functions are ephemeral and time-limited. Add `CRONOMETER_STORAGE_STATE_BASE64` when Cronometer starts challenging fresh headless logins. `CRONOMETER_LOGIN_BACKOFF_MS` stops repeated login attempts during temporary rate limits.
 
 Food logs write directly when `CRONOMETER_ENABLE_WRITES=true` unless the tool call sets `dryRun=true`. Set `CRONOMETER_REQUIRE_FOOD_CONFIRMATION=true` if you want every food log to require a second-step confirmation again. Dry-run write previews return without opening Cronometer, so validation calls do not burn browser login attempts.
+
+Browser-backed tools are serialized within a warm serverless instance and retry transient Playwright/session failures once by default. They do not retry Cronometer login failures, CAPTCHA, or credential errors.
 
 Other write tools require `CRONOMETER_ENABLE_WRITES=true` plus both call arguments:
 
