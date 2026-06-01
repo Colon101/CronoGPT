@@ -16,6 +16,7 @@ import type {
   SearchFoodsInput,
   TargetsInput,
   BackendMode,
+  UiFlowInput,
 } from "../domain.js";
 import { capabilitiesForMode } from "../features.js";
 
@@ -133,6 +134,10 @@ export class BaseCronometerProvider implements CronometerProvider {
 
   async scheduleRepeatItem(input: RepeatItemInput): Promise<ProviderResult> {
     return this.unsupported("schedule_repeat_item", input);
+  }
+
+  async runUiFlow(input: UiFlowInput): Promise<ProviderResult> {
+    return this.unsupported("run_cronometer_ui_flow", input);
   }
 
   protected result<T>(

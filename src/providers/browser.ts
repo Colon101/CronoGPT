@@ -15,6 +15,8 @@ import type {
   RepeatItemInput,
   SearchFoodsInput,
   TargetsInput,
+  UiFlowInput,
+  UiFlowStep,
 } from "../domain.js";
 import { BaseCronometerProvider } from "./base.js";
 import { capabilitiesForMode } from "../features.js";
@@ -44,6 +46,24 @@ interface BrowserSession {
 }
 
 const CRONOMETER_ORIGIN = "https://cronometer.com";
+const CRONOMETER_PAGE_HASHES = {
+  diary: "#diary",
+  customFoods: "#custom-foods",
+  customMeals: "#custom-meals",
+  customRecipes: "#custom-recipes",
+  targetsProfile: "#profile",
+  charts: "#charts",
+  nutritionReport: "#nutrition-report",
+  printReport: "#print-report",
+  snapshots: "#snapshots",
+  fasting: "#fasting",
+  repeatItems: "#repeat-items",
+  macroScheduler: "#macro-scheduler",
+  displaySettings: "#display-settings",
+  devices: "#devices",
+  sharing: "#sharing",
+  account: "#account",
+} as const;
 let cachedStorageState: unknown;
 let loginBackoffUntil = 0;
 let lastLoginFailure: string | undefined;
@@ -122,6 +142,50 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   async readFeaturePage(feature: string, hash: string, input: unknown) {
     return this.readPage(feature, hash, input);
+  }
+
+  async runUiFlow(input: UiFlowInput): Promise<ProviderResult> {
+    const steps = input.steps.slice(0, 20);
+    const hash = CRONOMETER_PAGE_HASHES[input.section] ?? "#diary";
+
+    if (input.dryRun !== false || !input.confirmed) {
+      return this.withPage("run_cronometer_ui_flow", async (page) => {
+        await this.openApp(page, hash);
+        return this.result("run_cronometer_ui_flow", "dry_run", {
+          input: safeInput({ ...input, steps }),
+          hash,
+          plannedStepCount: steps.length,
+          nextStep: "Review the visible page and planned steps, then call again with dryRun=false and confirmed=true to execute non-dangerous UI actions.",
+          visibleText: compactText(await this.visibleText(page), 12000),
+        });
+      });
+    }
+
+    const blocked = steps.find((step) => step.action === "clickText" && isDangerousClickText(step.text ?? ""));
+    if (blocked) {
+      return this.result("run_cronometer_ui_flow", "needs_manual_step", {
+        input: safeInput({ ...input, steps }),
+        blockedStep: blocked,
+      }, "This generic UI flow refuses dangerous click text. Use a dedicated reviewed tool for destructive account or bulk-delete actions.");
+    }
+
+    return this.withPage("run_cronometer_ui_flow", async (page) => {
+      await this.openApp(page, hash);
+      const executed = [];
+      for (const [index, step] of steps.entries()) {
+        const result = await runUiStep(page, step);
+        executed.push({ index, step: safeInput(step), ...result });
+        if (result.status !== "ok") break;
+      }
+
+      const allOk = executed.every((step) => step.status === "ok");
+      return this.result("run_cronometer_ui_flow", allOk ? "ok" : "needs_manual_step", {
+        input: safeInput({ ...input, steps }),
+        hash,
+        executed,
+        visibleText: compactText(await this.visibleText(page), 12000),
+      }, allOk ? undefined : "One or more UI-flow steps could not be completed with stable selectors.");
+    });
   }
 
   async getDailySummary(input: DateRangeInput) {
@@ -708,6 +772,56 @@ async function clickByText(page: Page, label: string | RegExp) {
     return true;
   }
   return false;
+}
+
+async function runUiStep(page: Page, step: UiFlowStep) {
+  if (step.action === "read") {
+    return { status: "ok" as const };
+  }
+
+  if (step.action === "wait") {
+    const ms = Math.max(0, Math.min(step.ms ?? 1000, 5000));
+    await page.waitForTimeout(ms);
+    return { status: "ok" as const, waitedMs: ms };
+  }
+
+  if (step.action === "press") {
+    if (!step.key) return { status: "not_found" as const, warning: "Missing key." };
+    await page.keyboard.press(step.key);
+    return { status: "ok" as const, key: step.key };
+  }
+
+  if (step.action === "clickText") {
+    if (!step.text) return { status: "not_found" as const, warning: "Missing text." };
+    const clicked = await clickByText(page, step.exact === false ? new RegExp(escapeRegExp(step.text), "i") : new RegExp(`^${escapeRegExp(step.text)}$`, "i"));
+    return clicked ? { status: "ok" as const, clickedText: step.text } : { status: "not_found" as const, warning: `Could not find clickable text: ${step.text}` };
+  }
+
+  if (step.action === "fillLabel") {
+    if (!step.label || step.value === undefined) return { status: "not_found" as const, warning: "Missing label or value." };
+    const locator = page.getByLabel(new RegExp(escapeRegExp(step.label), "i")).first();
+    if (!(await locator.isVisible().catch(() => false))) {
+      return { status: "not_found" as const, warning: `Could not find visible label: ${step.label}` };
+    }
+    await locator.fill(step.value);
+    return { status: "ok" as const, filledLabel: step.label };
+  }
+
+  if (step.action === "fillPlaceholder") {
+    if (!step.placeholder || step.value === undefined) return { status: "not_found" as const, warning: "Missing placeholder or value." };
+    const locator = page.getByPlaceholder(new RegExp(escapeRegExp(step.placeholder), "i")).first();
+    if (!(await locator.isVisible().catch(() => false))) {
+      return { status: "not_found" as const, warning: `Could not find visible placeholder: ${step.placeholder}` };
+    }
+    await locator.fill(step.value);
+    return { status: "ok" as const, filledPlaceholder: step.placeholder };
+  }
+
+  return { status: "not_found" as const, warning: `Unsupported action: ${step.action}` };
+}
+
+function isDangerousClickText(value: string) {
+  return /\b(delete account|bulk delete|delete all|delete diary|delete data|remove account|reset account|cancel subscription|erase)\b/i.test(value);
 }
 
 function activeDialog(page: Page) {

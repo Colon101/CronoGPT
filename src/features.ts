@@ -35,6 +35,14 @@ export const FEATURE_DEFINITIONS: FeatureDefinition[] = [
     notes: "Generic browser fallback that returns visible text from major Cronometer pages.",
   },
   {
+    id: "run_cronometer_ui_flow",
+    group: "capabilities",
+    title: "Run Cronometer UI flow",
+    preferredBackend: "browser",
+    supportedModes: ["mock"],
+    notes: "Constrained browser fallback for unimplemented workflows; requires confirmation before executing UI actions.",
+  },
+  {
     id: "get_daily_summary",
     group: "diary",
     title: "Read daily nutrition summary",
@@ -392,6 +400,7 @@ const BROWSER_FEATURE_STATUS: Record<string, ProviderStatus> = {
   cronometer_runtime_status: "ok",
   refresh_cronometer_session: "ok",
   read_cronometer_page: "ok",
+  run_cronometer_ui_flow: "needs_manual_step",
   get_daily_summary: "ok",
   list_food_entries: "ok",
   list_exercises: "ok",

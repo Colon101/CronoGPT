@@ -131,6 +131,7 @@ The existing lowercase `email` and `password` keys are supported only for local 
 - `cronometer_runtime_status`
 - `refresh_cronometer_session`
 - `read_cronometer_page`
+- `run_cronometer_ui_flow`
 - `get_daily_summary`
 - `list_food_entries`
 - `list_biometrics`

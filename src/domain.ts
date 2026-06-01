@@ -131,6 +131,42 @@ export interface RepeatItemInput {
   confirmed?: boolean;
 }
 
+export type UiFlowSection =
+  | "diary"
+  | "customFoods"
+  | "customMeals"
+  | "customRecipes"
+  | "targetsProfile"
+  | "charts"
+  | "nutritionReport"
+  | "printReport"
+  | "snapshots"
+  | "fasting"
+  | "repeatItems"
+  | "macroScheduler"
+  | "displaySettings"
+  | "devices"
+  | "sharing"
+  | "account";
+
+export interface UiFlowStep {
+  action: "clickText" | "fillLabel" | "fillPlaceholder" | "press" | "wait" | "read";
+  text?: string;
+  label?: string;
+  placeholder?: string;
+  value?: string;
+  key?: "Enter" | "Escape" | "Tab" | "ArrowDown" | "ArrowUp";
+  ms?: number;
+  exact?: boolean;
+}
+
+export interface UiFlowInput {
+  section: UiFlowSection;
+  steps: UiFlowStep[];
+  dryRun?: boolean;
+  confirmed?: boolean;
+}
+
 export interface Capability {
   id: string;
   group: FeatureGroup;
@@ -176,4 +212,5 @@ export interface CronometerProvider {
   startFast(input: FastInput): Promise<ProviderResult>;
   stopFast(input: FastInput): Promise<ProviderResult>;
   scheduleRepeatItem(input: RepeatItemInput): Promise<ProviderResult>;
+  runUiFlow(input: UiFlowInput): Promise<ProviderResult>;
 }

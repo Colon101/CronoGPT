@@ -222,6 +222,48 @@ export function createCronoServer() {
   );
 
   register(
+    "run_cronometer_ui_flow",
+    "Run Cronometer UI flow",
+    "Runs a constrained sequence of visible-text UI steps inside Cronometer for workflows that do not have a specialized tool yet. Use dryRun=true first; execution requires confirmed=true.",
+    {
+      section: z.enum([
+        "diary",
+        "customFoods",
+        "customMeals",
+        "customRecipes",
+        "targetsProfile",
+        "charts",
+        "nutritionReport",
+        "printReport",
+        "snapshots",
+        "fasting",
+        "repeatItems",
+        "macroScheduler",
+        "displaySettings",
+        "devices",
+        "sharing",
+        "account",
+      ]),
+      steps: z.array(
+        z.object({
+          action: z.enum(["clickText", "fillLabel", "fillPlaceholder", "press", "wait", "read"]),
+          text: z.string().optional(),
+          label: z.string().optional(),
+          placeholder: z.string().optional(),
+          value: z.string().optional(),
+          key: z.enum(["Enter", "Escape", "Tab", "ArrowDown", "ArrowUp"]).optional(),
+          ms: z.number().int().nonnegative().max(5000).optional(),
+          exact: z.boolean().optional(),
+        }),
+      ).max(20),
+      dryRun: z.boolean().optional(),
+      confirmed: z.boolean().optional(),
+    },
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    async (args) => toMcpToolResponse(await provider.runUiFlow(args as never)),
+  );
+
+  register(
     "get_daily_summary",
     "Get daily nutrition summary",
     "Reads a Cronometer daily nutrition summary for a date or date range.",
