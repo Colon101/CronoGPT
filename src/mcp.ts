@@ -38,7 +38,7 @@ const commonOutputSchema = {
 };
 
 export const MCP_PATH = "/mcp";
-const AUTH_REALM = "ChronoGPT MCP";
+const AUTH_REALM = "CronoGPT MCP";
 
 function getAuthToken() {
   return process.env.CRONOGPT_API_TOKEN?.trim() || undefined;
