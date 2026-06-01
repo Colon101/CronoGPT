@@ -9,13 +9,14 @@ CRONOGPT_LINK_SECRET=optional-separate-chatgpt-link-code
 CRONOMETER_BACKEND=browser
 CRONOMETER_EMAIL=your-cronometer-email
 CRONOMETER_PASSWORD=your-cronometer-password
+CRONOMETER_STORAGE_STATE_BASE64=optional-playwright-storage-state
 CRONOMETER_SERVERLESS_CHROMIUM=true
 REMOTE_CHROME_WS_ENDPOINT=wss://your-browserless-or-compatible-endpoint
 CRONOMETER_ENABLE_WRITES=true
 CRONOMETER_NAVIGATION_TIMEOUT_MS=45000
 ```
 
-`REMOTE_CHROME_WS_ENDPOINT` is optional when serverless Chromium is enabled. Browserless or another remote Chrome CDP endpoint is still the better production choice because Vercel functions are ephemeral and time-limited.
+`REMOTE_CHROME_WS_ENDPOINT` is optional when serverless Chromium is enabled. Browserless or another remote Chrome CDP endpoint is still the better production choice because Vercel functions are ephemeral and time-limited. Add `CRONOMETER_STORAGE_STATE_BASE64` when Cronometer starts challenging fresh headless logins.
 
 Write tools require `CRONOMETER_ENABLE_WRITES=true` plus both call arguments:
 

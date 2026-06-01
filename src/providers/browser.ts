@@ -22,6 +22,7 @@ export interface BrowserConfig {
   email?: string;
   password?: string;
   remoteWsEndpoint?: string;
+  storageState?: string;
   serverlessChromium: boolean;
   writeEnabled: boolean;
   navigationTimeoutMs: number;
@@ -40,6 +41,7 @@ interface BrowserSession {
 }
 
 const CRONOMETER_ORIGIN = "https://cronometer.com";
+let cachedStorageState: unknown;
 
 export class BrowserCronometerProvider extends BaseCronometerProvider {
   constructor(private readonly config: BrowserConfig) {
@@ -424,7 +426,9 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     let session: BrowserSession | undefined;
     try {
       session = await this.newSession();
-      return await handler(session.page);
+      const result = await handler(session.page);
+      cachedStorageState = await session.context.storageState().catch(() => cachedStorageState);
+      return result;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown browser automation error";
       return this.result(feature, "error", undefined, message, "browser");
@@ -443,6 +447,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     const context = await browser.newContext({
       viewport: { width: 1440, height: 1100 },
       locale: "en-US",
+      storageState: this.storageState(),
     });
     const page = await context.newPage();
     page.setDefaultTimeout(this.config.navigationTimeoutMs);
@@ -452,6 +457,21 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   private hasRunnableBrowser() {
     return Boolean(this.config.remoteWsEndpoint || this.config.serverlessChromium);
+  }
+
+  private storageState() {
+    if (cachedStorageState) return cachedStorageState;
+    if (!this.config.storageState) return undefined;
+    const raw = this.config.storageState.trim();
+    try {
+      return JSON.parse(raw.startsWith("{") ? raw : Buffer.from(raw, "base64url").toString("utf8"));
+    } catch {
+      try {
+        return JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
+      } catch {
+        return undefined;
+      }
+    }
   }
 
   private async launchServerlessChromium() {
