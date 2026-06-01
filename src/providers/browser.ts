@@ -73,6 +73,32 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     );
   }
 
+  async runtimeStatus(): Promise<ProviderResult> {
+    const now = Date.now();
+    const loginPaused = now < loginBackoffUntil;
+    return this.result("cronometer_runtime_status", "ok", {
+      provider: this.name,
+      mode: this.mode,
+      browserConfigured: this.hasRunnableBrowser(),
+      hasCredentials: Boolean(this.config.email && this.config.password),
+      hasRemoteBrowser: Boolean(this.config.remoteWsEndpoint),
+      serverlessChromium: this.config.serverlessChromium,
+      storageStateConfigured: Boolean(this.config.storageState),
+      warmStorageStateCached: Boolean(cachedStorageState),
+      writeEnabled: this.config.writeEnabled,
+      requireFoodConfirmation: this.config.requireFoodConfirmation,
+      loginPaused,
+      loginPauseSecondsRemaining: loginPaused ? Math.ceil((loginBackoffUntil - now) / 1000) : 0,
+      lastLoginFailure,
+      guidance: [
+        "Use dryRun=true for validation and previews; dry-run write tools do not open Cronometer.",
+        "Use resolve_recipe_ingredients with a low limitPerIngredient and maxSeconds for large recipes.",
+        "If loginPaused is true, wait or provide durable storage state/remote browser before retrying browser actions.",
+        "For the most reliable hosted writes, configure a persistent remote browser or CRONOMETER_STORAGE_STATE_BASE64.",
+      ],
+    });
+  }
+
   async readFeaturePage(feature: string, hash: string, input: unknown) {
     return this.readPage(feature, hash, input);
   }

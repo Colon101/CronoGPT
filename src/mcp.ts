@@ -171,6 +171,15 @@ export function createCronoServer() {
   );
 
   register(
+    "cronometer_runtime_status",
+    "Show connector runtime status",
+    "Reports backend configuration, write mode, browser session state, and login cooldown without opening Cronometer.",
+    emptyInputSchema,
+    { readOnlyHint: true, openWorldHint: false },
+    async () => toMcpToolResponse(await provider.runtimeStatus()),
+  );
+
+  register(
     "read_cronometer_page",
     "Read Cronometer page",
     "Reads visible text from a major Cronometer page as a fallback when a specialized parser is not enough.",

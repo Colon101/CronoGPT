@@ -11,6 +11,14 @@ interface FeatureDefinition {
 
 export const FEATURE_DEFINITIONS: FeatureDefinition[] = [
   {
+    id: "cronometer_runtime_status",
+    group: "capabilities",
+    title: "Show connector runtime status",
+    preferredBackend: "browser",
+    supportedModes: ["mock", "terra"],
+    notes: "Reports backend configuration, write mode, browser session state, and login cooldown without opening Cronometer.",
+  },
+  {
     id: "read_cronometer_page",
     group: "capabilities",
     title: "Read Cronometer page",
@@ -373,6 +381,7 @@ export const FEATURE_DEFINITIONS: FeatureDefinition[] = [
 ];
 
 const BROWSER_FEATURE_STATUS: Record<string, ProviderStatus> = {
+  cronometer_runtime_status: "ok",
   read_cronometer_page: "ok",
   get_daily_summary: "ok",
   list_food_entries: "ok",

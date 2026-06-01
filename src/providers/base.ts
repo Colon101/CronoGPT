@@ -29,6 +29,13 @@ export class BaseCronometerProvider implements CronometerProvider {
     return this.result("cronometer_capabilities", "ok", capabilitiesForMode(this.mode));
   }
 
+  async runtimeStatus(): Promise<ProviderResult> {
+    return this.result("cronometer_runtime_status", "ok", {
+      provider: this.name,
+      mode: this.mode,
+    });
+  }
+
   async readFeaturePage(feature: string, hash: string, input: unknown): Promise<ProviderResult> {
     return this.unsupported(feature, { hash, input });
   }
