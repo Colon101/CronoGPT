@@ -73,7 +73,7 @@ CRONOMETER_LOGIN_BACKOFF_MS=900000
 
 `REMOTE_CHROME_WS_ENDPOINT` is optional when `CRONOMETER_SERVERLESS_CHROMIUM=true`, but a Browserless-compatible remote Chrome endpoint is more reliable for long browser sessions than Vercel's ephemeral function runtime. `CRONOMETER_STORAGE_STATE_BASE64` lets the hosted browser reuse a valid Cronometer session instead of logging in from scratch on every tool call. `CRONOMETER_LOGIN_BACKOFF_MS` pauses new login attempts after a rate-limit or bot challenge.
 
-Food logs write directly when `CRONOMETER_ENABLE_WRITES=true` unless the tool call sets `dryRun=true`. Set `CRONOMETER_REQUIRE_FOOD_CONFIRMATION=true` to restore the older second-step confirmation behavior. Other write tools still require `dryRun=false` and `confirmed=true`. Set `CRONOMETER_ENABLE_WRITES=false` for read-only dry-run mode.
+Food logs write directly when `CRONOMETER_ENABLE_WRITES=true` unless the tool call sets `dryRun=true`. Set `CRONOMETER_REQUIRE_FOOD_CONFIRMATION=true` to restore the older second-step confirmation behavior. Other write tools still require `dryRun=false` and `confirmed=true`. Dry-run write previews return without opening Cronometer, so recipe/custom-food validation does not burn browser login attempts. Set `CRONOMETER_ENABLE_WRITES=false` for read-only dry-run mode.
 
 For more reliable read data, add Terra:
 
@@ -112,6 +112,8 @@ Set `CRONOMETER_BACKEND` in `.env`:
 - `browser`: hosted browser automation through serverless Chromium or `REMOTE_CHROME_WS_ENDPOINT`. This cannot reuse the Codex `@chrome` plugin from ChatGPT.
 
 The existing lowercase `email` and `password` keys are supported only for local browser-framework detection. Prefer `CRONOMETER_EMAIL` and `CRONOMETER_PASSWORD`.
+
+`resolve_recipe_ingredients` reuses a single Cronometer food-search dialog and stops before the hosted function timeout. If a large recipe returns skipped or unresolved ingredients, call it again with only those remaining ingredients.
 
 ## Current tool map
 

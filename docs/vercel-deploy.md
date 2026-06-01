@@ -20,7 +20,7 @@ CRONOMETER_LOGIN_BACKOFF_MS=900000
 
 `REMOTE_CHROME_WS_ENDPOINT` is optional when serverless Chromium is enabled. Browserless or another remote Chrome CDP endpoint is still the better production choice because Vercel functions are ephemeral and time-limited. Add `CRONOMETER_STORAGE_STATE_BASE64` when Cronometer starts challenging fresh headless logins. `CRONOMETER_LOGIN_BACKOFF_MS` stops repeated login attempts during temporary rate limits.
 
-Food logs write directly when `CRONOMETER_ENABLE_WRITES=true` unless the tool call sets `dryRun=true`. Set `CRONOMETER_REQUIRE_FOOD_CONFIRMATION=true` if you want every food log to require a second-step confirmation again.
+Food logs write directly when `CRONOMETER_ENABLE_WRITES=true` unless the tool call sets `dryRun=true`. Set `CRONOMETER_REQUIRE_FOOD_CONFIRMATION=true` if you want every food log to require a second-step confirmation again. Dry-run write previews return without opening Cronometer, so validation calls do not burn browser login attempts.
 
 Other write tools require `CRONOMETER_ENABLE_WRITES=true` plus both call arguments:
 
@@ -67,5 +67,7 @@ When ChatGPT opens the CronoGPT OAuth page, use `CRONOGPT_LINK_SECRET`; if it is
 3. Call `create_recipe` with the selected foods and `dryRun=true`.
 4. Review the preview.
 5. Call `create_recipe` again with `dryRun=false` and `confirmed=true`.
+
+`resolve_recipe_ingredients` is a bounded batch search. For large recipes, keep `limitPerIngredient` low, use `maxSeconds`, and retry with only skipped or unresolved ingredients if the first call stops early.
 
 The hosted browser adapter opens the custom recipe editor, fills the recipe name/servings, opens `ADD INGREDIENTS`, searches each ingredient, and selects matches. Keep the first real runs in dry-run mode and review the visible result before enabling writes.

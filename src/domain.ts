@@ -69,14 +69,23 @@ export interface SearchFoodsInput {
   limit?: number;
 }
 
+export interface RecipeIngredientInput {
+  query: string;
+  selectedName?: string;
+  amount?: number;
+  unit?: string;
+}
+
+export interface ResolveRecipeIngredientsInput {
+  recipeName?: string;
+  ingredients: RecipeIngredientInput[];
+  limitPerIngredient?: number;
+  maxSeconds?: number;
+}
+
 export interface RecipeInput {
   name: string;
-  ingredients: Array<{
-    query: string;
-    selectedName?: string;
-    amount?: number;
-    unit?: string;
-  }>;
+  ingredients: RecipeIngredientInput[];
   servings?: number;
   servingName?: string;
   dryRun?: boolean;
@@ -151,6 +160,7 @@ export interface CronometerProvider {
   listExercises(input: DateRangeInput): Promise<ProviderResult>;
   listNotes(input: DateRangeInput): Promise<ProviderResult>;
   searchFoods(input: SearchFoodsInput): Promise<ProviderResult>;
+  resolveRecipeIngredients(input: ResolveRecipeIngredientsInput): Promise<ProviderResult>;
   logFood(input: FoodLogInput): Promise<ProviderResult>;
   logExercise(input: ExerciseLogInput): Promise<ProviderResult>;
   logBiometric(input: BiometricLogInput): Promise<ProviderResult>;

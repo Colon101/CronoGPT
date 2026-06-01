@@ -207,33 +207,19 @@ export function createCronoServer() {
           unit: z.string().optional(),
         }),
       ),
-      limitPerIngredient: z.number().int().positive().max(10).optional(),
+      limitPerIngredient: z.number().int().positive().max(5).optional(),
+      maxSeconds: z.number().int().positive().max(50).optional(),
     },
     { readOnlyHint: true, openWorldHint: true },
     async (args) => {
-      const ingredients = args.ingredients as Array<{ query: string; amount?: number; unit?: string }>;
-      const limit = (args.limitPerIngredient as number | undefined) ?? 5;
-      const resolved = [];
-      for (const ingredient of ingredients) {
-        const result = await provider.searchFoods({ query: ingredient.query, limit });
-        resolved.push({
-          ingredient,
-          status: result.status,
-          warning: result.warning,
-          matches: result.data,
-        });
-      }
-      return toMcpToolResponse({
-        provider: provider.name,
-        mode: provider.mode,
-        feature: "resolve_recipe_ingredients",
-        status: resolved.every((item) => item.status === "ok" || item.status === "dry_run") ? "ok" : "needs_manual_step",
-        data: {
-          recipeName: args.recipeName,
-          resolved,
-          nextStep: "Pick the matching Cronometer food for each ingredient, then call create_recipe with confirmed=true when ready to write.",
-        },
-      });
+      return toMcpToolResponse(
+        await provider.resolveRecipeIngredients({
+          recipeName: args.recipeName as string | undefined,
+          ingredients: args.ingredients as Array<{ query: string; selectedName?: string; amount?: number; unit?: string }>,
+          limitPerIngredient: args.limitPerIngredient as number | undefined,
+          maxSeconds: args.maxSeconds as number | undefined,
+        }),
+      );
     },
   );
 

@@ -11,6 +11,7 @@ import type {
   NoteLogInput,
   ProviderResult,
   RecipeInput,
+  ResolveRecipeIngredientsInput,
   RepeatItemInput,
   SearchFoodsInput,
   TargetsInput,
@@ -113,6 +114,62 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     });
   }
 
+  async resolveRecipeIngredients(input: ResolveRecipeIngredientsInput) {
+    const limit = Math.min(input.limitPerIngredient ?? 3, 5);
+    const maxMs = Math.min(input.maxSeconds ?? 45, 50) * 1000;
+    return this.withPage("resolve_recipe_ingredients", async (page) => {
+      const startedAt = Date.now();
+      const deadline = startedAt + maxMs;
+      await this.openFoodSearchDialog(page);
+      await clickFoodDialogFilter(page, "All").catch(() => undefined);
+
+      const resolved = [];
+      let stoppedEarly = false;
+
+      for (const ingredient of input.ingredients) {
+        if (Date.now() > deadline - 4500) {
+          stoppedEarly = true;
+          resolved.push({
+            ingredient,
+            status: "skipped",
+            warning: "Skipped before the hosted function timeout. Call resolve_recipe_ingredients again with the remaining ingredients.",
+            matches: { query: ingredient.query, results: [] },
+          });
+          continue;
+        }
+
+        let results = await searchCurrentFoodDialog(page, ingredient.query, limit);
+        if (results.length === 0 && Date.now() < deadline - 6500) {
+          const customClicked = await clickFoodDialogFilter(page, "Custom");
+          if (customClicked) {
+            results = await searchCurrentFoodDialog(page, ingredient.query, limit);
+            await clickFoodDialogFilter(page, "All").catch(() => undefined);
+          }
+        }
+
+        resolved.push({
+          ingredient,
+          status: results.length > 0 ? "ok" : "needs_manual_step",
+          warning: results.length > 0 ? undefined : "No Cronometer matches were found for this ingredient.",
+          matches: { query: ingredient.query, results },
+        });
+      }
+
+      const elapsedMs = Date.now() - startedAt;
+      const allResolved = resolved.every((item) => item.status === "ok");
+      return this.result("resolve_recipe_ingredients", allResolved && !stoppedEarly ? "ok" : "needs_manual_step", {
+        recipeName: input.recipeName,
+        limitPerIngredient: limit,
+        elapsedMs,
+        stoppedEarly,
+        resolved,
+        nextStep: stoppedEarly
+          ? "Call resolve_recipe_ingredients again with only the skipped or unresolved ingredients."
+          : "Pick the matching Cronometer food for each ingredient, then call create_recipe with confirmed=true when ready to write.",
+      });
+    });
+  }
+
   async logFood(input: FoodLogInput & { confirmed?: boolean }) {
     return this.withPage("log_food", async (page) => {
       const preview = await this.searchFoodUi(page, input.query, 5);
@@ -197,24 +254,23 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   async createRecipe(input: RecipeInput & { confirmed?: boolean }) {
+    const preview = {
+      recipeName: input.name,
+      servings: input.servings,
+      servingName: input.servingName,
+      ingredients: input.ingredients,
+    };
+
+    if (input.dryRun !== false || !input.confirmed || !this.config.writeEnabled) {
+      return this.result("create_recipe", "dry_run", {
+        input: safeInput(input),
+        preview,
+        nextStep: "Call again with dryRun=false and confirmed=true after reviewing exact Cronometer ingredient matches.",
+      });
+    }
+
     return this.withPage("create_recipe", async (page) => {
       await this.openApp(page, "#custom-recipes");
-      const preview = {
-        recipeName: input.name,
-        servings: input.servings,
-        servingName: input.servingName,
-        ingredients: input.ingredients,
-      };
-
-      if (input.dryRun !== false || !input.confirmed || !this.config.writeEnabled) {
-        return this.result("create_recipe", "dry_run", {
-          input: safeInput(input),
-          preview,
-          visibleText: compactText(await this.visibleText(page), 10000),
-          nextStep: "Call again with dryRun=false and confirmed=true after reviewing exact Cronometer ingredient matches.",
-        });
-      }
-
       const opened = await clickByText(page, /^CREATE RECIPE$/i);
       if (!opened) {
         return this.result("create_recipe", "needs_manual_step", { input: safeInput(input) }, "Could not find CREATE RECIPE.");
@@ -250,15 +306,15 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   async exportData(input: ExportDataInput & { confirmed?: boolean }) {
+    if (input.dryRun !== false || !input.confirmed || !this.config.writeEnabled) {
+      return this.result("export_data", "dry_run", {
+        input: safeInput(input),
+        nextStep: "Call with dryRun=false and confirmed=true to click EXPORT DATA.",
+      });
+    }
+
     return this.withPage("export_data", async (page) => {
       await this.openApp(page, "#account");
-      if (input.dryRun !== false || !input.confirmed || !this.config.writeEnabled) {
-        return this.result("export_data", "dry_run", {
-          input: safeInput(input),
-          visibleText: compactText(await this.visibleText(page), 10000),
-          nextStep: "Call with dryRun=false and confirmed=true to click EXPORT DATA.",
-        });
-      }
       const clicked = await clickByText(page, /^EXPORT DATA$/i);
       return this.result(clicked ? "export_data" : "export_data", clicked ? "ok" : "needs_manual_step", {
         clicked,
@@ -303,16 +359,16 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private async createCustomItem(feature: string, hash: string, createButtonText: string, input: { name: string; dryRun?: boolean; confirmed?: boolean }) {
+    if (input.dryRun !== false || !input.confirmed || !this.config.writeEnabled) {
+      return this.result(feature, "dry_run", {
+        input: safeInput(input),
+        nextStep: `Call again with dryRun=false and confirmed=true to open ${createButtonText}.`,
+      });
+    }
+
     return this.withPage(feature, async (page) => {
       await this.openApp(page, hash);
       const visibleText = compactText(await this.visibleText(page), 10000);
-      if (input.dryRun !== false || !input.confirmed || !this.config.writeEnabled) {
-        return this.result(feature, "dry_run", {
-          input: safeInput(input),
-          visibleText,
-          nextStep: `Call again with dryRun=false and confirmed=true to open ${createButtonText}.`,
-        });
-      }
 
       const created = await clickByText(page, new RegExp(`^${escapeRegExp(createButtonText)}$`, "i"));
       if (!created) {
@@ -335,14 +391,15 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private async writeViaQuickAdd(feature: string, buttonText: string, input: { dryRun?: boolean; confirmed?: boolean }) {
+    if (input.dryRun !== false || !input.confirmed || !this.config.writeEnabled) {
+      return this.result(feature, "dry_run", {
+        input: safeInput(input),
+        nextStep: `Call again with dryRun=false and confirmed=true to open ${buttonText}.`,
+      });
+    }
+
     return this.withPage(feature, async (page) => {
       await this.openApp(page, "#diary");
-      if (input.dryRun !== false || !input.confirmed || !this.config.writeEnabled) {
-        return this.result(feature, "dry_run", {
-          input: safeInput(input),
-          nextStep: `Call again with dryRun=false and confirmed=true to open ${buttonText}.`,
-        });
-      }
 
       const clicked = await clickByText(page, new RegExp(`^${escapeRegExp(buttonText)}$`, "i"));
       if (!clicked) {
@@ -362,10 +419,18 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private async confirmedPageWrite(feature: string, hash: string, input: { dryRun?: boolean; confirmed?: boolean }, warning: string) {
+    const confirmedWrite = input.dryRun === false && input.confirmed && this.config.writeEnabled;
+    if (!confirmedWrite) {
+      return this.result(feature, "dry_run", {
+        input: safeInput(input),
+        hash,
+        nextStep: "Call again with dryRun=false and confirmed=true after reviewing the requested change.",
+      }, warning);
+    }
+
     return this.withPage(feature, async (page) => {
       await this.openApp(page, hash);
-      const confirmedWrite = input.dryRun === false && input.confirmed && this.config.writeEnabled;
-      return this.result(feature, confirmedWrite ? "needs_manual_step" : "dry_run", {
+      return this.result(feature, "needs_manual_step", {
         input: safeInput(input),
         hash,
         visibleText: compactText(await this.visibleText(page), 10000),
@@ -374,9 +439,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private async searchFoodUi(page: Page, query: string, limit: number): Promise<SearchResult[]> {
-    await this.openApp(page, "#diary");
-    await clickByText(page, /^FOOD$/i);
-    await page.waitForTimeout(1000);
+    await this.openFoodSearchDialog(page);
 
     const attempts: Array<string | undefined> = [undefined, "Custom", "Favorites", "All"];
     let fallbackTab: string | undefined;
@@ -409,6 +472,15 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     }
 
     return [];
+  }
+
+  private async openFoodSearchDialog(page: Page) {
+    await this.openApp(page, "#diary");
+    const alreadyOpen = await activeDialog(page).isVisible().catch(() => false);
+    if (!alreadyOpen) {
+      await clickByText(page, /^FOOD$/i);
+      await page.waitForTimeout(1000);
+    }
   }
 
   private async openApp(page: Page, hash = "") {

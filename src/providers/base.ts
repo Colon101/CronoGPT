@@ -11,6 +11,7 @@ import type {
   NoteLogInput,
   ProviderResult,
   RecipeInput,
+  ResolveRecipeIngredientsInput,
   RepeatItemInput,
   SearchFoodsInput,
   TargetsInput,
@@ -50,6 +51,25 @@ export class BaseCronometerProvider implements CronometerProvider {
 
   async searchFoods(input: SearchFoodsInput): Promise<ProviderResult> {
     return this.unsupported("search_foods", input);
+  }
+
+  async resolveRecipeIngredients(input: ResolveRecipeIngredientsInput): Promise<ProviderResult> {
+    const limit = input.limitPerIngredient ?? 5;
+    const resolved = [];
+    for (const ingredient of input.ingredients) {
+      const result = await this.searchFoods({ query: ingredient.query, limit });
+      resolved.push({
+        ingredient,
+        status: result.status,
+        warning: result.warning,
+        matches: result.data,
+      });
+    }
+    return this.result("resolve_recipe_ingredients", "dry_run", {
+      recipeName: input.recipeName,
+      resolved,
+      nextStep: "Pick the matching Cronometer food for each ingredient, then call create_recipe with confirmed=true when ready to write.",
+    });
   }
 
   async logFood(input: FoodLogInput): Promise<ProviderResult> {
