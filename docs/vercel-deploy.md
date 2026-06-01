@@ -8,11 +8,15 @@ CRONOGPT_API_TOKEN=long-random-private-token
 CRONOMETER_BACKEND=browser
 CRONOMETER_EMAIL=your-cronometer-email
 CRONOMETER_PASSWORD=your-cronometer-password
+CRONOMETER_SERVERLESS_CHROMIUM=true
 REMOTE_CHROME_WS_ENDPOINT=wss://your-browserless-or-compatible-endpoint
-CRONOMETER_ENABLE_WRITES=false
+CRONOMETER_ENABLE_WRITES=true
+CRONOMETER_NAVIGATION_TIMEOUT_MS=45000
 ```
 
-Keep writes disabled until dry runs behave correctly. Write tools require both:
+`REMOTE_CHROME_WS_ENDPOINT` is optional when serverless Chromium is enabled. Browserless or another remote Chrome CDP endpoint is still the better production choice because Vercel functions are ephemeral and time-limited.
+
+Write tools require `CRONOMETER_ENABLE_WRITES=true` plus both call arguments:
 
 ```json
 { "dryRun": false, "confirmed": true }

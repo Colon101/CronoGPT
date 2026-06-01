@@ -61,11 +61,15 @@ CRONOGPT_API_TOKEN=generate-a-long-random-token
 CRONOMETER_BACKEND=browser
 CRONOMETER_EMAIL=...
 CRONOMETER_PASSWORD=...
+CRONOMETER_SERVERLESS_CHROMIUM=true
 REMOTE_CHROME_WS_ENDPOINT=wss://your-remote-chrome-endpoint
-CRONOMETER_ENABLE_WRITES=false
+CRONOMETER_ENABLE_WRITES=true
+CRONOMETER_NAVIGATION_TIMEOUT_MS=45000
 ```
 
-Use `CRONOMETER_ENABLE_WRITES=true` only after dry-run testing. Write tools require `dryRun=false` and `confirmed=true`; otherwise they return a preview.
+`REMOTE_CHROME_WS_ENDPOINT` is optional when `CRONOMETER_SERVERLESS_CHROMIUM=true`, but a Browserless-compatible remote Chrome endpoint is more reliable for long browser sessions than Vercel's ephemeral function runtime.
+
+Write tools require `dryRun=false` and `confirmed=true`; otherwise they return a preview. Set `CRONOMETER_ENABLE_WRITES=false` for read-only dry-run mode.
 
 For more reliable read data, add Terra:
 
@@ -95,7 +99,7 @@ Set `CRONOMETER_BACKEND` in `.env`:
 
 - `mock`: local dry-run data, safe default.
 - `terra`: API-backed read framework using `TERRA_API_KEY`, `TERRA_DEV_ID`, and `TERRA_USER_ID`.
-- `browser`: hosted browser automation through `REMOTE_CHROME_WS_ENDPOINT`. This cannot reuse the Codex `@chrome` plugin from ChatGPT.
+- `browser`: hosted browser automation through serverless Chromium or `REMOTE_CHROME_WS_ENDPOINT`. This cannot reuse the Codex `@chrome` plugin from ChatGPT.
 
 The existing lowercase `email` and `password` keys are supported only for local browser-framework detection. Prefer `CRONOMETER_EMAIL` and `CRONOMETER_PASSWORD`.
 

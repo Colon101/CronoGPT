@@ -34,6 +34,7 @@ export function createProviderFromEnv(): CronometerProvider {
       email: env("CRONOMETER_EMAIL") ?? env("email"),
       password: env("CRONOMETER_PASSWORD") ?? env("password"),
       remoteWsEndpoint: env("REMOTE_CHROME_WS_ENDPOINT") ?? env("BROWSERLESS_WS_ENDPOINT"),
+      serverlessChromium: env("CRONOMETER_SERVERLESS_CHROMIUM") !== "false",
       writeEnabled: env("CRONOMETER_ENABLE_WRITES") === "true",
       navigationTimeoutMs: Number(env("CRONOMETER_NAVIGATION_TIMEOUT_MS") ?? 20000),
     });

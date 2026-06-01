@@ -22,6 +22,7 @@ export interface BrowserConfig {
   email?: string;
   password?: string;
   remoteWsEndpoint?: string;
+  serverlessChromium: boolean;
   writeEnabled: boolean;
   navigationTimeoutMs: number;
 }
@@ -46,7 +47,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   async capabilities(): Promise<ProviderResult<Capability[]>> {
-    const browserConfigured = Boolean(this.config.remoteWsEndpoint && this.config.email && this.config.password);
+    const browserConfigured = Boolean(this.hasRunnableBrowser() && this.config.email && this.config.password);
     const capabilities = capabilitiesForMode("mock").map((capability) => {
       if (capability.preferredBackend === "manual") {
         return { ...capability, currentBackendStatus: "unsupported" as const };
@@ -60,7 +61,12 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       };
     });
 
-    return this.result("cronometer_capabilities", browserConfigured ? "ok" : "not_configured", capabilities, browserConfigured ? undefined : "Set REMOTE_CHROME_WS_ENDPOINT plus Cronometer credentials.");
+    return this.result(
+      "cronometer_capabilities",
+      browserConfigured ? "ok" : "not_configured",
+      capabilities,
+      browserConfigured ? undefined : "Set Cronometer credentials and either enable serverless Chromium or provide REMOTE_CHROME_WS_ENDPOINT.",
+    );
   }
 
   async getDailySummary(input: DateRangeInput) {
@@ -395,12 +401,16 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private async withPage(feature: string, handler: (page: Page) => Promise<ProviderResult>): Promise<ProviderResult> {
-    if (!this.config.remoteWsEndpoint) {
+    if (!this.hasRunnableBrowser()) {
       return this.result(
         feature,
         "not_configured",
-        { hasCredentials: Boolean(this.config.email && this.config.password), hasRemoteBrowser: false },
-        "Set REMOTE_CHROME_WS_ENDPOINT to a Browserless or compatible Chrome WebSocket endpoint for hosted browser control.",
+        {
+          hasCredentials: Boolean(this.config.email && this.config.password),
+          hasRemoteBrowser: Boolean(this.config.remoteWsEndpoint),
+          serverlessChromium: this.config.serverlessChromium,
+        },
+        "Enable CRONOMETER_SERVERLESS_CHROMIUM or set REMOTE_CHROME_WS_ENDPOINT to a Browserless-compatible Chrome WebSocket endpoint.",
         "browser",
       );
     }
@@ -419,9 +429,11 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private async newSession(): Promise<BrowserSession> {
-    const browser = await chromium.connectOverCDP(this.config.remoteWsEndpoint!, {
-      timeout: this.config.navigationTimeoutMs,
-    });
+    const browser = this.config.remoteWsEndpoint
+      ? await chromium.connectOverCDP(this.config.remoteWsEndpoint, {
+          timeout: this.config.navigationTimeoutMs,
+        })
+      : await this.launchServerlessChromium();
     const context = await browser.newContext({
       viewport: { width: 1440, height: 1100 },
       locale: "en-US",
@@ -430,6 +442,26 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     page.setDefaultTimeout(this.config.navigationTimeoutMs);
     page.setDefaultNavigationTimeout(this.config.navigationTimeoutMs);
     return { browser, context, page };
+  }
+
+  private hasRunnableBrowser() {
+    return Boolean(this.config.remoteWsEndpoint || this.config.serverlessChromium);
+  }
+
+  private async launchServerlessChromium() {
+    const serverlessChromium = (await import("@sparticuz/chromium")).default;
+    serverlessChromium.setGraphicsMode = false;
+    return chromium.launch({
+      args: [
+        ...serverlessChromium.args,
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-sandbox",
+      ],
+      executablePath: await serverlessChromium.executablePath(),
+      headless: true,
+      timeout: this.config.navigationTimeoutMs,
+    });
   }
 }
 
