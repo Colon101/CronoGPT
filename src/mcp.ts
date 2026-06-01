@@ -245,6 +245,7 @@ export function createCronoServer() {
       date: z.string().optional(),
       meal: z.string().optional(),
       query: z.string().min(1),
+      selectedName: z.string().optional(),
       amount: z.number().positive().optional(),
       unit: z.string().optional(),
       timestamp: z.string().optional(),

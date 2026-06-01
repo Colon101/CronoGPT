@@ -28,6 +28,7 @@ export interface FoodLogInput {
   date?: string;
   meal?: string;
   query: string;
+  selectedName?: string;
   amount?: number;
   unit?: string;
   timestamp?: string;

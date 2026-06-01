@@ -122,8 +122,9 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         return this.result("log_food", "needs_manual_step", { input: safeInput(input) }, "No matching Cronometer food result was found.");
       }
 
-      const selectedName = preview[0]?.name ?? input.query;
-      const clicked = await clickByText(page, selectedName);
+      const selectedResult = pickFoodResult(input.query, preview, input.selectedName);
+      const selectedName = selectedResult?.name ?? input.selectedName ?? input.query;
+      const clicked = await clickFoodSearchResult(page, selectedName);
       if (!clicked) {
         return this.result(
           "log_food",
@@ -134,11 +135,12 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       }
 
       await page.waitForTimeout(1000);
-      await fillLikelyAmount(page, input.amount);
-      await fillLikelyUnit(page, input.unit);
+      await fillFoodAmount(page, input.amount);
+      await fillFoodTime(page, input.timestamp);
+      await fillFoodUnit(page, input.unit);
       await chooseMeal(page, input.meal);
 
-      const saved = await clickByText(page, /^(ADD|ADD TO DIARY|SAVE|DONE)$/i);
+      const saved = await clickDialogButton(page, /^(ADD|ADD TO DIARY|ADD TO DIARY|SAVE|DONE)$/i);
       if (!saved) {
         return this.result(
           "log_food",
@@ -367,8 +369,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     await clickByText(page, /^SEARCH$/i);
     await page.waitForTimeout(1800);
 
-    const text = await this.visibleText(page);
-    return parseFoodSearchResults(text, limit);
+    return extractFoodSearchResults(page, limit);
   }
 
   private async openApp(page: Page, hash = "") {
@@ -487,6 +488,87 @@ async function clickByText(page: Page, label: string | RegExp) {
   return false;
 }
 
+function activeDialog(page: Page) {
+  return page.locator(".pretty-dialog, [role='dialog'], .gwt-DialogBox").last();
+}
+
+async function clickDialogButton(page: Page, label: string | RegExp) {
+  const dialog = activeDialog(page);
+  const candidates = [
+    dialog.getByRole("button", { name: label }),
+    dialog.locator("button,.gwt-Button,[role='button']").filter({ hasText: label }),
+  ];
+
+  for (const candidate of candidates) {
+    if ((await candidate.count().catch(() => 0)) === 0) continue;
+    const first = candidate.first();
+    if (!(await first.isVisible().catch(() => false))) continue;
+    await first.click();
+    return true;
+  }
+  return false;
+}
+
+async function clickFoodSearchResult(page: Page, selectedName: string) {
+  const dialog = activeDialog(page);
+  const exactCell = dialog.locator(".gwt-HTML").filter({ hasText: new RegExp(`^${escapeRegExp(selectedName)}$`, "i") });
+  if ((await exactCell.count().catch(() => 0)) > 0 && (await exactCell.first().isVisible().catch(() => false))) {
+    await exactCell.first().click();
+    return true;
+  }
+
+  const row = dialog.locator("tr").filter({ hasText: selectedName }).filter({ hasNotText: /^DescriptionSource$/i }).first();
+  if ((await row.count().catch(() => 0)) > 0 && (await row.isVisible().catch(() => false))) {
+    await row.click();
+    return true;
+  }
+
+  return false;
+}
+
+async function fillFoodAmount(page: Page, amount?: number) {
+  if (!amount) return;
+  const dialog = activeDialog(page);
+  const textBoxes = dialog.locator("input.text-box:visible");
+  const count = await textBoxes.count().catch(() => 0);
+  if (count === 0) return;
+  await textBoxes.nth(count - 1).fill(String(amount));
+}
+
+async function fillFoodTime(page: Page, timestamp?: string) {
+  if (!timestamp) return;
+  const parsed = parseTime(timestamp);
+  if (!parsed) return;
+
+  const dialog = activeDialog(page);
+  const textBoxes = dialog.locator("input.text-box:visible");
+  if ((await textBoxes.count().catch(() => 0)) < 2) return;
+
+  await textBoxes.nth(0).fill(String(parsed.hour12));
+  await textBoxes.nth(1).fill(String(parsed.minute).padStart(2, "0"));
+
+  const periodButton = dialog.locator("button.dropdown-toggle:visible").filter({ hasText: /^(AM|PM)$/i }).first();
+  if ((await periodButton.count().catch(() => 0)) === 0) return;
+  const current = (await periodButton.innerText().catch(() => "")).trim().toUpperCase();
+  if (current === parsed.period) return;
+  await periodButton.click();
+  await page.locator(".dropdown-item:visible").filter({ hasText: new RegExp(`^${parsed.period}$`, "i") }).last().click().catch(() => undefined);
+}
+
+async function fillFoodUnit(page: Page, unit?: string) {
+  if (!unit) return;
+  const dialog = activeDialog(page);
+  const unitButton = dialog.locator("button.dropdown-toggle:visible").filter({ hasText: /g|oz|serving|size|cup|tbsp|tsp|piece|slice/i }).last();
+  if ((await unitButton.count().catch(() => 0)) === 0) return;
+  await unitButton.click();
+  const option = page.locator(".dropdown-item:visible").filter({ hasText: new RegExp(escapeRegExp(unit), "i") }).first();
+  if ((await option.count().catch(() => 0)) > 0) {
+    await option.click().catch(() => undefined);
+  } else {
+    await page.keyboard.press("Escape").catch(() => undefined);
+  }
+}
+
 async function fillLikelyAmount(page: Page, amount?: number) {
   if (!amount) return;
   const amountText = String(amount);
@@ -515,7 +597,25 @@ async function fillLikelyUnit(page: Page, unit?: string) {
 
 async function chooseMeal(page: Page, meal?: string) {
   if (!meal) return;
-  await page.getByText(meal, { exact: true }).click().catch(() => undefined);
+  const normalizedMeal = meal.trim();
+  const dialog = activeDialog(page);
+  const mealDropdown = dialog
+    .locator("button.dropdown-toggle:visible")
+    .filter({ hasText: /^(Breakfast|Lunch|Dinner|Snacks|Snack|Supplements)$/i })
+    .first();
+  if ((await mealDropdown.count().catch(() => 0)) === 0) {
+    await dialog.getByText(normalizedMeal, { exact: true }).click().catch(() => undefined);
+    return;
+  }
+  const current = (await mealDropdown.innerText().catch(() => "")).trim();
+  if (current.toLowerCase() === normalizedMeal.toLowerCase()) return;
+  await mealDropdown.click();
+  await page
+    .locator(".dropdown-item:visible")
+    .filter({ hasText: new RegExp(`^${escapeRegExp(normalizedMeal)}$`, "i") })
+    .last()
+    .click()
+    .catch(() => undefined);
 }
 
 async function fillLikelyName(page: Page, name: string) {
@@ -634,6 +734,65 @@ function parseFoodSearchResults(rawText: string, limit: number): SearchResult[] 
     })
     .filter((item, index, items) => items.findIndex((candidate) => candidate.name === item.name) === index)
     .slice(0, limit);
+}
+
+async function extractFoodSearchResults(page: Page, limit: number): Promise<SearchResult[]> {
+  const dialog = activeDialog(page);
+  return dialog
+    .locator("tr")
+    .evaluateAll((rows, max) => {
+      const results = [];
+      for (const row of rows) {
+        if (row.classList.contains("table-header")) continue;
+        const name = row.querySelector(".gwt-HTML")?.textContent?.replace(/\s+/g, " ").trim();
+        const source = row.querySelector(".source")?.textContent?.replace(/\s+/g, " ").trim();
+        if (!name || /^Description$/i.test(name)) continue;
+        results.push({
+          name,
+          source: source || undefined,
+          raw: `${name}${source ? ` ${source}` : ""}`,
+        });
+        if (results.length >= Number(max)) break;
+      }
+      return results;
+    }, limit)
+    .catch(() => []);
+}
+
+function pickFoodResult(query: string, results: SearchResult[], selectedName?: string) {
+  if (selectedName) {
+    const selected = results.find((result) => result.name.toLowerCase() === selectedName.toLowerCase());
+    if (selected) return selected;
+  }
+
+  const normalizedQuery = normalizeFoodName(query);
+  return (
+    results.find((result) => normalizeFoodName(result.name) === normalizedQuery) ??
+    results.find((result) => normalizeFoodName(result.name) === `${normalizedQuery} plain`) ??
+    results.find((result) => /\bplain\b/i.test(result.name)) ??
+    results[0]
+  );
+}
+
+function normalizeFoodName(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[,()[\]{}]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseTime(value: string) {
+  const match = value.trim().match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?$/i);
+  if (!match) return undefined;
+  let hour = Number(match[1]);
+  const minute = Number(match[2] ?? "0");
+  const explicitPeriod = match[3]?.toUpperCase();
+  if (hour > 23 || minute > 59) return undefined;
+  const period = explicitPeriod ?? (hour >= 12 ? "PM" : "AM");
+  if (hour === 0) hour = 12;
+  if (hour > 12) hour -= 12;
+  return { hour12: hour, minute, period };
 }
 
 function compactText(text: string, maxLength: number) {
