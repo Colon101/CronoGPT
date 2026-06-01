@@ -38,6 +38,7 @@ export function createProviderFromEnv(): CronometerProvider {
       serverlessChromium: env("CRONOMETER_SERVERLESS_CHROMIUM") !== "false",
       writeEnabled: env("CRONOMETER_ENABLE_WRITES") === "true",
       navigationTimeoutMs: Number(env("CRONOMETER_NAVIGATION_TIMEOUT_MS") ?? 20000),
+      loginBackoffMs: Number(env("CRONOMETER_LOGIN_BACKOFF_MS") ?? 15 * 60 * 1000),
     });
   }
 

@@ -26,6 +26,7 @@ export interface BrowserConfig {
   serverlessChromium: boolean;
   writeEnabled: boolean;
   navigationTimeoutMs: number;
+  loginBackoffMs: number;
 }
 
 interface SearchResult {
@@ -42,6 +43,8 @@ interface BrowserSession {
 
 const CRONOMETER_ORIGIN = "https://cronometer.com";
 let cachedStorageState: unknown;
+let loginBackoffUntil = 0;
+let lastLoginFailure: string | undefined;
 
 export class BrowserCronometerProvider extends BaseCronometerProvider {
   constructor(private readonly config: BrowserConfig) {
@@ -375,19 +378,37 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private async openApp(page: Page, hash = "") {
+    await page.goto(`${CRONOMETER_ORIGIN}/${hash}`);
+    await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
+    await page.waitForTimeout(1200);
+    if (await this.isLoggedIn(page)) return;
+
     await this.login(page);
     await page.goto(`${CRONOMETER_ORIGIN}/${hash}`);
     await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
-    await page.waitForTimeout(1800);
+    await page.waitForTimeout(1200);
+    if (!(await this.isLoggedIn(page))) {
+      throw new Error("Cronometer login succeeded but the app page did not load.");
+    }
   }
 
   private async login(page: Page) {
+    if (Date.now() < loginBackoffUntil) {
+      const waitSeconds = Math.ceil((loginBackoffUntil - Date.now()) / 1000);
+      throw new Error(`Cronometer login is paused for ${waitSeconds}s to avoid more rate-limit attempts. Last failure: ${lastLoginFailure ?? "unknown"}`);
+    }
+
     await page.goto(`${CRONOMETER_ORIGIN}/login/`);
     await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
-    await page.waitForTimeout(700);
+    await page.waitForTimeout(600);
 
     const bodyText = await this.visibleText(page);
-    if (/\bDashboard\b|\bDiary\b/.test(bodyText) && !/\bWelcome Back\b/.test(bodyText)) return;
+    if (await this.isLoggedIn(page, bodyText)) return;
+    const initialFailure = loginFailureReason(bodyText);
+    if (initialFailure) {
+      this.pauseLoginAttempts(initialFailure);
+      throw new Error(initialFailure);
+    }
 
     if (!this.config.email || !this.config.password) {
       throw new Error("Missing CRONOMETER_EMAIL/CRONOMETER_PASSWORD.");
@@ -396,12 +417,29 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     await page.getByLabel(/email/i).fill(this.config.email);
     await page.getByLabel(/password/i).fill(this.config.password);
     await page.getByRole("button", { name: /log in/i }).click();
-    await page.waitForTimeout(4500);
+    await page.waitForTimeout(3500);
 
     const afterLoginText = await this.visibleText(page);
-    if (!/\bDashboard\b|\bDiary\b/.test(afterLoginText)) {
-      throw new Error("Cronometer login did not reach the app. Check credentials, CAPTCHA, or two-factor prompts.");
+    if (!(await this.isLoggedIn(page, afterLoginText))) {
+      const failure = loginFailureReason(afterLoginText) ?? "Cronometer login did not reach the app. Check credentials, CAPTCHA, or two-factor prompts.";
+      this.pauseLoginAttempts(failure);
+      throw new Error(failure);
     }
+
+    loginBackoffUntil = 0;
+    lastLoginFailure = undefined;
+    cachedStorageState = await page.context().storageState().catch(() => cachedStorageState);
+  }
+
+  private async isLoggedIn(page: Page, text?: string) {
+    const bodyText = text ?? (await this.visibleText(page).catch(() => ""));
+    if (/\bWelcome Back\b|\bLOG IN\b|Too Many Attempts|captcha|robot|verify/i.test(bodyText)) return false;
+    return /\bDashboard\b|\bDiary\b|\bTrends\b|\bFoods\b/.test(bodyText);
+  }
+
+  private pauseLoginAttempts(reason: string) {
+    lastLoginFailure = reason;
+    loginBackoffUntil = Date.now() + this.config.loginBackoffMs;
   }
 
   private async visibleText(page: Page) {
@@ -425,6 +463,16 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
     let session: BrowserSession | undefined;
     try {
+      if (Date.now() < loginBackoffUntil && !this.storageState()) {
+        const waitSeconds = Math.ceil((loginBackoffUntil - Date.now()) / 1000);
+        return this.result(
+          feature,
+          "error",
+          undefined,
+          `Cronometer login is paused for ${waitSeconds}s to avoid more rate-limit attempts. Last failure: ${lastLoginFailure ?? "unknown"}`,
+          "browser",
+        );
+      }
       session = await this.newSession();
       const result = await handler(session.page);
       cachedStorageState = await session.context.storageState().catch(() => cachedStorageState);
@@ -813,6 +861,19 @@ function parseTime(value: string) {
   if (hour === 0) hour = 12;
   if (hour > 12) hour -= 12;
   return { hour12: hour, minute, period };
+}
+
+function loginFailureReason(text: string) {
+  if (/Too Many Attempts/i.test(text)) {
+    return "Cronometer is rate-limiting login attempts: Too Many Attempts. Please try again later.";
+  }
+  if (/captcha|robot|verify|challenge|cloudflare/i.test(text)) {
+    return "Cronometer is showing a bot/CAPTCHA verification challenge.";
+  }
+  if (/invalid|incorrect/i.test(text)) {
+    return "Cronometer rejected the configured email or password.";
+  }
+  return undefined;
 }
 
 function compactText(text: string, maxLength: number) {
