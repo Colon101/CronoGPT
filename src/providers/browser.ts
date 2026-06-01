@@ -34,12 +34,29 @@ export interface BrowserConfig {
   loginBackoffMs: number;
   operationTimeoutMs: number;
   browserRetryCount: number;
+  timeZone: string;
 }
 
 interface SearchResult {
   name: string;
   source?: string;
   raw: string;
+}
+
+interface DiaryDateStatus {
+  requestedDate?: string;
+  normalizedDate?: string;
+  currentDate: string;
+  appliedDate: string;
+  selected: boolean;
+  strategy: "current" | "today" | "arrow" | "invalid" | "out_of_range" | "failed";
+  steps?: number;
+  warning?: string;
+}
+
+interface FoodSearchOutcome {
+  results: SearchResult[];
+  dateStatus: DiaryDateStatus;
 }
 
 interface BrowserSession {
@@ -67,6 +84,7 @@ interface ParsedStorageState {
 
 const CRONOMETER_ORIGIN = "https://cronometer.com";
 const DIARY_MEAL_SECTION_RE = /\b(Breakfast|Lunch|Dinner|Snacks|Supplements)\b/i;
+const MAX_DIARY_ARROW_DAYS = 45;
 const CRONOMETER_PAGE_HASHES = {
   diary: "#diary",
   customFoods: "#custom-foods",
@@ -199,7 +217,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
       let foodSearch: { query: string; resultCount: number; firstResult?: SearchResult } | undefined;
       if (includeFoodSearch) {
-        const results = await this.searchFoodUi(page, foodQuery, 3);
+        const { results } = await this.searchFoodUi(page, foodQuery, 3);
         foodSearch = {
           query: foodQuery,
           resultCount: results.length,
@@ -276,13 +294,14 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   async getDailySummary(input: DateRangeInput) {
     return this.withPage("get_daily_summary", async (page) => {
-      await this.openApp(page, "#diary");
+      const dateStatus = await this.openDiary(page, input.date);
       const rawText = await this.waitForDiaryText(page);
-      return this.result("get_daily_summary", "ok", {
-        date: input.date ?? new Date().toISOString().slice(0, 10),
+      return this.result("get_daily_summary", dateStatus.selected ? "ok" : "needs_manual_step", {
+        date: dateStatus.appliedDate,
+        dateStatus,
         summary: parseDailySummary(rawText),
         rawText: compactText(rawText, 18000),
-      });
+      }, dateStatus.warning);
     });
   }
 
@@ -304,7 +323,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   async searchFoods(input: SearchFoodsInput) {
     return this.withPage("search_foods", async (page) => {
-      const results = await this.searchFoodUi(page, input.query, input.limit ?? 10);
+      const { results } = await this.searchFoodUi(page, input.query, input.limit ?? 10);
       return this.result("search_foods", "ok", {
         query: input.query,
         results,
@@ -370,7 +389,15 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   async logFood(input: FoodLogInput & { confirmed?: boolean }) {
     return this.withPage("log_food", async (page) => {
-      const preview = await this.searchFoodUi(page, input.query, 5);
+      const { results: preview, dateStatus } = await this.searchFoodUi(page, input.query, 5, input.date);
+      if (input.date && !dateStatus.selected) {
+        return this.result(
+          "log_food",
+          "needs_manual_step",
+          { input: safeInput(input), dateStatus },
+          dateStatus.warning ?? "Could not apply the requested diary date. No write was attempted.",
+        );
+      }
       const shouldWrite =
         this.config.writeEnabled &&
         input.dryRun !== true &&
@@ -387,6 +414,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
               : "Food log confirmation is required by CRONOMETER_REQUIRE_FOOD_CONFIRMATION.";
         return this.result("log_food", "dry_run", {
           input: safeInput(input),
+          dateStatus,
           preview,
           reason,
           nextStep: this.config.writeEnabled
@@ -430,6 +458,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       await page.waitForTimeout(1500);
       return this.result("log_food", "ok", {
         logged: { ...safeInput(input), selectedName },
+        dateStatus,
         visibleText: compactText(await this.visibleText(page), 6000),
       });
     });
@@ -535,13 +564,14 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   private async readDiarySection(feature: string, input: DateRangeInput, hints: string[]) {
     return this.withPage(feature, async (page) => {
-      await this.openApp(page, "#diary");
+      const dateStatus = await this.openDiary(page, input.date);
       const rawText = await this.waitForDiaryText(page);
-      return this.result(feature, "ok", {
-        date: input.date ?? new Date().toISOString().slice(0, 10),
+      return this.result(feature, dateStatus.selected ? "ok" : "needs_manual_step", {
+        date: dateStatus.appliedDate,
+        dateStatus,
         hints,
         rawText: compactText(rawText, 14000),
-      });
+      }, dateStatus.warning);
     });
   }
 
@@ -636,8 +666,9 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     });
   }
 
-  private async searchFoodUi(page: Page, query: string, limit: number): Promise<SearchResult[]> {
-    await this.openFoodSearchDialog(page);
+  private async searchFoodUi(page: Page, query: string, limit: number, date?: string): Promise<FoodSearchOutcome> {
+    const dateStatus = await this.openFoodSearchDialog(page, date);
+    if (date && !dateStatus.selected) return { results: [], dateStatus };
 
     const attempts: Array<string | undefined> = [undefined, "Custom", "Favorites", "All"];
     let fallbackTab: string | undefined;
@@ -655,7 +686,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       }
 
       if (hasExactFoodResult(query, results)) {
-        return results;
+        return { results, dateStatus };
       }
     }
 
@@ -666,20 +697,81 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         await clickFoodDialogFilter(page, "All");
       }
       const visibleResults = await searchCurrentFoodDialog(page, query, limit);
-      return visibleResults.length > 0 ? visibleResults : fallbackResults;
+      return { results: visibleResults.length > 0 ? visibleResults : fallbackResults, dateStatus };
     }
 
-    return [];
+    return { results: [], dateStatus };
   }
 
-  private async openFoodSearchDialog(page: Page) {
-    await this.openApp(page, "#diary");
-    await this.waitForDiaryText(page).catch(() => undefined);
+  private async openFoodSearchDialog(page: Page, date?: string) {
+    const dateStatus = await this.openDiary(page, date);
     const alreadyOpen = await activeDialog(page).isVisible().catch(() => false);
     if (!alreadyOpen) {
       await clickByText(page, /^FOOD$/i);
       await page.waitForTimeout(1000);
     }
+    return dateStatus;
+  }
+
+  private async openDiary(page: Page, date?: string) {
+    await this.openApp(page, "#diary");
+    await this.waitForDiaryText(page).catch(() => undefined);
+    return this.selectDiaryDate(page, date);
+  }
+
+  private async selectDiaryDate(page: Page, requestedDate?: string): Promise<DiaryDateStatus> {
+    const currentDate = todayIso(this.config.timeZone);
+    const parsed = normalizeDiaryDateInput(requestedDate, currentDate);
+    const base = {
+      requestedDate,
+      normalizedDate: parsed.date,
+      currentDate,
+      appliedDate: parsed.date ?? currentDate,
+    };
+
+    if (!requestedDate) {
+      return { ...base, appliedDate: currentDate, selected: true, strategy: "current" };
+    }
+    if (!parsed.date) {
+      return {
+        ...base,
+        selected: false,
+        strategy: "invalid",
+        warning: parsed.warning ?? "Use an ISO diary date like 2026-06-02, or today/yesterday/tomorrow.",
+      };
+    }
+
+    const days = daysBetweenIso(currentDate, parsed.date);
+    if (days === 0) {
+      return { ...base, selected: true, strategy: "today", steps: 0 };
+    }
+    if (Math.abs(days) > MAX_DIARY_ARROW_DAYS) {
+      return {
+        ...base,
+        selected: false,
+        strategy: "out_of_range",
+        steps: Math.abs(days),
+        warning: `Requested diary date is ${Math.abs(days)} days from today. This hosted browser flow only auto-navigates up to ${MAX_DIARY_ARROW_DAYS} days by Cronometer's day arrows.`,
+      };
+    }
+
+    const direction = days > 0 ? "next" : "previous";
+    for (let index = 0; index < Math.abs(days); index += 1) {
+      const clicked = await clickDiaryDateArrow(page, direction);
+      if (!clicked) {
+        return {
+          ...base,
+          selected: false,
+          strategy: "failed",
+          steps: index,
+          warning: "Could not find Cronometer's diary date arrow. No date-specific write was attempted.",
+        };
+      }
+      await page.waitForTimeout(450);
+    }
+
+    await this.waitForDiaryText(page).catch(() => undefined);
+    return { ...base, selected: true, strategy: "arrow", steps: Math.abs(days) };
   }
 
   private async openApp(page: Page, hash = "") {
@@ -955,6 +1047,69 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, message: string):
 function isTransientAutomationError(message: string) {
   if (/Too Many Attempts|captcha|robot|verify|invalid|incorrect|two.factor|2fa|login is paused/i.test(message)) return false;
   return /Target page|context.*closed|browser.*closed|browser.*disconnected|Execution context|Navigation timeout|Timeout .* exceeded|Timed out|Protocol error|net::ERR|ECONNRESET|EPIPE/i.test(message);
+}
+
+async function clickDiaryDateArrow(page: Page, direction: "previous" | "next") {
+  const nav = page.locator(".sidebar-diary-date .diary-date-nav:visible, .diary-date-nav:visible").first();
+  if (!(await nav.isVisible().catch(() => false))) return false;
+
+  const box = await nav.boundingBox().catch(() => undefined);
+  if (!box) return false;
+
+  const x = direction === "previous" ? box.x + 12 : box.x + box.width - 12;
+  await page.mouse.click(x, box.y + box.height / 2);
+  return true;
+}
+
+function normalizeDiaryDateInput(value: string | undefined, today: string): { date?: string; warning?: string } {
+  const normalized = value?.trim();
+  if (!normalized) return {};
+
+  const lower = normalized.toLowerCase();
+  if (lower === "today") return { date: today };
+  if (lower === "yesterday") return { date: addDaysIso(today, -1) };
+  if (lower === "tomorrow") return { date: addDaysIso(today, 1) };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+    return { warning: "CronoGPT currently accepts diary dates as YYYY-MM-DD, today, yesterday, or tomorrow." };
+  }
+
+  return isValidIsoDate(normalized)
+    ? { date: normalized }
+    : { warning: `Invalid diary date: ${normalized}` };
+}
+
+function todayIso(timeZone: string) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const get = (type: string) => parts.find((part) => part.type === type)?.value;
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+function isValidIsoDate(value: string) {
+  const [year, month, day] = value.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+}
+
+function addDaysIso(value: string, days: number) {
+  const [year, month, day] = value.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day + days));
+  return date.toISOString().slice(0, 10);
+}
+
+function daysBetweenIso(from: string, to: string) {
+  const fromTime = isoDateMs(from);
+  const toTime = isoDateMs(to);
+  return Math.round((toTime - fromTime) / 86400000);
+}
+
+function isoDateMs(value: string) {
+  const [year, month, day] = value.split("-").map(Number);
+  return Date.UTC(year, month - 1, day);
 }
 
 async function waitForVisibleText(page: Page, isReady: (text: string) => boolean, timeoutMs: number) {

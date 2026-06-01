@@ -48,6 +48,31 @@ await withClient(async (client) => {
     data: stability.structuredContent?.data,
   });
 
+  const datedFoodDryRun = await client.callTool({
+    name: "log_food",
+    arguments: {
+      date: "today",
+      meal: "Breakfast",
+      query: "Banana cream",
+      amount: 1,
+      unit: "pint",
+      dryRun: true,
+      confirmed: false,
+    },
+  });
+  checks.push({
+    name: "dated_food_dry_run",
+    ok: datedFoodDryRun.structuredContent?.status === "dry_run" &&
+      datedFoodDryRun.structuredContent?.data?.dateStatus?.selected === true &&
+      Array.isArray(datedFoodDryRun.structuredContent?.data?.preview) &&
+      datedFoodDryRun.structuredContent.data.preview.length > 0,
+    data: {
+      status: datedFoodDryRun.structuredContent?.status,
+      dateStatus: datedFoodDryRun.structuredContent?.data?.dateStatus,
+      previewCount: datedFoodDryRun.structuredContent?.data?.preview?.length,
+    },
+  });
+
   const dryRun = await client.callTool({
     name: "create_custom_food",
     arguments: {

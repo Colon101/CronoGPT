@@ -42,6 +42,7 @@ export function createProviderFromEnv(): CronometerProvider {
       loginBackoffMs: Number(env("CRONOMETER_LOGIN_BACKOFF_MS") ?? 15 * 60 * 1000),
       operationTimeoutMs: Number(env("CRONOMETER_OPERATION_TIMEOUT_MS") ?? 55000),
       browserRetryCount: Number(env("CRONOMETER_BROWSER_RETRY_COUNT") ?? 1),
+      timeZone: env("CRONOMETER_TIME_ZONE") ?? "Asia/Jerusalem",
     });
   }
 
