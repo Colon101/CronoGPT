@@ -79,6 +79,8 @@ Food logs write directly when `CRONOMETER_ENABLE_WRITES=true` unless the tool ca
 
 Browser-backed tools are serialized inside each warm serverless instance to reduce Chromium contention. `CRONOMETER_OPERATION_TIMEOUT_MS` bounds individual browser attempts, and `CRONOMETER_BROWSER_RETRY_COUNT` retries transient automation failures without retrying login/CAPTCHA/credential failures.
 
+Before a long ChatGPT workflow, call `cronometer_stability_check`. It verifies hosted login, Diary readability, and a small food search in one queued browser job without writing data.
+
 To create a durable Cronometer session for Vercel, run this locally after confirming `.env` has the Cronometer credentials:
 
 ```bash
@@ -134,6 +136,7 @@ The existing lowercase `email` and `password` keys are supported only for local 
 - `cronometer_capabilities`
 - `cronometer_runtime_status`
 - `refresh_cronometer_session`
+- `cronometer_stability_check`
 - `read_cronometer_page`
 - `run_cronometer_ui_flow`
 - `get_daily_summary`

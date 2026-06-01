@@ -14,6 +14,7 @@ import type {
   ResolveRecipeIngredientsInput,
   RepeatItemInput,
   SearchFoodsInput,
+  StabilityCheckInput,
   TargetsInput,
   UiFlowInput,
   UiFlowStep,
@@ -146,6 +147,49 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           hasDashboard: /\bDashboard\b/i.test(visibleText),
         },
       });
+    });
+  }
+
+  async stabilityCheck(input: StabilityCheckInput): Promise<ProviderResult> {
+    const foodQuery = input.foodQuery?.trim() || "Banana cream";
+    const includeFoodSearch = input.includeFoodSearch !== false;
+
+    return this.withPage("cronometer_stability_check", async (page) => {
+      const startedAt = Date.now();
+      await this.openApp(page, "#diary");
+      const diaryText = await this.visibleText(page).catch(() => "");
+      const checks = {
+        loggedIn: await this.isLoggedIn(page, diaryText),
+        diaryReadable: /\bDiary\b/i.test(diaryText),
+        hasMealSections: /\b(Breakfast|Lunch|Dinner|Snacks|Supplements)\b/i.test(diaryText),
+        hasNavigation: /\b(Dashboard|Diary|Trends|Foods)\b/i.test(diaryText),
+      };
+
+      let foodSearch: { query: string; resultCount: number; firstResult?: SearchResult } | undefined;
+      if (includeFoodSearch) {
+        const results = await this.searchFoodUi(page, foodQuery, 3);
+        foodSearch = {
+          query: foodQuery,
+          resultCount: results.length,
+          firstResult: results[0],
+        };
+      }
+
+      const ready = checks.loggedIn && checks.diaryReadable && checks.hasNavigation && (!includeFoodSearch || Boolean(foodSearch?.resultCount));
+      return this.result("cronometer_stability_check", ready ? "ok" : "needs_manual_step", {
+        ready,
+        elapsedMs: Date.now() - startedAt,
+        checks,
+        foodSearch,
+        runtime: {
+          storageStateConfigured: Boolean(this.config.storageState),
+          warmStorageStateCached: Boolean(cachedStorageState),
+          activeBrowserJobs,
+          queuedBrowserJobs,
+          operationTimeoutMs: this.config.operationTimeoutMs,
+          browserRetryCount: this.config.browserRetryCount,
+        },
+      }, ready ? undefined : "Cronometer preflight did not pass every readiness check.");
     });
   }
 

@@ -27,6 +27,14 @@ export const FEATURE_DEFINITIONS: FeatureDefinition[] = [
     notes: "Opens Cronometer once to verify login and warm the hosted browser storage cache without writing diary data.",
   },
   {
+    id: "cronometer_stability_check",
+    group: "capabilities",
+    title: "Run Cronometer stability check",
+    preferredBackend: "browser",
+    supportedModes: ["mock"],
+    notes: "Read-only preflight that verifies hosted login, Diary readability, and optional food search before a workflow.",
+  },
+  {
     id: "read_cronometer_page",
     group: "capabilities",
     title: "Read Cronometer page",
@@ -399,6 +407,7 @@ export const FEATURE_DEFINITIONS: FeatureDefinition[] = [
 const BROWSER_FEATURE_STATUS: Record<string, ProviderStatus> = {
   cronometer_runtime_status: "ok",
   refresh_cronometer_session: "ok",
+  cronometer_stability_check: "ok",
   read_cronometer_page: "ok",
   run_cronometer_ui_flow: "needs_manual_step",
   get_daily_summary: "ok",

@@ -189,6 +189,18 @@ export function createCronoServer() {
   );
 
   register(
+    "cronometer_stability_check",
+    "Run Cronometer stability check",
+    "Read-only preflight that verifies hosted Cronometer login, Diary readability, and optional food search before a workflow.",
+    {
+      foodQuery: z.string().optional(),
+      includeFoodSearch: z.boolean().optional(),
+    },
+    { readOnlyHint: true, openWorldHint: true },
+    async (args) => toMcpToolResponse(await provider.stabilityCheck(args)),
+  );
+
+  register(
     "read_cronometer_page",
     "Read Cronometer page",
     "Reads visible text from a major Cronometer page as a fallback when a specialized parser is not enough.",

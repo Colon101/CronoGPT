@@ -14,6 +14,7 @@ import type {
   ResolveRecipeIngredientsInput,
   RepeatItemInput,
   SearchFoodsInput,
+  StabilityCheckInput,
   TargetsInput,
   BackendMode,
   UiFlowInput,
@@ -39,6 +40,14 @@ export class BaseCronometerProvider implements CronometerProvider {
 
   async refreshSession(): Promise<ProviderResult> {
     return this.unsupported("refresh_cronometer_session");
+  }
+
+  async stabilityCheck(input: StabilityCheckInput): Promise<ProviderResult> {
+    return this.result("cronometer_stability_check", this.mode === "mock" ? "dry_run" : "unsupported", {
+      input,
+      provider: this.name,
+      mode: this.mode,
+    });
   }
 
   async readFeaturePage(feature: string, hash: string, input: unknown): Promise<ProviderResult> {

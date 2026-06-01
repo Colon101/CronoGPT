@@ -69,6 +69,11 @@ export interface SearchFoodsInput {
   limit?: number;
 }
 
+export interface StabilityCheckInput {
+  foodQuery?: string;
+  includeFoodSearch?: boolean;
+}
+
 export interface RecipeIngredientInput {
   query: string;
   selectedName?: string;
@@ -192,6 +197,7 @@ export interface CronometerProvider {
   capabilities(): Promise<ProviderResult<Capability[]>>;
   runtimeStatus(): Promise<ProviderResult>;
   refreshSession(): Promise<ProviderResult>;
+  stabilityCheck(input: StabilityCheckInput): Promise<ProviderResult>;
   readFeaturePage(feature: string, hash: string, input: unknown): Promise<ProviderResult>;
   getDailySummary(input: DateRangeInput): Promise<ProviderResult>;
   listFoodEntries(input: DateRangeInput): Promise<ProviderResult>;
