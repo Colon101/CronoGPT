@@ -42,7 +42,9 @@ await withClient(async (client) => {
   });
   checks.push({
     name: "stability",
-    ok: stability.structuredContent?.status === "ok" && stability.structuredContent?.data?.ready === true,
+    ok: stability.structuredContent?.status === "ok" &&
+      stability.structuredContent?.data?.ready === true &&
+      stability.structuredContent?.data?.checks?.hasMealSections === true,
     data: stability.structuredContent?.data,
   });
 

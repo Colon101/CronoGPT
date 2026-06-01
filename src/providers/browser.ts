@@ -66,6 +66,7 @@ interface ParsedStorageState {
 }
 
 const CRONOMETER_ORIGIN = "https://cronometer.com";
+const DIARY_MEAL_SECTION_RE = /\b(Breakfast|Lunch|Dinner|Snacks|Supplements)\b/i;
 const CRONOMETER_PAGE_HASHES = {
   diary: "#diary",
   customFoods: "#custom-foods",
@@ -188,11 +189,11 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     return this.withPage("cronometer_stability_check", async (page) => {
       const startedAt = Date.now();
       await this.openApp(page, "#diary");
-      const diaryText = await this.visibleText(page).catch(() => "");
+      const diaryText = await this.waitForDiaryText(page);
       const checks = {
         loggedIn: await this.isLoggedIn(page, diaryText),
         diaryReadable: /\bDiary\b/i.test(diaryText),
-        hasMealSections: /\b(Breakfast|Lunch|Dinner|Snacks|Supplements)\b/i.test(diaryText),
+        hasMealSections: hasDiaryMealSections(diaryText),
         hasNavigation: /\b(Dashboard|Diary|Trends|Foods)\b/i.test(diaryText),
       };
 
@@ -206,12 +207,13 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         };
       }
 
-      const ready = checks.loggedIn && checks.diaryReadable && checks.hasNavigation && (!includeFoodSearch || Boolean(foodSearch?.resultCount));
+      const ready = checks.loggedIn && checks.diaryReadable && checks.hasMealSections && checks.hasNavigation && (!includeFoodSearch || Boolean(foodSearch?.resultCount));
       return this.result("cronometer_stability_check", ready ? "ok" : "needs_manual_step", {
         ready,
         elapsedMs: Date.now() - startedAt,
         checks,
         foodSearch,
+        diaryText: ready ? undefined : compactText(diaryText, 8000),
         runtime: {
           storageStateConfigured: Boolean(this.config.storageState),
           warmStorageStateCached: Boolean(cachedStorageState),
@@ -275,7 +277,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   async getDailySummary(input: DateRangeInput) {
     return this.withPage("get_daily_summary", async (page) => {
       await this.openApp(page, "#diary");
-      const rawText = await this.visibleText(page);
+      const rawText = await this.waitForDiaryText(page);
       return this.result("get_daily_summary", "ok", {
         date: input.date ?? new Date().toISOString().slice(0, 10),
         summary: parseDailySummary(rawText),
@@ -534,7 +536,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   private async readDiarySection(feature: string, input: DateRangeInput, hints: string[]) {
     return this.withPage(feature, async (page) => {
       await this.openApp(page, "#diary");
-      const rawText = await this.visibleText(page);
+      const rawText = await this.waitForDiaryText(page);
       return this.result(feature, "ok", {
         date: input.date ?? new Date().toISOString().slice(0, 10),
         hints,
@@ -672,6 +674,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   private async openFoodSearchDialog(page: Page) {
     await this.openApp(page, "#diary");
+    await this.waitForDiaryText(page).catch(() => undefined);
     const alreadyOpen = await activeDialog(page).isVisible().catch(() => false);
     if (!alreadyOpen) {
       await clickByText(page, /^FOOD$/i);
@@ -746,6 +749,14 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   private async visibleText(page: Page) {
     return page.locator("body").innerText({ timeout: this.config.navigationTimeoutMs });
+  }
+
+  private async waitForDiaryText(page: Page) {
+    return waitForVisibleText(
+      page,
+      (text) => /\bDiary\b/i.test(text) && hasDiaryMealSections(text),
+      Math.min(this.config.navigationTimeoutMs, 12000),
+    );
   }
 
   private async withPage(feature: string, handler: (page: Page) => Promise<ProviderResult>): Promise<ProviderResult> {
@@ -944,6 +955,23 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, message: string):
 function isTransientAutomationError(message: string) {
   if (/Too Many Attempts|captcha|robot|verify|invalid|incorrect|two.factor|2fa|login is paused/i.test(message)) return false;
   return /Target page|context.*closed|browser.*closed|browser.*disconnected|Execution context|Navigation timeout|Timeout .* exceeded|Timed out|Protocol error|net::ERR|ECONNRESET|EPIPE/i.test(message);
+}
+
+async function waitForVisibleText(page: Page, isReady: (text: string) => boolean, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  let lastText = "";
+
+  while (Date.now() < deadline) {
+    lastText = await page.locator("body").innerText({ timeout: Math.min(3000, timeoutMs) }).catch(() => lastText);
+    if (isReady(lastText)) return lastText;
+    await page.waitForTimeout(Math.min(600, Math.max(0, deadline - Date.now())));
+  }
+
+  return lastText || page.locator("body").innerText({ timeout: 3000 }).catch(() => "");
+}
+
+function hasDiaryMealSections(text: string) {
+  return DIARY_MEAL_SECTION_RE.test(text);
 }
 
 function storageStateStats(state: unknown): {
