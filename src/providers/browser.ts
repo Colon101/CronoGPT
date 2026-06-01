@@ -354,10 +354,15 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     await clickByText(page, /^FOOD$/i);
     await page.waitForTimeout(1000);
 
-    const searchBox = page
-      .locator('input[placeholder*="Search"], input.gwt-TextBox.search-field, input[type="text"]')
-      .filter({ hasNotText: /^$/ })
-      .first();
+    const searchBox = await firstVisibleLocator(page, [
+      page.getByPlaceholder(/Search all foods/i),
+      page.getByPlaceholder(/Search/i),
+      page.locator("input.gwt-TextBox.search-field:visible").last(),
+      page.locator('input[type="text"]:visible').last(),
+    ]);
+    if (!searchBox) {
+      throw new Error("Food search input was not found after opening the Cronometer food dialog.");
+    }
     await searchBox.fill(query);
     await clickByText(page, /^SEARCH$/i);
     await page.waitForTimeout(1800);
@@ -487,7 +492,7 @@ async function fillLikelyAmount(page: Page, amount?: number) {
   const amountText = String(amount);
   const selectors = [
     page.getByLabel(/amount|serving|quantity/i),
-    page.locator("input[type='number']").first(),
+    page.locator("input[type='number']:visible").first(),
   ];
   for (const selector of selectors) {
     if ((await selector.count().catch(() => 0)) === 0) continue;
@@ -516,7 +521,7 @@ async function chooseMeal(page: Page, meal?: string) {
 async function fillLikelyName(page: Page, name: string) {
   const selectors = [
     page.getByLabel(/name|description/i),
-    page.locator("input[type='text']").filter({ hasNotText: /Search/i }).first(),
+    page.locator('input[type="text"]:visible').first(),
   ];
   for (const selector of selectors) {
     if ((await selector.count().catch(() => 0)) === 0) continue;
@@ -548,8 +553,13 @@ async function addRecipeIngredient(page: Page, ingredient: RecipeInput["ingredie
   if (!clickedAdd) return { status: "not_found", warning: "ADD INGREDIENTS button was not found." };
 
   await page.waitForTimeout(800);
-  const search = page.locator('input[placeholder*="Search all foods"], input.gwt-TextBox.search-field').last();
-  if ((await search.count().catch(() => 0)) === 0) {
+  const search = await firstVisibleLocator(page, [
+    page.getByPlaceholder(/Search all foods/i),
+    page.getByPlaceholder(/Search/i),
+    page.locator("input.gwt-TextBox.search-field:visible").last(),
+    page.locator('input[type="text"]:visible').last(),
+  ]);
+  if (!search) {
     return { status: "not_found", warning: "Ingredient search input was not found." };
   }
 
@@ -629,6 +639,16 @@ function parseFoodSearchResults(rawText: string, limit: number): SearchResult[] 
 function compactText(text: string, maxLength: number) {
   const normalized = text.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
   return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}...` : normalized;
+}
+
+async function firstVisibleLocator(page: Page, locators: ReturnType<Page["locator"]>[]) {
+  for (const locator of locators) {
+    if ((await locator.count().catch(() => 0)) === 0) continue;
+    const candidate = locator.first();
+    if (!(await candidate.isVisible().catch(() => false))) continue;
+    return candidate;
+  }
+  return undefined;
 }
 
 function safeInput<T>(input: T): T {
