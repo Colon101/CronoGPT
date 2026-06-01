@@ -1,0 +1,150 @@
+# CronoGPT
+
+CronoGPT is a starter Apps SDK/MCP server for controlling or reading Cronometer from ChatGPT.
+
+## API reality
+
+As of the current public sources, Cronometer does not appear to offer a first-party public API for normal user accounts. The practical API-backed option is Terra, which advertises a Cronometer integration for synced nutrition, workout, and health-metric data. Cronometer itself officially supports web CSV export for diary data.
+
+That means the architecture should be:
+
+1. API-backed reads through Terra when available.
+2. CSV import/export fallback for official Cronometer exports.
+3. Browser automation only as a local fallback for actions that no supported API exposes, such as logging foods directly in Cronometer.
+
+Do not deploy Cronometer email/password credentials to an unprotected server. This repo gates `/mcp` with `CRONOGPT_API_TOKEN`; for a multi-user ChatGPT app with personal data or write actions, replace that private token gate with OAuth and store per-user tokens or connection state.
+
+## What ChatGPT needs
+
+ChatGPT connects to an Apps SDK app by calling an HTTPS MCP endpoint, usually `/mcp`. This repo exposes:
+
+- `GET /` health check
+- `POST|GET|DELETE /mcp` MCP endpoint
+- Apps SDK widget resource at `ui://widget/cronometer-dashboard.html`
+- Tool framework for diary reads, logging actions, targets, reports, fasting, recipes, and capability discovery
+
+## Local setup
+
+```bash
+npm install
+npm run build
+npm start
+```
+
+The local MCP endpoint is:
+
+```text
+http://localhost:8787/mcp
+```
+
+Use the inspector while developing:
+
+```bash
+npm run inspect
+```
+
+To connect from ChatGPT, expose the server over HTTPS with a tunnel, then create a connector in ChatGPT developer mode using:
+
+```text
+https://your-tunnel.example/mcp
+```
+
+## Vercel setup
+
+This repo includes a Vercel function at `api/mcp.ts` and rewrites `/mcp` to it.
+
+Set these Vercel environment variables:
+
+```text
+APP_PUBLIC_ORIGIN=https://your-project.vercel.app
+CRONOGPT_API_TOKEN=generate-a-long-random-token
+CRONOMETER_BACKEND=browser
+CRONOMETER_EMAIL=...
+CRONOMETER_PASSWORD=...
+REMOTE_CHROME_WS_ENDPOINT=wss://your-remote-chrome-endpoint
+CRONOMETER_ENABLE_WRITES=false
+```
+
+Use `CRONOMETER_ENABLE_WRITES=true` only after dry-run testing. Write tools require `dryRun=false` and `confirmed=true`; otherwise they return a preview.
+
+For more reliable read data, add Terra:
+
+```text
+TERRA_API_KEY=...
+TERRA_DEV_ID=...
+TERRA_USER_ID=...
+```
+
+ChatGPT connector URL after deployment:
+
+```text
+https://your-project.vercel.app/mcp
+```
+
+The deployed `/mcp` endpoint requires:
+
+```text
+Authorization: Bearer your-cronogpt-api-token
+```
+
+If the ChatGPT connector UI you use cannot send a static bearer token, use OAuth in front of this server before enabling write tools.
+
+## Backends
+
+Set `CRONOMETER_BACKEND` in `.env`:
+
+- `mock`: local dry-run data, safe default.
+- `terra`: API-backed read framework using `TERRA_API_KEY`, `TERRA_DEV_ID`, and `TERRA_USER_ID`.
+- `browser`: hosted browser automation through `REMOTE_CHROME_WS_ENDPOINT`. This cannot reuse the Codex `@chrome` plugin from ChatGPT.
+
+The existing lowercase `email` and `password` keys are supported only for local browser-framework detection. Prefer `CRONOMETER_EMAIL` and `CRONOMETER_PASSWORD`.
+
+## Current tool map
+
+- `cronometer_capabilities`
+- `get_daily_summary`
+- `list_food_entries`
+- `list_biometrics`
+- `list_exercises`
+- `list_notes`
+- `search_foods`
+- `resolve_recipe_ingredients`
+- `log_food`
+- `log_exercise`
+- `log_biometric`
+- `log_note`
+- `create_custom_food`
+- `list_custom_foods`
+- `create_custom_meal`
+- `list_custom_meals`
+- `list_custom_recipes`
+- `create_recipe`
+- `get_targets`
+- `set_targets`
+- `export_data`
+- `get_charts`
+- `get_nutrition_report`
+- `get_print_report`
+- `list_snapshots`
+- `create_snapshot`
+- `start_fast`
+- `stop_fast`
+- `get_profile`
+- `set_profile`
+- `get_macro_scheduler`
+- `set_macro_scheduler`
+- `get_display_settings`
+- `set_display_settings`
+- `list_devices`
+- `connect_device`
+- `get_sharing`
+- `set_sharing`
+- `get_account`
+- `ask_oracle`
+- `suggest_food`
+- `list_repeat_items`
+- `schedule_repeat_item`
+- `bulk_delete_entries` (disabled framework stub)
+- `delete_account` (disabled framework stub)
+
+See `docs/cronometer-chatgpt-plan.md` for the feature matrix and shipping checklist.

@@ -1,0 +1,43 @@
+import { BrowserCronometerProvider } from "./browser.js";
+import { MockCronometerProvider } from "./mock.js";
+import { TerraCronometerProvider } from "./terra.js";
+import type { BackendMode, CronometerProvider } from "../domain.js";
+
+function env(name: string): string | undefined {
+  const value = process.env[name];
+  return value && value.trim() ? value.trim() : undefined;
+}
+
+export function createProviderFromEnv(): CronometerProvider {
+  const requested = env("CRONOMETER_BACKEND") as BackendMode | undefined;
+  const hasTerra = Boolean(env("TERRA_API_KEY") && env("TERRA_DEV_ID") && env("TERRA_USER_ID"));
+  const hasBrowserCredentials = Boolean(
+    (env("CRONOMETER_EMAIL") || env("email")) && (env("CRONOMETER_PASSWORD") || env("password")),
+  );
+
+  const mode: BackendMode = requested ?? (hasTerra ? "terra" : hasBrowserCredentials ? "browser" : "mock");
+
+  if (mode === "terra") {
+    if (!hasTerra) {
+      return new MockCronometerProvider();
+    }
+    return new TerraCronometerProvider({
+      apiBaseUrl: env("TERRA_API_BASE_URL") ?? "https://api.tryterra.co/v2",
+      apiKey: env("TERRA_API_KEY") ?? "",
+      devId: env("TERRA_DEV_ID") ?? "",
+      userId: env("TERRA_USER_ID") ?? "",
+    });
+  }
+
+  if (mode === "browser") {
+    return new BrowserCronometerProvider({
+      email: env("CRONOMETER_EMAIL") ?? env("email"),
+      password: env("CRONOMETER_PASSWORD") ?? env("password"),
+      remoteWsEndpoint: env("REMOTE_CHROME_WS_ENDPOINT") ?? env("BROWSERLESS_WS_ENDPOINT"),
+      writeEnabled: env("CRONOMETER_ENABLE_WRITES") === "true",
+      navigationTimeoutMs: Number(env("CRONOMETER_NAVIGATION_TIMEOUT_MS") ?? 20000),
+    });
+  }
+
+  return new MockCronometerProvider();
+}

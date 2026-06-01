@@ -1,0 +1,24 @@
+{
+  "name": "cronogpt",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/server.ts",
+    "start": "node dist/src/server.js",
+    "inspect": "npx @modelcontextprotocol/inspector@latest --server-url http://localhost:${PORT:-8787}/mcp --transport http"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "^1.0.1",
+    "@modelcontextprotocol/sdk": "^1.20.2",
+    "dotenv": "^17.2.3",
+    "playwright-core": "^1.60.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}
