@@ -378,20 +378,37 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     await clickByText(page, /^FOOD$/i);
     await page.waitForTimeout(1000);
 
-    const searchBox = await firstVisibleLocator(page, [
-      page.getByPlaceholder(/Search all foods/i),
-      page.getByPlaceholder(/Search/i),
-      page.locator("input.gwt-TextBox.search-field:visible").last(),
-      page.locator('input[type="text"]:visible').last(),
-    ]);
-    if (!searchBox) {
-      throw new Error("Food search input was not found after opening the Cronometer food dialog.");
-    }
-    await searchBox.fill(query);
-    await clickByText(page, /^SEARCH$/i);
-    await page.waitForTimeout(1800);
+    const attempts: Array<string | undefined> = [undefined, "Custom", "Favorites", "All"];
+    let fallbackTab: string | undefined;
+    let fallbackResults: SearchResult[] = [];
 
-    return extractFoodSearchResults(page, limit);
+    for (const tab of attempts) {
+      if (tab && !(await clickFoodDialogFilter(page, tab))) continue;
+
+      const results = await searchCurrentFoodDialog(page, query, limit);
+      if (results.length === 0) continue;
+
+      if (!fallbackResults.length || tab === "Custom") {
+        fallbackTab = tab;
+        fallbackResults = results;
+      }
+
+      if (hasExactFoodResult(query, results)) {
+        return results;
+      }
+    }
+
+    if (fallbackResults.length > 0) {
+      if (fallbackTab) {
+        await clickFoodDialogFilter(page, fallbackTab);
+      } else {
+        await clickFoodDialogFilter(page, "All");
+      }
+      const visibleResults = await searchCurrentFoodDialog(page, query, limit);
+      return visibleResults.length > 0 ? visibleResults : fallbackResults;
+    }
+
+    return [];
   }
 
   private async openApp(page: Page, hash = "") {
@@ -594,6 +611,57 @@ async function clickDialogButton(page: Page, label: string | RegExp) {
   return false;
 }
 
+async function clickFoodDialogFilter(page: Page, label: string) {
+  const dialog = activeDialog(page);
+  const exact = new RegExp(`^${escapeRegExp(label)}$`, "i");
+  const candidates = [
+    dialog.getByRole("tab", { name: exact }),
+    dialog.getByRole("button", { name: exact }),
+    dialog.locator(".gwt-TabBarItem,.gwt-Button,.gwt-ToggleButton,[role='tab'],button").filter({ hasText: exact }),
+    dialog.locator("td,div,span").filter({ hasText: exact }),
+  ];
+
+  for (const candidate of candidates) {
+    const count = await candidate.count().catch(() => 0);
+    for (let index = 0; index < Math.min(count, 8); index += 1) {
+      const item = candidate.nth(index);
+      if (!(await item.isVisible().catch(() => false))) continue;
+      await item.click().catch(() => undefined);
+      await page.waitForTimeout(500);
+      return true;
+    }
+  }
+  return false;
+}
+
+async function searchCurrentFoodDialog(page: Page, query: string, limit: number) {
+  const searchBox = await foodSearchBox(page);
+  if (!searchBox) {
+    throw new Error("Food search input was not found after opening the Cronometer food dialog.");
+  }
+
+  await searchBox.click();
+  await page.keyboard.press("Control+A").catch(() => undefined);
+  await page.keyboard.type(query, { delay: 10 });
+  await searchBox.fill(query).catch(() => undefined);
+  const searched = await clickDialogButton(page, /^SEARCH$/i);
+  if (!searched) {
+    await clickByText(page, /^SEARCH$/i);
+  }
+  await page.waitForTimeout(1800);
+
+  return collectFoodSearchResults(page, limit);
+}
+
+async function foodSearchBox(page: Page) {
+  return firstVisibleLocator(page, [
+    activeDialog(page).getByPlaceholder(/Search all foods/i),
+    activeDialog(page).getByPlaceholder(/Search/i),
+    activeDialog(page).locator("input.gwt-TextBox.search-field:visible").last(),
+    activeDialog(page).locator('input[type="text"]:visible').last(),
+  ]);
+}
+
 async function clickFoodSearchResult(page: Page, selectedName: string) {
   const dialog = activeDialog(page);
   const exactCell = dialog.locator(".gwt-HTML").filter({ hasText: new RegExp(`^${escapeRegExp(selectedName)}$`, "i") });
@@ -602,9 +670,25 @@ async function clickFoodSearchResult(page: Page, selectedName: string) {
     return true;
   }
 
+  const rows = dialog.locator("tr:visible");
+  const count = await rows.count().catch(() => 0);
+  for (let index = 0; index < count; index += 1) {
+    const row = rows.nth(index);
+    const parsed = parseFoodRowText(await row.innerText().catch(() => ""));
+    if (!parsed) continue;
+    if (normalizeFoodName(parsed.name) !== normalizeFoodName(selectedName)) continue;
+
+    await row.scrollIntoViewIfNeeded().catch(() => undefined);
+    await row.focus().catch(() => undefined);
+    await row.click().catch(() => undefined);
+    await page.keyboard.press("Enter").catch(() => undefined);
+    return true;
+  }
+
   const row = dialog.locator("tr").filter({ hasText: selectedName }).filter({ hasNotText: /^DescriptionSource$/i }).first();
   if ((await row.count().catch(() => 0)) > 0 && (await row.isVisible().catch(() => false))) {
-    await row.click();
+    await row.click().catch(() => undefined);
+    await page.keyboard.press("Enter").catch(() => undefined);
     return true;
   }
 
@@ -643,7 +727,10 @@ async function fillFoodTime(page: Page, timestamp?: string) {
 async function fillFoodUnit(page: Page, unit?: string) {
   if (!unit) return;
   const dialog = activeDialog(page);
-  const unitButton = dialog.locator("button.dropdown-toggle:visible").filter({ hasText: /g|oz|serving|size|cup|tbsp|tsp|piece|slice/i }).last();
+  const unitButton = dialog
+    .locator("button.dropdown-toggle:visible")
+    .filter({ hasText: /g|oz|serving|size|cup|tbsp|tsp|piece|slice|pint|pt|quart|ml|liter|litre/i })
+    .last();
   if ((await unitButton.count().catch(() => 0)) === 0) return;
   await unitButton.click();
   const option = page.locator(".dropdown-item:visible").filter({ hasText: new RegExp(escapeRegExp(unit), "i") }).first();
@@ -808,9 +895,9 @@ function parseFoodSearchResults(rawText: string, limit: number): SearchResult[] 
     .split(/\r?\n/)
     .map((line) => line.replace(/\s+/g, " ").trim())
     .filter((line) => line.length > 2)
-    .filter((line) => !/^(SEARCH|All|Favorites|Common Foods|Beverages|Supplements|Brands|Restaurants|Custom)$/i.test(line))
+    .filter((line) => !/^(SEARCH|All|Favorites|Common Foods|Beverages|Supplements|Brands|Restaurants|Custom|Recipes)$/i.test(line))
     .map((line) => {
-      const sourceMatch = line.match(/\b(NCCDB|USDA|Custom Food|CRDB|Restaurant|Brand)$/i);
+      const sourceMatch = line.match(foodSourcePattern());
       return {
         name: sourceMatch ? line.slice(0, sourceMatch.index).trim() : line,
         source: sourceMatch?.[1],
@@ -829,8 +916,9 @@ async function extractFoodSearchResults(page: Page, limit: number): Promise<Sear
       const results = [];
       for (const row of rows) {
         if (row.classList.contains("table-header")) continue;
-        const name = row.querySelector(".gwt-HTML")?.textContent?.replace(/\s+/g, " ").trim();
-        const source = row.querySelector(".source")?.textContent?.replace(/\s+/g, " ").trim();
+        const cells = Array.from(row.querySelectorAll("td")).map((cell) => cell.textContent?.replace(/\s+/g, " ").trim() ?? "").filter(Boolean);
+        const name = row.querySelector(".gwt-HTML")?.textContent?.replace(/\s+/g, " ").trim() || cells[0];
+        const source = row.querySelector(".source")?.textContent?.replace(/\s+/g, " ").trim() || cells[1];
         if (!name || /^Description$/i.test(name)) continue;
         results.push({
           name,
@@ -842,6 +930,51 @@ async function extractFoodSearchResults(page: Page, limit: number): Promise<Sear
       return results;
     }, limit)
     .catch(() => []);
+}
+
+async function collectFoodSearchResults(page: Page, limit: number) {
+  const tableResults = await extractFoodSearchResults(page, limit * 2);
+  const dialogText = await activeDialog(page).innerText().catch(() => "");
+  const textResults = parseFoodSearchResults(dialogText, limit * 2);
+  return mergeFoodResults([...tableResults, ...textResults]).slice(0, limit);
+}
+
+function parseFoodRowText(rawText: string): SearchResult | undefined {
+  const lines = rawText
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  const compact = rawText.replace(/\s+/g, " ").trim();
+  if (!compact || /^(Description Source|SEARCH)$/i.test(compact)) return undefined;
+
+  if (lines.length >= 2 && !/Description/i.test(lines[0])) {
+    return { name: lines[0], source: lines[1], raw: compact };
+  }
+
+  const sourceMatch = compact.match(foodSourcePattern());
+  const name = sourceMatch ? compact.slice(0, sourceMatch.index).trim() : compact;
+  if (!name || /^(Description|Source)$/i.test(name)) return undefined;
+  return { name, source: sourceMatch?.[1], raw: compact };
+}
+
+function mergeFoodResults(results: SearchResult[]) {
+  const merged: SearchResult[] = [];
+  for (const result of results) {
+    const name = result.name.replace(/\s+/g, " ").trim();
+    if (!name || /^(Description|Source)$/i.test(name)) continue;
+    if (merged.some((candidate) => normalizeFoodName(candidate.name) === normalizeFoodName(name))) continue;
+    merged.push({ ...result, name });
+  }
+  return merged;
+}
+
+function hasExactFoodResult(query: string, results: SearchResult[]) {
+  const normalizedQuery = normalizeFoodName(query);
+  return results.some((result) => normalizeFoodName(result.name) === normalizedQuery);
+}
+
+function foodSourcePattern() {
+  return /\b(Custom Recipe|Custom Food|Custom Meal|Recipe|NCCDB|USDA|CNF|CRDB|Restaurant|Brand|Common Food|Survey|Label)$/i;
 }
 
 function pickFoodResult(query: string, results: SearchResult[], selectedName?: string) {
