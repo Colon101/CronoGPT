@@ -5,6 +5,7 @@
 ```text
 APP_PUBLIC_ORIGIN=https://your-project.vercel.app
 CRONOGPT_API_TOKEN=long-random-private-token
+CRONOGPT_LINK_SECRET=optional-separate-chatgpt-link-code
 CRONOMETER_BACKEND=browser
 CRONOMETER_EMAIL=your-cronometer-email
 CRONOMETER_PASSWORD=your-cronometer-password
@@ -46,13 +47,13 @@ After deploy, connect ChatGPT to:
 https://your-project.vercel.app/mcp
 ```
 
-The endpoint rejects unauthenticated MCP traffic. Your MCP client must send:
+The endpoint rejects unauthenticated MCP traffic. ChatGPT should use OAuth. Direct MCP clients must send:
 
 ```text
 Authorization: Bearer <CRONOGPT_API_TOKEN>
 ```
 
-If your ChatGPT connector flow cannot attach a static bearer token, put OAuth in front of this server before enabling writes.
+When ChatGPT opens the CronoGPT OAuth page, use `CRONOGPT_LINK_SECRET`; if it is not set, use `CRONOGPT_API_TOKEN`.
 
 ## Recipe workflow
 

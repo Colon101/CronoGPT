@@ -12,7 +12,7 @@ That means the architecture should be:
 2. CSV import/export fallback for official Cronometer exports.
 3. Browser automation only as a local fallback for actions that no supported API exposes, such as logging foods directly in Cronometer.
 
-Do not deploy Cronometer email/password credentials to an unprotected server. This repo gates `/mcp` with `CRONOGPT_API_TOKEN`; for a multi-user ChatGPT app with personal data or write actions, replace that private token gate with OAuth and store per-user tokens or connection state.
+Do not deploy Cronometer email/password credentials to an unprotected server. This repo gates `/mcp` with OAuth for ChatGPT plus a private `CRONOGPT_API_TOKEN` fallback for direct MCP clients. For a multi-user app, replace the built-in single-user link-code flow with a real identity provider and per-user connection state.
 
 ## What ChatGPT needs
 
@@ -58,6 +58,7 @@ Set these Vercel environment variables:
 ```text
 APP_PUBLIC_ORIGIN=https://your-project.vercel.app
 CRONOGPT_API_TOKEN=generate-a-long-random-token
+CRONOGPT_LINK_SECRET=optional-separate-chatgpt-link-code
 CRONOMETER_BACKEND=browser
 CRONOMETER_EMAIL=...
 CRONOMETER_PASSWORD=...
@@ -85,13 +86,19 @@ ChatGPT connector URL after deployment:
 https://your-project.vercel.app/mcp
 ```
 
-The deployed `/mcp` endpoint requires:
+The deployed `/mcp` endpoint supports ChatGPT OAuth discovery. In ChatGPT, create the app with authentication set to OAuth and use:
+
+```text
+https://your-project.vercel.app/mcp
+```
+
+When ChatGPT opens the CronoGPT linking page, enter `CRONOGPT_LINK_SECRET`. If that env var is empty, enter `CRONOGPT_API_TOKEN`.
+
+Direct MCP clients can still use:
 
 ```text
 Authorization: Bearer your-cronogpt-api-token
 ```
-
-If the ChatGPT connector UI you use cannot send a static bearer token, use OAuth in front of this server before enabling write tools.
 
 ## Backends
 

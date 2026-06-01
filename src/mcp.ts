@@ -12,6 +12,12 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import { createProviderFromEnv } from "./providers/index.js";
 import { toMcpToolResponse } from "./tool-response.js";
+import {
+  authorizeMcpRequest,
+  getAuthToken,
+  handleOAuthRequest,
+  rejectUnauthorized,
+} from "./oauth.js";
 
 const widgetHtml = readFileSync(join(process.cwd(), "public/cronometer-widget.html"), "utf8");
 const widgetUri = "ui://widget/cronometer-dashboard.html";
@@ -38,59 +44,7 @@ const commonOutputSchema = {
 };
 
 export const MCP_PATH = "/mcp";
-const AUTH_REALM = "CronoGPT MCP";
-
-function getAuthToken() {
-  return process.env.CRONOGPT_API_TOKEN?.trim() || undefined;
-}
-
-function requestHost(req: IncomingMessage) {
-  const forwardedHost = req.headers["x-forwarded-host"];
-  if (Array.isArray(forwardedHost)) {
-    return forwardedHost[0] ?? req.headers.host ?? "";
-  }
-  return forwardedHost ?? req.headers.host ?? "";
-}
-
-function isLocalRequest(req: IncomingMessage) {
-  const host = requestHost(req).split(":")[0]?.toLowerCase();
-  const remote = req.socket.remoteAddress;
-  return (
-    host === "localhost" ||
-    host === "127.0.0.1" ||
-    host === "::1" ||
-    remote === "127.0.0.1" ||
-    remote === "::1" ||
-    remote === "::ffff:127.0.0.1"
-  );
-}
-
-function authorizeMcpRequest(req: IncomingMessage) {
-  const token = getAuthToken();
-  if (!token) {
-    return {
-      ok: process.env.NODE_ENV !== "production" && isLocalRequest(req),
-      reason: "CRONOGPT_API_TOKEN is not configured.",
-    };
-  }
-
-  const authorization = req.headers.authorization ?? "";
-  const [scheme, credential] = authorization.split(/\s+/, 2);
-  return {
-    ok: scheme?.toLowerCase() === "bearer" && credential === token,
-    reason: "Missing or invalid bearer token.",
-  };
-}
-
-function rejectUnauthorized(res: ServerResponse, reason: string) {
-  res.writeHead(401, {
-    "content-type": "application/json",
-    "WWW-Authenticate": `Bearer realm="${AUTH_REALM}"`,
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "authorization, content-type, mcp-session-id",
-  });
-  res.end(JSON.stringify({ error: "unauthorized", message: reason }));
-}
+const allToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read", "cronometer:write"] }];
 
 export function createCronoServer() {
   const server = new McpServer({ name: "cronogpt", version: "0.1.0" });
@@ -130,20 +84,23 @@ export function createCronoServer() {
     annotations: Record<string, boolean>,
     handler: (args: Record<string, unknown>) => Promise<any>,
   ) => {
+    const toolConfig = {
+      title,
+      description,
+      inputSchema,
+      outputSchema: commonOutputSchema,
+      securitySchemes: allToolSecuritySchemes,
+      annotations,
+      _meta: {
+        ui: { resourceUri: widgetUri },
+      },
+    };
+
     registerAppTool(
       server,
       name,
-      {
-        title,
-        description,
-        inputSchema,
-        outputSchema: commonOutputSchema,
-        annotations,
-        _meta: {
-          ui: { resourceUri: widgetUri },
-        },
-      },
-      async (args) => handler((args ?? {}) as Record<string, unknown>),
+      toolConfig as Parameters<typeof registerAppTool>[2],
+      async (args: unknown) => handler((args ?? {}) as Record<string, unknown>),
     );
   };
 
@@ -714,6 +671,10 @@ export async function handleMcpHttpRequest(req: IncomingMessage, res: ServerResp
 
   const url = new URL(req.url, `http://${req.headers.host ?? "localhost"}`);
 
+  if (await handleOAuthRequest(req, res, url)) {
+    return;
+  }
+
   if (req.method === "OPTIONS" && url.pathname === MCP_PATH) {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
@@ -746,7 +707,7 @@ export async function handleMcpHttpRequest(req: IncomingMessage, res: ServerResp
 
     const auth = authorizeMcpRequest(req);
     if (!auth.ok) {
-      rejectUnauthorized(res, auth.reason);
+      rejectUnauthorized(req, res, auth.reason ?? "Unauthorized.");
       return;
     }
 
