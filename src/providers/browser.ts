@@ -39,7 +39,6 @@ export interface BrowserConfig {
   storageState?: string;
   localChromium: boolean;
   chromiumExecutablePath?: string;
-  serverlessChromium: boolean;
   writeEnabled: boolean;
   requireFoodConfirmation: boolean;
   navigationTimeoutMs: number;
@@ -175,7 +174,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       "cronometer_capabilities",
       browserConfigured ? "ok" : "not_configured",
       capabilities,
-      browserConfigured ? undefined : "Set Cronometer credentials and enable local Chromium, serverless Chromium, or provide REMOTE_CHROME_WS_ENDPOINT.",
+      browserConfigured ? undefined : "Set Cronometer credentials and enable local Chromium or provide REMOTE_CHROME_WS_ENDPOINT.",
     );
   }
 
@@ -191,7 +190,6 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       hasRemoteBrowser: Boolean(this.config.remoteWsEndpoint),
       localChromium: this.config.localChromium,
       chromiumExecutablePathConfigured: Boolean(this.config.chromiumExecutablePath),
-      serverlessChromium: this.config.serverlessChromium,
       storageStateConfigured: Boolean(this.config.storageState),
       storageStateUsable: storageStateInfo.usable,
       storageStateSource: storageStateInfo.source,
@@ -1421,9 +1419,8 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           hasCredentials: Boolean(this.config.email && this.config.password),
           hasRemoteBrowser: Boolean(this.config.remoteWsEndpoint),
           localChromium: this.config.localChromium,
-          serverlessChromium: this.config.serverlessChromium,
         },
-        "Enable CRONOMETER_LOCAL_CHROMIUM, enable CRONOMETER_SERVERLESS_CHROMIUM, or set REMOTE_CHROME_WS_ENDPOINT to a Browserless-compatible Chrome WebSocket endpoint.",
+        "Enable CRONOMETER_LOCAL_CHROMIUM or set REMOTE_CHROME_WS_ENDPOINT to a Browserless-compatible Chrome WebSocket endpoint.",
         "browser",
       );
     }
@@ -1478,9 +1475,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       ? await chromium.connectOverCDP(this.config.remoteWsEndpoint, {
           timeout: this.config.navigationTimeoutMs,
         })
-      : this.config.serverlessChromium
-        ? await this.launchServerlessChromium()
-        : await this.launchLocalChromium();
+      : await this.launchLocalChromium();
     if (this.config.remoteWsEndpoint && this.config.reuseRemoteContext) {
       const context = browser.contexts()[0] ?? await browser.newContext({
         viewport: { width: 1440, height: 1100 },
@@ -1505,7 +1500,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private hasRunnableBrowser() {
-    return Boolean(this.config.remoteWsEndpoint || this.config.serverlessChromium || this.config.localChromium);
+    return Boolean(this.config.remoteWsEndpoint || this.config.localChromium);
   }
 
   private storageState(): ParsedStorageState | undefined {
@@ -1553,22 +1548,6 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         return { configured: true, usable: false, source: "invalid" };
       }
     }
-  }
-
-  private async launchServerlessChromium() {
-    const serverlessChromium = (await import("@sparticuz/chromium")).default;
-    serverlessChromium.setGraphicsMode = false;
-    return chromium.launch({
-      args: [
-        ...serverlessChromium.args,
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--no-sandbox",
-      ],
-      executablePath: await serverlessChromium.executablePath(),
-      headless: true,
-      timeout: this.config.navigationTimeoutMs,
-    });
   }
 
   private async launchLocalChromium() {

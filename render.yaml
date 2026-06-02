@@ -32,8 +32,6 @@ services:
         value: "false"
       - key: CRONOMETER_LOCAL_CHROMIUM
         value: "true"
-      - key: CRONOMETER_SERVERLESS_CHROMIUM
-        value: "false"
       - key: CRONOMETER_REUSE_REMOTE_CONTEXT
         value: "false"
       - key: CRONOMETER_NAVIGATION_TIMEOUT_MS

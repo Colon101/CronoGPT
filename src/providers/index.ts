@@ -37,7 +37,6 @@ export function createProviderFromEnv(): CronometerProvider {
       storageState: env("CRONOMETER_STORAGE_STATE_BASE64") ?? env("CRONOMETER_STORAGE_STATE"),
       localChromium: env("CRONOMETER_LOCAL_CHROMIUM") === "true" || Boolean(env("CHROME_EXECUTABLE_PATH") || env("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")),
       chromiumExecutablePath: env("CHROME_EXECUTABLE_PATH") ?? env("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"),
-      serverlessChromium: env("CRONOMETER_SERVERLESS_CHROMIUM") !== "false",
       writeEnabled: env("CRONOMETER_ENABLE_WRITES") === "true",
       requireFoodConfirmation: env("CRONOMETER_REQUIRE_FOOD_CONFIRMATION") === "true",
       navigationTimeoutMs: Number(env("CRONOMETER_NAVIGATION_TIMEOUT_MS") ?? 20000),

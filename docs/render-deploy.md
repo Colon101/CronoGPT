@@ -2,7 +2,7 @@
 
 ## What Render runs
 
-`render.yaml` defines one public Docker web service named `cronogpt`. The Docker image uses the official Playwright Node image so the browser backend can launch Chromium locally instead of relying on Vercel serverless Chromium.
+`render.yaml` defines one public Docker web service named `cronogpt`. The Docker image uses the official Playwright Node image so the browser backend can launch Chromium locally on Render.
 
 The service exposes:
 

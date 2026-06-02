@@ -7,5 +7,4 @@ dist/
 npm-debug.log*
 coverage/
 exports/
-.vercel
 .cronometer-storage-state.*

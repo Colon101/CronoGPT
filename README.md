@@ -51,7 +51,7 @@ https://your-tunnel.example/mcp
 
 ## Render setup
 
-This repo includes `render.yaml` and a Playwright-based `Dockerfile` so hosted browser automation can run as a normal long-lived web service instead of a short serverless function.
+This repo includes `render.yaml` and a Playwright-based `Dockerfile` so hosted browser automation runs as a normal long-lived Render web service.
 
 Set these Render environment variables. Values marked secret are declared with `sync: false` in `render.yaml` and are filled in the Render Dashboard:
 
@@ -64,7 +64,6 @@ CRONOMETER_EMAIL=...
 CRONOMETER_PASSWORD=...
 CRONOMETER_STORAGE_STATE_BASE64=optional-playwright-storage-state
 CRONOMETER_LOCAL_CHROMIUM=true
-CRONOMETER_SERVERLESS_CHROMIUM=false
 REMOTE_CHROME_WS_ENDPOINT=optional-remote-chrome-endpoint
 CRONOMETER_ENABLE_WRITES=true
 CRONOMETER_REQUIRE_FOOD_CONFIRMATION=false
@@ -130,7 +129,7 @@ Set `CRONOMETER_BACKEND` in `.env`:
 
 - `mock`: local dry-run data, safe default.
 - `terra`: API-backed read framework using `TERRA_API_KEY`, `TERRA_DEV_ID`, and `TERRA_USER_ID`.
-- `browser`: hosted browser automation through local Chromium, serverless Chromium, or `REMOTE_CHROME_WS_ENDPOINT`. This cannot reuse the Codex `@chrome` plugin from ChatGPT.
+- `browser`: hosted browser automation through Render-local Chromium or `REMOTE_CHROME_WS_ENDPOINT`. This cannot reuse the Codex `@chrome` plugin from ChatGPT.
 
 The existing lowercase `email` and `password` keys are supported only for local browser-framework detection. Prefer `CRONOMETER_EMAIL` and `CRONOMETER_PASSWORD`.
 
