@@ -8,7 +8,6 @@ services:
     autoDeployTrigger: commit
     dockerfilePath: ./Dockerfile
     healthCheckPath: /
-    maxShutdownDelaySeconds: 120
     envVars:
       - key: NODE_ENV
         value: production
