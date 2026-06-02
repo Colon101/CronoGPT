@@ -1,6 +1,7 @@
 services:
   - type: web
     name: cronogpt
+    repo: https://github.com/Colon101/CronoGPT
     runtime: docker
     plan: free
     region: frankfurt
