@@ -385,13 +385,14 @@ export function createCronoServer() {
   register(
     "resolve_recipe_ingredients",
     "Resolve recipe ingredients",
-    "Searches Cronometer for each recipe ingredient so ChatGPT can map recipe text to real foods before creating a custom recipe.",
+    "Searches Cronometer for each recipe ingredient so ChatGPT can map recipe text to exact foods and sources before creating a custom recipe.",
     {
       recipeName: z.string().optional(),
       ingredients: z.array(
         z.object({
           query: z.string().min(1),
           selectedName: z.string().optional(),
+          selectedSource: z.string().optional().describe("Optional Cronometer result source from resolve_recipe_ingredients, such as CRDB, NCCDB, USDA, Custom Food, or Brand."),
           amount: z.number().positive().optional(),
           unit: z.string().optional(),
         }),
@@ -404,7 +405,7 @@ export function createCronoServer() {
       return toMcpToolResponse(
         await provider.resolveRecipeIngredients({
           recipeName: args.recipeName as string | undefined,
-          ingredients: args.ingredients as Array<{ query: string; selectedName?: string; amount?: number; unit?: string }>,
+          ingredients: args.ingredients as Array<{ query: string; selectedName?: string; selectedSource?: string; amount?: number; unit?: string }>,
           limitPerIngredient: args.limitPerIngredient as number | undefined,
           maxSeconds: args.maxSeconds as number | undefined,
         }),
@@ -613,13 +614,14 @@ export function createCronoServer() {
   register(
     "create_recipe",
     "Create recipe",
-    "Creates a custom Cronometer recipe after validation and confirmation.",
+    "Creates a custom Cronometer recipe after validation and confirmation. Use selectedName and selectedSource from resolve_recipe_ingredients for each ingredient; ambiguous search results are returned without writing.",
     {
       name: z.string().min(1),
       ingredients: z.array(
         z.object({
           query: z.string().min(1),
           selectedName: z.string().optional(),
+          selectedSource: z.string().optional().describe("Optional Cronometer result source from resolve_recipe_ingredients, such as CRDB, NCCDB, USDA, Custom Food, or Brand."),
           amount: z.number().positive().optional(),
           unit: z.string().optional(),
         }),
@@ -647,6 +649,7 @@ export function createCronoServer() {
         z.object({
           query: z.string().min(1),
           selectedName: z.string().optional(),
+          selectedSource: z.string().optional().describe("Optional Cronometer result source from resolve_recipe_ingredients, such as CRDB, NCCDB, USDA, Custom Food, or Brand."),
           amount: z.number().positive().optional(),
           unit: z.string().optional(),
         }),

@@ -360,7 +360,8 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   async searchFoods(input: SearchFoodsInput) {
     return this.withPage("search_foods", async (page) => {
-      const { results } = await this.searchFoodUi(page, input.query, input.limit ?? 10);
+      const outcome = await this.searchFoodUi(page, input.query, input.limit ?? 10);
+      const results = rankFoodResults(input.query, outcome.results);
       return this.result("search_foods", "ok", {
         query: input.query,
         results,
@@ -393,11 +394,21 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           continue;
         }
 
-        let results = await searchCurrentFoodDialog(page, ingredient.query, limit);
+        let results = rankFoodResults(
+          ingredient.query,
+          await searchCurrentFoodDialog(page, ingredient.query, limit),
+          ingredient.selectedName,
+          ingredient.selectedSource,
+        );
         if (results.length === 0 && Date.now() < deadline - 6500) {
           const customClicked = await clickFoodDialogFilter(page, "Custom");
           if (customClicked) {
-            results = await searchCurrentFoodDialog(page, ingredient.query, limit);
+            results = rankFoodResults(
+              ingredient.query,
+              await searchCurrentFoodDialog(page, ingredient.query, limit),
+              ingredient.selectedName,
+              ingredient.selectedSource,
+            );
             await clickFoodDialogFilter(page, "All").catch(() => undefined);
           }
         }
@@ -406,7 +417,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           ingredient,
           status: results.length > 0 ? "ok" : "needs_manual_step",
           warning: results.length > 0 ? undefined : "No Cronometer matches were found for this ingredient.",
-          matches: { query: ingredient.query, results },
+          matches: { query: ingredient.query, recommended: results[0], results },
         });
       }
 
@@ -2175,7 +2186,7 @@ async function fillLikelyAmount(page: Page, amount?: number, selectedName?: stri
   if (/\bDescription\s+Source\b/i.test(dialogText) && !selectedPanel) {
     return { filled: false, warning: "Still on ingredient search results; refused to fill the search box as an amount." };
   }
-  const input = await editableAmountInput(page, 2500);
+  const input = await editableAmountInput(page, 2500, selectedPanel);
   if (!input) {
     return { filled: false, warning: "No editable amount input was found; refused to fill radio/checkbox controls." };
   }
@@ -2185,28 +2196,40 @@ async function fillLikelyAmount(page: Page, amount?: number, selectedName?: stri
   }
   await input.fill(amountText);
   await page.keyboard.press("Tab").catch(() => undefined);
-  return { filled: true, value: amountText, inputType: elementType || undefined, selectedPanel };
+  const actualValue = await input.inputValue().catch(() => "");
+  if (!numericInputMatches(actualValue, amount)) {
+    return {
+      filled: false,
+      value: amountText,
+      actualValue,
+      inputType: elementType || undefined,
+      selectedPanel,
+      warning: `Ingredient amount did not verify after filling. Requested ${amountText}, current value is ${actualValue || "blank"}.`,
+    };
+  }
+  return { filled: true, value: amountText, actualValue, inputType: elementType || undefined, selectedPanel };
 }
 
-async function editableAmountInput(page: Page, timeoutMs: number) {
+async function editableAmountInput(page: Page, timeoutMs: number, selectedPanel?: { x: number; y: number; width: number; height: number }) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const dialog = activeDialog(page);
-    const input = await editableAmountInputInScope(dialog) ?? await editableAmountInputInScope(page.locator("body"));
+    const input = await editableAmountInputInScope(dialog, selectedPanel) ?? await editableAmountInputInScope(page.locator("body"), selectedPanel);
     if (input) return input;
     await page.waitForTimeout(150);
   }
   return undefined;
 }
 
-async function editableAmountInputInScope(scope: ReturnType<Page["locator"]>) {
+async function editableAmountInputInScope(scope: ReturnType<Page["locator"]>, selectedPanel?: { x: number; y: number; width: number; height: number }) {
   const inputs = scope.locator("input:visible");
   const count = await inputs.count().catch(() => 0);
-  let fallback: ReturnType<Page["locator"]> | undefined;
+  const candidates: Array<{ input: ReturnType<Page["locator"]>; score: number }> = [];
   for (let index = count - 1; index >= 0; index -= 1) {
     const input = inputs.nth(index);
     const meta = await input.evaluate((element) => {
       if (!(element instanceof HTMLInputElement)) return undefined;
+      const rect = element.getBoundingClientRect();
       return {
         type: element.type,
         readOnly: element.readOnly,
@@ -2217,6 +2240,10 @@ async function editableAmountInputInScope(scope: ReturnType<Page["locator"]>) {
         id: element.id,
         aria: element.getAttribute("aria-label") ?? "",
         value: element.value,
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
       };
     }).catch(() => undefined);
     if (!meta || meta.disabled || meta.readOnly) continue;
@@ -2224,10 +2251,28 @@ async function editableAmountInputInScope(scope: ReturnType<Page["locator"]>) {
     const haystack = `${meta.placeholder} ${meta.className} ${meta.name} ${meta.id} ${meta.aria}`.toLowerCase();
     if (/\b(search|filter|barcode)\b/.test(haystack)) continue;
     if (meta.className.includes("search-field")) continue;
-    if (meta.type === "number" || /number-box/.test(meta.className)) return input;
-    fallback ??= input;
+    let score = 0;
+    if (meta.type === "number" || /number-box/.test(meta.className)) score += 30;
+    if (/\b(amount|serving|quantity|qty)\b/.test(haystack)) score += 20;
+    if (selectedPanel) {
+      const panelBottom = selectedPanel.y + selectedPanel.height;
+      const verticalDistance = Math.abs(meta.y - panelBottom);
+      const horizontallyNear = meta.x + meta.width >= selectedPanel.x - 80 && meta.x <= selectedPanel.x + selectedPanel.width + 260;
+      if (meta.y >= selectedPanel.y - 20 && meta.y <= selectedPanel.y + 360) score += 30;
+      if (horizontallyNear) score += 15;
+      score -= Math.min(verticalDistance / 25, 20);
+    }
+    candidates.push({ input, score });
   }
-  return fallback;
+  return candidates.sort((a, b) => b.score - a.score)[0]?.input;
+}
+
+function numericInputMatches(actualValue: string, expected: number) {
+  const normalized = actualValue.replace(/,/g, "").trim();
+  if (!normalized) return false;
+  const actual = Number(normalized);
+  if (!Number.isFinite(actual)) return normalized === String(expected);
+  return Math.abs(actual - expected) <= Math.max(0.000001, Math.abs(expected) * 0.000001);
 }
 
 async function fillLikelyUnit(page: Page, unit?: string) {
@@ -2251,13 +2296,12 @@ async function fillLikelyUnit(page: Page, unit?: string) {
   }
 
   await unitButton.click({ timeout: 2500 }).catch(async () => unitButton.click({ timeout: 2500, force: true }));
-  await page.waitForTimeout(200);
+  await waitForVisibleUnitOptions(page, 1800);
   const clicked = await clickVisibleOptionByExactText(page, normalizedUnit)
     || await clickVisibleOptionByExactText(page, unitAliases(normalizedUnit)[0])
     || await clickVisibleControlByLabel(dialog, new RegExp(`^${escapeRegExp(normalizedUnit)}$`, "i"));
   if (clicked) {
-    await page.waitForTimeout(250);
-    const updatedUnitText = await unitButton.innerText().catch(() => "");
+    const updatedUnitText = await waitForUnitText(page, unitButton, normalizedUnit, 1800);
     if (unitTextAlreadyMatches(updatedUnitText, normalizedUnit)) {
       return { filled: true, unit: normalizedUnit, strategy: "dropdown-option", currentUnitText: updatedUnitText };
     }
@@ -2267,6 +2311,31 @@ async function fillLikelyUnit(page: Page, unit?: string) {
   await page.keyboard.press("Escape").catch(() => undefined);
   const updatedUnitText = await unitButton.innerText().catch(() => currentUnitText);
   return { filled: false, unit: normalizedUnit, currentUnitText: updatedUnitText, warning: `Could not select unit option: ${normalizedUnit}.` };
+}
+
+async function waitForVisibleUnitOptions(page: Page, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const visible = await page
+      .locator("[role='option']:visible,.dropdown-item:visible,.dropdown-menu:visible *,.popupContent:visible *,.gwt-PopupPanel:visible *")
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (visible) return true;
+    await page.waitForTimeout(100);
+  }
+  return false;
+}
+
+async function waitForUnitText(page: Page, unitButton: ReturnType<Page["locator"]>, unit: string, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  let latest = await unitButton.innerText().catch(() => "");
+  while (Date.now() < deadline) {
+    latest = await unitButton.innerText().catch(() => latest);
+    if (unitTextAlreadyMatches(latest, unit)) return latest;
+    await page.waitForTimeout(100);
+  }
+  return latest;
 }
 
 async function currentRecipeUnitText(page: Page) {
@@ -2309,6 +2378,11 @@ async function recipeUnitDropdownButton(page: Page) {
 async function clickVisibleOptionByExactText(page: Page, value?: string) {
   if (!value) return false;
   const normalizedValue = value.replace(/\s+/g, " ").trim().toLowerCase();
+  const roleOption = page.getByRole("option", { name: new RegExp(`^${escapeRegExp(value)}$`, "i") }).last();
+  if ((await roleOption.count().catch(() => 0)) > 0 && (await roleOption.isVisible().catch(() => false))) {
+    await roleOption.click().catch(() => undefined);
+    return true;
+  }
   const box = await page.evaluate((normalizedValue) => {
     const normalize = (text: string | null | undefined) => (text ?? "").replace(/\s+/g, " ").trim();
     const isVisible = (element: Element) => {
@@ -3286,61 +3360,95 @@ async function fillRecipeCookedWeight(page: Page, cookedWeight: number, unit?: s
   return filled;
 }
 
+function chooseRecipeIngredientCandidate(ingredient: RecipeInput["ingredients"][number], candidates: SearchResult[]) {
+  if (candidates.length === 0) return undefined;
+
+  const selectedName = ingredient.selectedName?.trim();
+  const selectedSource = ingredient.selectedSource?.trim();
+  if (selectedName) {
+    return candidates.find((candidate) =>
+      normalizeFoodName(candidate.name) === normalizeFoodName(selectedName) &&
+      (!selectedSource || normalizeSource(candidate.source) === normalizeSource(selectedSource))
+    );
+  }
+
+  const exactQueryMatches = candidates.filter((candidate) => normalizeFoodName(candidate.name) === normalizeFoodName(ingredient.query));
+  if (exactQueryMatches.length === 1) return exactQueryMatches[0];
+  const officialExactMatches = exactQueryMatches.filter((candidate) => sourcePriority(candidate.source) >= 40);
+  if (officialExactMatches.length === 1) return officialExactMatches[0];
+
+  return undefined;
+}
+
 async function addRecipeIngredient(page: Page, ingredient: RecipeInput["ingredients"][number], options: { deadline?: number } = {}) {
   const clickedAdd = await clickByText(page, /^ADD INGREDIENTS$/i);
-  if (!clickedAdd) return { status: "not_found", warning: "ADD INGREDIENTS button was not found." };
+  if (!clickedAdd) return { status: "add_button_not_found", warning: "ADD INGREDIENTS button was not found." };
 
   const search = await waitForFoodSearchInput(page, 2500);
   if (!search) {
-    return { status: "not_found", warning: "Ingredient search input was not found." };
+    return { status: "search_input_not_found", warning: "Ingredient search input was not found." };
   }
 
-  await search.fill(ingredient.selectedName ?? ingredient.query);
+  const searchText = ingredient.selectedName ?? ingredient.query;
+  await search.fill(searchText);
   const searched = await clickDialogButton(page, /^SEARCH$/i);
   if (!searched) await clickByText(page, /^SEARCH$/i);
-  await waitForIngredientSearchResult(page, ingredient.selectedName ?? ingredient.query, Math.min(5500, Math.max(1200, (options.deadline ?? Date.now() + 5500) - Date.now() - 2500)));
+  await waitForIngredientSearchResult(page, searchText, Math.min(8000, Math.max(1200, (options.deadline ?? Date.now() + 8000) - Date.now() - 2500)));
 
-  const selectedName = ingredient.selectedName ?? ingredient.query;
-  await waitForRecipeSearchResultRow(page, selectedName, Math.min(4000, Math.max(700, (options.deadline ?? Date.now() + 4000) - Date.now() - 2500)));
-  const selected = await selectRecipeIngredientSearchResult(page, selectedName);
+  const candidates = rankFoodResults(
+    ingredient.query,
+    await collectFoodSearchResults(page, 12),
+    ingredient.selectedName,
+    ingredient.selectedSource,
+  );
+  const selectedCandidate = chooseRecipeIngredientCandidate(ingredient, candidates);
+  if (!selectedCandidate) {
+    return {
+      status: candidates.length > 0 ? "ambiguous_result" : "no_results",
+      warning: candidates.length > 0
+        ? "No exact selectedName/selectedSource match was found. Call resolve_recipe_ingredients and pass the chosen selectedName and selectedSource."
+        : "No ingredient candidates found.",
+      candidates,
+    };
+  }
+
+  await waitForRecipeSearchResultRow(page, selectedCandidate.name, ingredient.selectedSource, Math.min(6000, Math.max(700, (options.deadline ?? Date.now() + 6000) - Date.now() - 2500)));
+  const selected = await selectRecipeIngredientSearchResult(page, selectedCandidate.name, ingredient.selectedSource);
   if (!selected) {
-    const selectionDebug = await recipeIngredientSelectionDebug(page, selectedName);
-    const results = parseFoodSearchResults(await page.locator("body").innerText(), 5);
-    if (results[0]?.name) {
-      const clickedFirst = await selectRecipeIngredientSearchResult(page, results[0].name);
-      if (!clickedFirst) return { status: "not_found", warning: "Could not select a searched ingredient.", candidates: results, selectionDebug };
-    } else {
-      return { status: "not_found", warning: "No ingredient candidates found.", selectionDebug };
-    }
-    return { status: "not_found", warning: "Could not select a searched ingredient.", candidates: results, selectionDebug };
+    const selectionDebug = await recipeIngredientSelectionDebug(page, selectedCandidate.name);
+    return { status: "result_not_selected", warning: "Could not select the exact searched ingredient row.", selectedCandidate, candidates, selectionDebug };
   }
 
-  const editorReady = await waitForRecipeIngredientEditor(page, 2500, selectedName);
+  const editorReady = await waitForRecipeIngredientEditor(page, 3500, selectedCandidate.name);
   if (!editorReady) {
-    return { status: "not_found", warning: "Selected ingredient result did not open the ingredient amount editor." };
+    return { status: "editor_not_opened", warning: "Selected ingredient result did not open the ingredient amount editor.", selectedCandidate };
   }
 
-  const amount = await fillLikelyAmount(page, ingredient.amount, selectedName);
+  const amount = await fillLikelyAmount(page, ingredient.amount, selectedCandidate.name);
   if (amount?.filled === false) {
-    return { status: "not_found", warning: amount.warning ?? "Ingredient amount input was not found.", amount };
+    return { status: "amount_not_filled", warning: amount.warning ?? "Ingredient amount input was not found.", selectedCandidate, amount };
   }
   const unit = await fillLikelyUnit(page, ingredient.unit);
   const convertedAmount = unit?.filled === false
-    ? await convertGramAmountForCurrentServingUnit(page, ingredient.amount, ingredient.unit, selectedName)
+    ? await convertGramAmountForCurrentServingUnit(page, ingredient.amount, ingredient.unit, selectedCandidate.name)
     : undefined;
+  if (unit?.filled === false && convertedAmount?.converted !== true) {
+    return { status: "unit_not_found", warning: unit.warning ?? convertedAmount?.warning ?? "Ingredient unit could not be selected or converted safely.", selectedCandidate, amount, unit, convertedAmount };
+  }
 
   const added = await clickDialogButton(page, /^(ADD|ADD INGREDIENT|ADD TO RECIPE|ADD SERVING|SAVE|DONE|OK)$/i);
-  await page.waitForTimeout(250);
+  const addVerified = added ? await waitForRecipeIngredientAdded(page, selectedCandidate.name, 3500) : false;
   if (!added) return {
-    status: "not_found",
+    status: "add_button_not_found",
     warning: "Could not find the ingredient add/save button after selecting amount.",
+    selectedCandidate,
     amount,
     unit,
     convertedAmount,
     editorDebug: await recipeIngredientEditorDebug(page),
   };
 
-  return { status: "ok", amount, unit, convertedAmount };
+  return { status: "ok", selectedCandidate, amount, unit, convertedAmount, addVerified };
 }
 
 async function recipeIngredientEditorDebug(page: Page) {
@@ -3432,19 +3540,20 @@ async function recipeIngredientSelectionDebug(page: Page, selectedName: string) 
   }, selectedName).catch((error) => ({ target: selectedName, error: error instanceof Error ? error.message : String(error) }));
 }
 
-async function selectRecipeIngredientSearchResult(page: Page, selectedName: string) {
+async function selectRecipeIngredientSearchResult(page: Page, selectedName: string, selectedSource?: string) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const clicked = await clickRecipeFoodResultRow(page, selectedName, attempt === 1);
+    const clicked = await clickRecipeFoodResultRow(page, selectedName, selectedSource, attempt === 1);
     if (!clicked) return false;
     if (await waitForRecipeIngredientEditor(page, 1600, selectedName)) return true;
   }
   return false;
 }
 
-async function clickRecipeFoodResultRow(page: Page, selectedName: string, doubleClick: boolean) {
-  const box = await page.evaluate((selectedName) => {
+async function clickRecipeFoodResultRow(page: Page, selectedName: string, selectedSource: string | undefined, doubleClick: boolean) {
+  const box = await page.evaluate(({ selectedName, selectedSource }) => {
     const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
     const target = normalize(selectedName);
+    const sourceTarget = normalize(selectedSource);
     const isVisible = (element: Element) => {
         const rect = element.getBoundingClientRect();
         const style = window.getComputedStyle(element);
@@ -3459,43 +3568,46 @@ async function clickRecipeFoodResultRow(page: Page, selectedName: string, double
       ?? containers.slice().reverse().find((element) => normalize(element.textContent).includes(target))
       ?? document.body;
 
-    const exactTextElements = Array.from(dialog.querySelectorAll("*"))
-      .filter(isVisible)
-      .filter((element) => normalize(element.textContent) === target)
-      .map((element) => ({ element, rect: element.getBoundingClientRect(), depth: elementDepth(element) }))
-      .filter((candidate) => candidate.rect.width > 0 && candidate.rect.height > 0)
-      .sort((a, b) => b.depth - a.depth || a.rect.y - b.rect.y);
-    if (exactTextElements[0]) {
-      const rect = exactTextElements[0].rect;
-      return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
-    }
-
-    const prefixElements = Array.from(dialog.querySelectorAll("*"))
-      .filter(isVisible)
-      .map((element) => {
-        const text = normalize(element.textContent);
-        const rect = element.getBoundingClientRect();
-        return { element, text, rect, depth: elementDepth(element), area: rect.width * rect.height };
-      })
-      .filter((candidate) => candidate.rect.width > 0 && candidate.rect.height > 0)
-      .filter((candidate) => candidate.text.startsWith(target) && candidate.text.length <= target.length + 30)
-      .sort((a, b) => a.area - b.area || b.depth - a.depth || a.rect.y - b.rect.y);
-    if (prefixElements[0]) {
-      const rect = prefixElements[0].rect;
-      return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
-    }
-
     const rows = Array.from(dialog.querySelectorAll("tr"));
     for (const row of rows) {
       const cells = Array.from(row.querySelectorAll("td,th"));
       const firstCellText = normalize(cells[0]?.textContent);
       const rowText = normalize(row.textContent);
       if (firstCellText !== target && !rowText.startsWith(`${target} `)) continue;
+      if (sourceTarget && !rowText.includes(sourceTarget)) continue;
       const targetElement = (cells[0] as HTMLElement | undefined) ?? (row as HTMLElement);
       targetElement.scrollIntoView({ block: "center" });
       const rect = targetElement.getBoundingClientRect();
       if (rect.width <= 0 || rect.height <= 0) return undefined;
       return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+    }
+
+    if (!sourceTarget) {
+      const exactTextElements = Array.from(dialog.querySelectorAll("*"))
+        .filter(isVisible)
+        .filter((element) => normalize(element.textContent) === target)
+        .map((element) => ({ element, rect: element.getBoundingClientRect(), depth: elementDepth(element) }))
+        .filter((candidate) => candidate.rect.width > 0 && candidate.rect.height > 0)
+        .sort((a, b) => b.depth - a.depth || a.rect.y - b.rect.y);
+      if (exactTextElements[0]) {
+        const rect = exactTextElements[0].rect;
+        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+      }
+
+      const prefixElements = Array.from(dialog.querySelectorAll("*"))
+        .filter(isVisible)
+        .map((element) => {
+          const text = normalize(element.textContent);
+          const rect = element.getBoundingClientRect();
+          return { element, text, rect, depth: elementDepth(element), area: rect.width * rect.height };
+        })
+        .filter((candidate) => candidate.rect.width > 0 && candidate.rect.height > 0)
+        .filter((candidate) => candidate.text.startsWith(target) && candidate.text.length <= target.length + 30)
+        .sort((a, b) => a.area - b.area || b.depth - a.depth || a.rect.y - b.rect.y);
+      if (prefixElements[0]) {
+        const rect = prefixElements[0].rect;
+        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+      }
     }
     return undefined;
 
@@ -3508,7 +3620,7 @@ async function clickRecipeFoodResultRow(page: Page, selectedName: string, double
       }
       return depth;
     }
-  }, selectedName).catch(() => undefined);
+  }, { selectedName, selectedSource }).catch(() => undefined);
   if (!box) return false;
   const x = box.x + box.width / 2;
   const y = box.y + box.height / 2;
@@ -3530,6 +3642,20 @@ async function waitForRecipeIngredientEditor(page: Page, timeoutMs: number, sele
     const hasSearchResults = /\bDescription\s+Source\b/i.test(dialogText);
     const hasAddButton = /\b(ADD TO RECIPE|ADD SERVING|DONE|SAVE|OK)\b/i.test(dialogText);
     if (!hasSearchResults && hasAddButton) return true;
+    await page.waitForTimeout(150);
+  }
+  return false;
+}
+
+async function waitForRecipeIngredientAdded(page: Page, selectedName: string, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  const target = normalizeFoodName(selectedName);
+  while (Date.now() < deadline) {
+    const dialogText = await activeDialog(page).innerText({ timeout: 500 }).catch(() => "");
+    const bodyText = await page.locator("body").innerText({ timeout: 800 }).catch(() => "");
+    const dialogStillSearching = /\bDescription\s+Source\b/i.test(dialogText);
+    const visibleInRecipe = normalizeFoodName(bodyText).includes(target);
+    if (!dialogStillSearching && visibleInRecipe) return true;
     await page.waitForTimeout(150);
   }
   return false;
@@ -3566,12 +3692,13 @@ async function recipeIngredientSelectedPanel(page: Page, selectedName?: string) 
   }, selectedName).catch(() => undefined);
 }
 
-async function waitForRecipeSearchResultRow(page: Page, selectedName: string, timeoutMs: number) {
+async function waitForRecipeSearchResultRow(page: Page, selectedName: string, selectedSource: string | undefined, timeoutMs: number) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const found = await page.evaluate((selectedName) => {
+    const found = await page.evaluate(({ selectedName, selectedSource }) => {
       const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
       const target = normalize(selectedName);
+      const sourceTarget = normalize(selectedSource);
       const isVisible = (element: Element) => {
         const rect = element.getBoundingClientRect();
         const style = window.getComputedStyle(element);
@@ -3579,8 +3706,11 @@ async function waitForRecipeSearchResultRow(page: Page, selectedName: string, ti
       };
       return Array.from(document.querySelectorAll("tr,td,.gwt-HTML,.food-search-name"))
         .filter(isVisible)
-        .some((element) => normalize(element.textContent).includes(target));
-    }, selectedName).catch(() => false);
+        .some((element) => {
+          const text = normalize(element.textContent);
+          return text.includes(target) && (!sourceTarget || text.includes(sourceTarget));
+        });
+    }, { selectedName, selectedSource }).catch(() => false);
     if (found) return true;
     await page.waitForTimeout(200);
   }
@@ -3609,7 +3739,9 @@ function gramsPerServingUnit(text: string) {
   const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
   const exact = normalized.match(/^([0-9]+(?:\.[0-9]+)?)\s*g$/i);
   if (exact?.[1]) return Number(exact[1]);
-  const annotated = normalized.match(/[—-]\s*([0-9]+(?:\.[0-9]+)?)\s*g\b/i);
+  const annotated = normalized.match(/[—-]\s*([0-9]+(?:\.[0-9]+)?)\s*g\b/i)
+    ?? normalized.match(/\(\s*([0-9]+(?:\.[0-9]+)?)\s*g\s*\)/i)
+    ?? normalized.match(/\b([0-9]+(?:\.[0-9]+)?)\s*g\b/i);
   if (annotated?.[1]) return Number(annotated[1]);
   return undefined;
 }
@@ -3681,7 +3813,10 @@ function parseFoodSearchResults(rawText: string, limit: number): SearchResult[] 
         raw: line,
       };
     })
-    .filter((item, index, items) => items.findIndex((candidate) => candidate.name === item.name) === index)
+    .filter((item, index, items) => items.findIndex((candidate) =>
+      normalizeFoodName(candidate.name) === normalizeFoodName(item.name) &&
+      normalizeSource(candidate.source) === normalizeSource(item.source)
+    ) === index)
     .slice(0, limit);
 }
 
@@ -3752,10 +3887,59 @@ function mergeFoodResults(results: SearchResult[]) {
   for (const result of results) {
     const name = result.name.replace(/\s+/g, " ").trim();
     if (!name || /^(Description|Source)$/i.test(name)) continue;
-    if (merged.some((candidate) => normalizeFoodName(candidate.name) === normalizeFoodName(name))) continue;
+    if (merged.some((candidate) =>
+      normalizeFoodName(candidate.name) === normalizeFoodName(name) &&
+      normalizeSource(candidate.source) === normalizeSource(result.source)
+    )) continue;
     merged.push({ ...result, name });
   }
   return merged;
+}
+
+function rankFoodResults(query: string, results: SearchResult[], selectedName?: string, selectedSource?: string) {
+  const normalizedQuery = normalizeFoodName(query);
+  const normalizedSelected = selectedName ? normalizeFoodName(selectedName) : undefined;
+  const normalizedSelectedSource = normalizeSource(selectedSource);
+  return [...results]
+    .sort((a, b) => {
+      const aScore = foodResultScore(a, normalizedQuery, normalizedSelected, normalizedSelectedSource);
+      const bScore = foodResultScore(b, normalizedQuery, normalizedSelected, normalizedSelectedSource);
+      return bScore - aScore;
+    });
+}
+
+function foodResultScore(result: SearchResult, normalizedQuery: string, normalizedSelected?: string, normalizedSelectedSource?: string) {
+  const normalizedName = normalizeFoodName(result.name);
+  let score = sourcePriority(result.source);
+  if (normalizedSelected) {
+    if (normalizedName === normalizedSelected) score += 200;
+    else if (normalizedName.startsWith(normalizedSelected) || normalizedSelected.startsWith(normalizedName)) score += 80;
+    else if (normalizedName.includes(normalizedSelected) || normalizedSelected.includes(normalizedName)) score += 40;
+  }
+  if (normalizedSelectedSource && normalizeSource(result.source) === normalizedSelectedSource) score += 70;
+  if (normalizedName === normalizedQuery) score += 100;
+  else if (normalizedName === `${normalizedQuery} plain`) score += 65;
+  else if (normalizedName.startsWith(normalizedQuery)) score += 45;
+  else if (normalizedName.includes(normalizedQuery)) score += 25;
+  if (/\bplain\b/i.test(result.name)) score += 5;
+  return score;
+}
+
+function sourcePriority(source?: string) {
+  const normalized = normalizeSource(source);
+  if (!normalized) return 0;
+  if (normalized === "crdb") return 60;
+  if (normalized === "nccdb") return 55;
+  if (normalized === "usda") return 50;
+  if (normalized === "cnf") return 45;
+  if (normalized.includes("custom")) return 35;
+  if (normalized.includes("common")) return 25;
+  if (normalized.includes("brand") || normalized.includes("restaurant")) return 10;
+  return 5;
+}
+
+function normalizeSource(source?: string) {
+  return (source ?? "").toLowerCase().replace(/\s+/g, " ").trim();
 }
 
 function hasExactFoodResult(query: string, results: SearchResult[]) {
@@ -3773,12 +3957,13 @@ function pickFoodResult(query: string, results: SearchResult[], selectedName?: s
     if (selected) return selected;
   }
 
+  const ranked = rankFoodResults(query, results, selectedName);
   const normalizedQuery = normalizeFoodName(query);
   return (
-    results.find((result) => normalizeFoodName(result.name) === normalizedQuery) ??
-    results.find((result) => normalizeFoodName(result.name) === `${normalizedQuery} plain`) ??
-    results.find((result) => /\bplain\b/i.test(result.name)) ??
-    results[0]
+    ranked.find((result) => normalizeFoodName(result.name) === normalizedQuery) ??
+    ranked.find((result) => normalizeFoodName(result.name) === `${normalizedQuery} plain`) ??
+    ranked.find((result) => /\bplain\b/i.test(result.name)) ??
+    ranked[0]
   );
 }
 

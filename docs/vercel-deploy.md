@@ -83,11 +83,11 @@ When ChatGPT opens the cronogpt OAuth page, use `CRONOGPT_LINK_SECRET`; if it is
 ## Recipe workflow
 
 1. Call `resolve_recipe_ingredients` with the recipe ingredient list.
-2. Pick the best Cronometer match for each ingredient.
+2. Pick the best Cronometer match for each ingredient, preserving both `selectedName` and `selectedSource`.
 3. Call `create_recipe` with the selected foods and `dryRun=true`.
 4. Review the preview.
 5. Call `create_recipe` again with `confirmed=true`; leave `dryRun` unset, or set `dryRun=false`.
 
-`resolve_recipe_ingredients` is a bounded batch search. For large recipes, keep `limitPerIngredient` low, use `maxSeconds`, and retry with only skipped or unresolved ingredients if the first call stops early.
+`resolve_recipe_ingredients` is a bounded batch search. For large recipes, keep `limitPerIngredient` low, use `maxSeconds`, and retry with only skipped or unresolved ingredients if the first call stops early. `create_recipe` refuses ambiguous matches and returns candidates when an exact `selectedName`/`selectedSource` cannot be selected.
 
 The hosted browser adapter opens the custom recipe editor, fills the recipe name/servings, opens `ADD INGREDIENTS`, searches each ingredient, and selects matches. Keep the first real runs in dry-run mode and review the visible result before enabling writes.

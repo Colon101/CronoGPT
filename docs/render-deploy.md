@@ -57,6 +57,8 @@ https://cronogpt.onrender.com/mcp
 
 When ChatGPT opens the cronogpt OAuth page, use `CRONOGPT_LINK_SECRET`; if it is not set, use `CRONOGPT_API_TOKEN`.
 
+For custom recipes, run `resolve_recipe_ingredients` first and carry both the chosen `selectedName` and `selectedSource` into `create_recipe`. The browser writer refuses ambiguous matches and returns candidates rather than selecting the first search result.
+
 ## Verify
 
 ```bash

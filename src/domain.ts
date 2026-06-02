@@ -77,6 +77,7 @@ export interface StabilityCheckInput {
 export interface RecipeIngredientInput {
   query: string;
   selectedName?: string;
+  selectedSource?: string;
   amount?: number;
   unit?: string;
 }

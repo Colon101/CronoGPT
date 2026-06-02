@@ -92,6 +92,37 @@ await withClient(async (client) => {
     },
   });
 
+  const recipeDryRun = await client.callTool({
+    name: "create_recipe",
+    arguments: {
+      name: "cronogpt smoke test recipe dry run",
+      ingredients: [
+        {
+          query: "Banana",
+          selectedName: "Banana",
+          selectedSource: "NCCDB",
+          amount: 100,
+          unit: "g",
+        },
+      ],
+      servings: 1,
+      servingName: "serving",
+      dryRun: true,
+      confirmed: false,
+    },
+  });
+  checks.push({
+    name: "recipe_dry_run",
+    ok: recipeDryRun.structuredContent?.status === "dry_run" &&
+      recipeDryRun.structuredContent?.data?.preview?.recipeName === "cronogpt smoke test recipe dry run" &&
+      Array.isArray(recipeDryRun.structuredContent?.data?.preview?.ingredients),
+    data: {
+      status: recipeDryRun.structuredContent?.status,
+      feature: recipeDryRun.structuredContent?.feature,
+      preview: recipeDryRun.structuredContent?.data?.preview,
+    },
+  });
+
   const dangerous = await client.callTool({
     name: "run_cronometer_ui_flow",
     arguments: {
