@@ -159,7 +159,9 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   async capabilities(): Promise<ProviderResult<Capability[]>> {
-    const browserConfigured = Boolean(this.hasRunnableBrowser() && this.config.email && this.config.password);
+    const storageStateInfo = this.storageStateInfo();
+    const hasLoginPath = Boolean((this.config.email && this.config.password) || storageStateInfo.usable);
+    const browserConfigured = Boolean(this.hasRunnableBrowser() && hasLoginPath);
     const capabilities = capabilitiesForMode("browser").map((capability) => {
       if (capability.preferredBackend === "manual") {
         return { ...capability, currentBackendStatus: "unsupported" as const };
@@ -174,7 +176,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       "cronometer_capabilities",
       browserConfigured ? "ok" : "not_configured",
       capabilities,
-      browserConfigured ? undefined : "Set Cronometer credentials and enable local Chromium or provide REMOTE_CHROME_WS_ENDPOINT.",
+      browserConfigured ? undefined : "Set CRONOMETER_STORAGE_STATE_BASE64 or Cronometer credentials, and enable local Chromium or provide REMOTE_CHROME_WS_ENDPOINT.",
     );
   }
 
