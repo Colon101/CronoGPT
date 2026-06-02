@@ -11,7 +11,7 @@ For ChatGPT control, build an Apps SDK MCP server and expose tools. ChatGPT call
 ```mermaid
 flowchart LR
   User["User in ChatGPT"] --> ChatGPT["ChatGPT Apps SDK host"]
-  ChatGPT --> MCP["CronoGPT MCP server /mcp"]
+  ChatGPT --> MCP["cronogpt MCP server /mcp"]
   MCP --> Widget["Optional ChatGPT widget"]
   MCP --> Terra["Terra API for synced reads"]
   MCP --> CSV["Cronometer CSV exports"]
@@ -19,7 +19,7 @@ flowchart LR
   Browser --> Cronometer["Cronometer web app"]
 ```
 
-On Vercel, the browser box should be a remote Chrome service such as Browserless. Vercel functions are ephemeral, so do not rely on a long-lived logged-in Chromium profile.
+On Render, the browser box can run local Chromium in the Playwright Docker image. A remote Chrome service such as Browserless remains an option if you want a separate persistent browser.
 
 ## Feature matrix
 
@@ -79,10 +79,10 @@ On Vercel, the browser box should be a remote Chrome service such as Browserless
 1. Start with `CRONOMETER_BACKEND=mock` and verify the MCP server in MCP Inspector.
 2. Add Terra credentials and implement/verify `get_daily_summary`, `list_food_entries`, `list_exercises`, and `list_biometrics`.
 3. Add a CSV importer for official exported files if Terra is not enough.
-4. Set `REMOTE_CHROME_WS_ENDPOINT` to a remote Chrome provider and verify browser-backed dry runs.
+4. Deploy on Render with local Chromium, or set `REMOTE_CHROME_WS_ENDPOINT` to a remote Chrome provider and verify browser-backed dry runs.
 5. Implement browser-backed writes behind explicit confirmations and dry-run previews.
 6. Add OAuth before connecting this to a real ChatGPT account beyond local testing.
-7. Expose the server over HTTPS on Vercel, create the ChatGPT connector, refresh metadata, and test each tool.
+7. Expose the server over HTTPS on Render, create the ChatGPT connector, refresh metadata, and test each tool.
 
 ## Useful public references
 

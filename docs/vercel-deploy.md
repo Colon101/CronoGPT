@@ -1,4 +1,6 @@
-# Deploy CronoGPT on Vercel
+# Deploy cronogpt on Vercel
+
+This is the legacy serverless deployment path. The current hosted path is Render; see `docs/render-deploy.md`.
 
 ## Required environment
 
@@ -26,10 +28,10 @@ Food logs write directly when `CRONOMETER_ENABLE_WRITES=true` unless the tool ca
 
 Browser-backed tools are serialized within a warm serverless instance and retry transient Playwright/session failures once by default. They do not retry Cronometer login failures, CAPTCHA, or credential errors.
 
-Other write tools require `CRONOMETER_ENABLE_WRITES=true` plus both call arguments:
+Other write tools require `CRONOMETER_ENABLE_WRITES=true` plus explicit confirmation. Leave `dryRun` unset for a real confirmed write, or set it to `false` if the client always sends the field:
 
 ```json
-{ "dryRun": false, "confirmed": true }
+{ "confirmed": true }
 ```
 
 ## Durable Cronometer session
@@ -76,7 +78,7 @@ The endpoint rejects unauthenticated MCP traffic. ChatGPT should use OAuth. Dire
 Authorization: Bearer <CRONOGPT_API_TOKEN>
 ```
 
-When ChatGPT opens the CronoGPT OAuth page, use `CRONOGPT_LINK_SECRET`; if it is not set, use `CRONOGPT_API_TOKEN`.
+When ChatGPT opens the cronogpt OAuth page, use `CRONOGPT_LINK_SECRET`; if it is not set, use `CRONOGPT_API_TOKEN`.
 
 ## Recipe workflow
 
@@ -84,7 +86,7 @@ When ChatGPT opens the CronoGPT OAuth page, use `CRONOGPT_LINK_SECRET`; if it is
 2. Pick the best Cronometer match for each ingredient.
 3. Call `create_recipe` with the selected foods and `dryRun=true`.
 4. Review the preview.
-5. Call `create_recipe` again with `dryRun=false` and `confirmed=true`.
+5. Call `create_recipe` again with `confirmed=true`; leave `dryRun` unset, or set `dryRun=false`.
 
 `resolve_recipe_ingredients` is a bounded batch search. For large recipes, keep `limitPerIngredient` low, use `maxSeconds`, and retry with only skipped or unresolved ingredients if the first call stops early.
 

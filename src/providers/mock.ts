@@ -1,6 +1,11 @@
 import type {
   BiometricLogInput,
+  CustomFoodDeleteInput,
+  CustomFoodDuplicateInput,
   CustomFoodInput,
+  CustomFoodListInput,
+  CustomFoodRetireInput,
+  CustomFoodUpdateInput,
   DateRangeInput,
   ExerciseLogInput,
   ExportDataInput,
@@ -8,6 +13,8 @@ import type {
   FoodLogInput,
   NoteLogInput,
   RecipeInput,
+  RecipeRetireInput,
+  RecipeUpdateInput,
   RepeatItemInput,
   SearchFoodsInput,
   TargetsInput,
@@ -97,12 +104,61 @@ export class MockCronometerProvider extends BaseCronometerProvider {
     return this.dryRunWrite("log_note", input);
   }
 
+  async listCustomFoods(input: CustomFoodListInput) {
+    return this.result("list_custom_foods", "dry_run", {
+      input,
+      foods: [
+        {
+          foodId: "sample-custom-food-1",
+          name: "Sweetango Gold",
+          servingSize: "100 g",
+          nutrients: { Energy: { value: 19, unit: "kcal" }, "Total Carbs": { value: 100, unit: "g" } },
+        },
+      ],
+    });
+  }
+
+  async findDuplicateCustomFoods(input: CustomFoodDuplicateInput) {
+    return this.result("find_duplicate_custom_foods", "dry_run", {
+      input,
+      matches: [],
+      duplicateGroups: [],
+    });
+  }
+
   async createCustomFood(input: CustomFoodInput) {
     return this.dryRunWrite("create_custom_food", input);
   }
 
+  async updateCustomFood(input: CustomFoodUpdateInput) {
+    return this.dryRunWrite("update_custom_food", input);
+  }
+
+  async deleteCustomFood(input: CustomFoodDeleteInput) {
+    return this.dryRunWrite("delete_custom_food", input);
+  }
+
+  async retireCustomFood(input: CustomFoodRetireInput) {
+    return this.dryRunWrite("retire_custom_food", input);
+  }
+
+  async listCustomRecipes(input: CustomFoodListInput) {
+    return this.result("list_custom_recipes", "dry_run", {
+      input,
+      recipes: [{ recipeId: "sample-custom-recipe-1", name: "Protein cookie" }],
+    });
+  }
+
   async createRecipe(input: RecipeInput) {
     return this.dryRunWrite("create_recipe", input);
+  }
+
+  async updateCustomRecipe(input: RecipeUpdateInput) {
+    return this.dryRunWrite("update_custom_recipe", input);
+  }
+
+  async retireCustomRecipe(input: RecipeRetireInput) {
+    return this.dryRunWrite("retire_custom_recipe", input);
   }
 
   async getTargets(input: DateRangeInput) {

@@ -1,0 +1,56 @@
+services:
+  - type: web
+    name: cronogpt
+    runtime: docker
+    plan: free
+    region: frankfurt
+    branch: main
+    autoDeployTrigger: commit
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    maxShutdownDelaySeconds: 120
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: APP_PUBLIC_ORIGIN
+        value: https://cronogpt.onrender.com
+      - key: CRONOGPT_API_TOKEN
+        sync: false
+      - key: CRONOGPT_LINK_SECRET
+        sync: false
+      - key: CRONOMETER_BACKEND
+        value: browser
+      - key: CRONOMETER_EMAIL
+        sync: false
+      - key: CRONOMETER_PASSWORD
+        sync: false
+      - key: CRONOMETER_STORAGE_STATE_BASE64
+        sync: false
+      - key: CRONOMETER_ENABLE_WRITES
+        value: "true"
+      - key: CRONOMETER_REQUIRE_FOOD_CONFIRMATION
+        value: "false"
+      - key: CRONOMETER_LOCAL_CHROMIUM
+        value: "true"
+      - key: CRONOMETER_SERVERLESS_CHROMIUM
+        value: "false"
+      - key: CRONOMETER_REUSE_REMOTE_CONTEXT
+        value: "false"
+      - key: CRONOMETER_NAVIGATION_TIMEOUT_MS
+        value: "60000"
+      - key: CRONOMETER_OPERATION_TIMEOUT_MS
+        value: "600000"
+      - key: CRONOMETER_BROWSER_RETRY_COUNT
+        value: "1"
+      - key: CRONOMETER_LOGIN_BACKOFF_MS
+        value: "900000"
+      - key: CRONOMETER_TIME_ZONE
+        value: Asia/Jerusalem
+      - key: TERRA_API_BASE_URL
+        value: https://api.tryterra.co/v2
+      - key: TERRA_API_KEY
+        sync: false
+      - key: TERRA_DEV_ID
+        sync: false
+      - key: TERRA_USER_ID
+        sync: false

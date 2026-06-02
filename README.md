@@ -1,6 +1,6 @@
-# CronoGPT
+# cronogpt
 
-CronoGPT is a starter Apps SDK/MCP server for controlling or reading Cronometer from ChatGPT.
+cronogpt is a starter Apps SDK/MCP server for controlling or reading Cronometer from ChatGPT.
 
 ## API reality
 
@@ -49,35 +49,36 @@ To connect from ChatGPT, expose the server over HTTPS with a tunnel, then create
 https://your-tunnel.example/mcp
 ```
 
-## Vercel setup
+## Render setup
 
-This repo includes a Vercel function at `api/mcp.ts` and rewrites `/mcp` to it.
+This repo includes `render.yaml` and a Playwright-based `Dockerfile` so hosted browser automation can run as a normal long-lived web service instead of a short serverless function.
 
-Set these Vercel environment variables:
+Set these Render environment variables. Values marked secret are declared with `sync: false` in `render.yaml` and are filled in the Render Dashboard:
 
 ```text
-APP_PUBLIC_ORIGIN=https://your-project.vercel.app
+APP_PUBLIC_ORIGIN=https://cronogpt.onrender.com
 CRONOGPT_API_TOKEN=generate-a-long-random-token
 CRONOGPT_LINK_SECRET=optional-separate-chatgpt-link-code
 CRONOMETER_BACKEND=browser
 CRONOMETER_EMAIL=...
 CRONOMETER_PASSWORD=...
 CRONOMETER_STORAGE_STATE_BASE64=optional-playwright-storage-state
-CRONOMETER_SERVERLESS_CHROMIUM=true
-REMOTE_CHROME_WS_ENDPOINT=wss://your-remote-chrome-endpoint
+CRONOMETER_LOCAL_CHROMIUM=true
+CRONOMETER_SERVERLESS_CHROMIUM=false
+REMOTE_CHROME_WS_ENDPOINT=optional-remote-chrome-endpoint
 CRONOMETER_ENABLE_WRITES=true
 CRONOMETER_REQUIRE_FOOD_CONFIRMATION=false
-CRONOMETER_NAVIGATION_TIMEOUT_MS=45000
+CRONOMETER_NAVIGATION_TIMEOUT_MS=60000
 CRONOMETER_LOGIN_BACKOFF_MS=900000
-CRONOMETER_OPERATION_TIMEOUT_MS=55000
+CRONOMETER_OPERATION_TIMEOUT_MS=600000
 CRONOMETER_BROWSER_RETRY_COUNT=1
 ```
 
-`REMOTE_CHROME_WS_ENDPOINT` is optional when `CRONOMETER_SERVERLESS_CHROMIUM=true`, but a Browserless-compatible remote Chrome endpoint is more reliable for long browser sessions than Vercel's ephemeral function runtime. `CRONOMETER_STORAGE_STATE_BASE64` lets the hosted browser reuse a valid Cronometer session instead of logging in from scratch on every tool call. `CRONOMETER_LOGIN_BACKOFF_MS` pauses new login attempts after a rate-limit or bot challenge.
+The Render Docker image includes local Chromium through the Playwright base image. `REMOTE_CHROME_WS_ENDPOINT` is optional if you want to use Browserless or another remote Chrome provider instead. `CRONOMETER_STORAGE_STATE_BASE64` lets the hosted browser reuse a valid Cronometer session instead of logging in from scratch on every tool call. `CRONOMETER_LOGIN_BACKOFF_MS` pauses new login attempts after a rate-limit or bot challenge.
 
-Food logs write directly when `CRONOMETER_ENABLE_WRITES=true` unless the tool call sets `dryRun=true`. Set `CRONOMETER_REQUIRE_FOOD_CONFIRMATION=true` to restore the older second-step confirmation behavior. Other write tools still require `dryRun=false` and `confirmed=true`. Dry-run write previews return without opening Cronometer, so recipe/custom-food validation does not burn browser login attempts. Set `CRONOMETER_ENABLE_WRITES=false` for read-only dry-run mode.
+Food logs write directly when `CRONOMETER_ENABLE_WRITES=true` unless the tool call sets `dryRun=true`. Set `CRONOMETER_REQUIRE_FOOD_CONFIRMATION=true` to restore the older second-step confirmation behavior. Other write tools require `confirmed=true` and will write as long as `dryRun` is not `true`. Dry-run write previews return without opening Cronometer, so recipe/custom-food validation does not burn browser login attempts. Set `CRONOMETER_ENABLE_WRITES=false` for read-only dry-run mode.
 
-Browser-backed tools are serialized inside each warm serverless instance to reduce Chromium contention. `CRONOMETER_OPERATION_TIMEOUT_MS` bounds individual browser attempts, and `CRONOMETER_BROWSER_RETRY_COUNT` retries transient automation failures without retrying login/CAPTCHA/credential failures.
+Browser-backed tools are serialized inside the hosted process to reduce Chromium contention. `CRONOMETER_OPERATION_TIMEOUT_MS` bounds individual browser attempts, and `CRONOMETER_BROWSER_RETRY_COUNT` retries transient automation failures without retrying login/CAPTCHA/credential failures.
 
 Before a long ChatGPT workflow, call `cronometer_stability_check`. It verifies hosted login, Diary readability, and a small food search in one queued browser job without writing data.
 
@@ -87,15 +88,13 @@ Run the no-write production smoke test after deploys:
 npm run smoke:production
 ```
 
-To create a durable Cronometer session for Vercel, run this locally after confirming `.env` has the Cronometer credentials:
+To create a durable Cronometer session for Render, run this locally after confirming `.env` has the Cronometer credentials:
 
 ```bash
 npm run storage:cronometer
-vercel env add CRONOMETER_STORAGE_STATE_BASE64 production < .cronometer-storage-state.base64
-vercel deploy --prod
 ```
 
-The generator writes `.cronometer-storage-state.json` and `.cronometer-storage-state.base64` with mode `0600`; both are ignored by git. Set `HEADLESS=false` if Cronometer requires an interactive verification step. The MCP tool `refresh_cronometer_session` can warm and verify the hosted session without writing diary data, but it is not a substitute for durable storage on cold Vercel instances.
+The generator writes `.cronometer-storage-state.json` and `.cronometer-storage-state.base64` with mode `0600`; both are ignored by git. Add the base64 file contents to Render as `CRONOMETER_STORAGE_STATE_BASE64`. Set `HEADLESS=false` if Cronometer requires an interactive verification step. The MCP tool `refresh_cronometer_session` can warm and verify the hosted session without writing diary data.
 
 For more reliable read data, add Terra:
 
@@ -108,16 +107,16 @@ TERRA_USER_ID=...
 ChatGPT connector URL after deployment:
 
 ```text
-https://your-project.vercel.app/mcp
+https://cronogpt.onrender.com/mcp
 ```
 
 The deployed `/mcp` endpoint supports ChatGPT OAuth discovery. In ChatGPT, create the app with authentication set to OAuth and use:
 
 ```text
-https://your-project.vercel.app/mcp
+https://cronogpt.onrender.com/mcp
 ```
 
-When ChatGPT opens the CronoGPT linking page, enter `CRONOGPT_LINK_SECRET`. If that env var is empty, enter `CRONOGPT_API_TOKEN`.
+When ChatGPT opens the cronogpt linking page, enter `CRONOGPT_LINK_SECRET`. If that env var is empty, enter `CRONOGPT_API_TOKEN`.
 
 Direct MCP clients can still use:
 
@@ -131,11 +130,11 @@ Set `CRONOMETER_BACKEND` in `.env`:
 
 - `mock`: local dry-run data, safe default.
 - `terra`: API-backed read framework using `TERRA_API_KEY`, `TERRA_DEV_ID`, and `TERRA_USER_ID`.
-- `browser`: hosted browser automation through serverless Chromium or `REMOTE_CHROME_WS_ENDPOINT`. This cannot reuse the Codex `@chrome` plugin from ChatGPT.
+- `browser`: hosted browser automation through local Chromium, serverless Chromium, or `REMOTE_CHROME_WS_ENDPOINT`. This cannot reuse the Codex `@chrome` plugin from ChatGPT.
 
 The existing lowercase `email` and `password` keys are supported only for local browser-framework detection. Prefer `CRONOMETER_EMAIL` and `CRONOMETER_PASSWORD`.
 
-`resolve_recipe_ingredients` reuses a single Cronometer food-search dialog and stops before the hosted function timeout. If a large recipe returns skipped or unresolved ingredients, call it again with only those remaining ingredients.
+`resolve_recipe_ingredients` reuses a single Cronometer food-search dialog and stops before the hosted operation budget expires. If a large recipe returns skipped or unresolved ingredients, call it again with only those remaining ingredients.
 
 ## Current tool map
 

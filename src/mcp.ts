@@ -12,6 +12,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import { createProviderFromEnv } from "./providers/index.js";
 import { toMcpToolResponse } from "./tool-response.js";
+import { CUSTOM_FOOD_NUTRIENT_SCHEMA, customFoodNutrientSchemaSummary } from "./nutrients.js";
 import {
   authorizeMcpRequest,
   getAuthToken,
@@ -47,7 +48,7 @@ export const MCP_PATH = "/mcp";
 const allToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read", "cronometer:write"] }];
 
 export function createCronoServer() {
-  const server = new McpServer({ name: "cronogpt", version: "0.1.0" });
+  const server = new McpServer({ name: "cronogpt", version: "0.1.2" });
 
   registerAppResource(
     server,
@@ -117,6 +118,39 @@ export function createCronoServer() {
     });
   };
 
+  const parseCustomFoodFallbackScope = (scope: unknown):
+    | { action: "delete"; foodId?: string; name: string; confirmName: string }
+    | { action: "retire"; foodId?: string; name: string; retiredName?: string }
+    | undefined => {
+    if (typeof scope !== "string") return undefined;
+    const value = scope.trim();
+    if (!value) return undefined;
+
+    const retireIdMatch = value.match(/^custom_food_id_retire:(\d+):(.+)$/i) ?? value.match(/^retire_custom_food_id:(\d+):(.+)$/i);
+    if (retireIdMatch?.[1] && retireIdMatch[2]) {
+      return { action: "retire", foodId: retireIdMatch[1], name: retireIdMatch[2].trim() };
+    }
+
+    const retireNameMatch = value.match(/^custom_food_retire:(.+)$/i) ?? value.match(/^retire_custom_food:(.+)$/i);
+    if (retireNameMatch?.[1]) {
+      return { action: "retire", name: retireNameMatch[1].trim() };
+    }
+
+    const idMatch = value.match(/^custom_food_id:(\d+):(.+)$/i) ?? value.match(/^custom_food#(\d+)\|(.+)$/i);
+    if (idMatch?.[1] && idMatch[2]) {
+      const name = idMatch[2].trim();
+      return { action: "delete", foodId: idMatch[1], name, confirmName: name };
+    }
+
+    const nameMatch = value.match(/^custom_food:(.+)$/i);
+    if (nameMatch?.[1]) {
+      const name = nameMatch[1].trim();
+      return { action: "delete", name, confirmName: name };
+    }
+
+    return undefined;
+  };
+
   const registerFrameworkTool = (
     name: string,
     title: string,
@@ -177,6 +211,25 @@ export function createCronoServer() {
     emptyInputSchema,
     { readOnlyHint: true, openWorldHint: false },
     async () => toMcpToolResponse(await provider.runtimeStatus()),
+  );
+
+  register(
+    "custom_food_nutrient_schema",
+    "Show custom food nutrient schema",
+    "Returns the canonical nutrient keys, Cronometer display labels, units, and aliases accepted by create_custom_food. Use this before writing detailed custom foods.",
+    emptyInputSchema,
+    { readOnlyHint: true, openWorldHint: false },
+    async () => toMcpToolResponse({
+      provider: provider.name,
+      mode: provider.mode,
+      feature: "custom_food_nutrient_schema",
+      status: "ok",
+      data: {
+        nutrients: CUSTOM_FOOD_NUTRIENT_SCHEMA,
+        summary: customFoodNutrientSchemaSummary(),
+        writeFormat: "create_custom_food.nutrients accepts any schema key, any listed alias, or an exact Cronometer display label as a numeric value in the label's Cronometer unit.",
+      },
+    }),
   );
 
   register(
@@ -344,7 +397,7 @@ export function createCronoServer() {
         }),
       ),
       limitPerIngredient: z.number().int().positive().max(5).optional(),
-      maxSeconds: z.number().int().positive().max(50).optional(),
+      maxSeconds: z.number().int().positive().max(900).optional(),
     },
     { readOnlyHint: true, openWorldHint: true },
     async (args) => {
@@ -429,12 +482,13 @@ export function createCronoServer() {
   register(
     "create_custom_food",
     "Create custom food",
-    "Creates a custom Cronometer food after validation and confirmation.",
+    "Creates or updates a custom Cronometer food after validation and confirmation. nutrients accepts keys from custom_food_nutrient_schema, aliases such as calories/carbs/valine/glycine/vitamin_c, or exact Cronometer display labels.",
     {
       name: z.string().min(1),
       servingSize: z.string().optional(),
-      nutrients: z.record(z.number()).optional(),
+      nutrients: z.record(z.number()).optional().describe("Numeric nutrient values. Keys may be canonical schema keys, aliases, or exact Cronometer labels; call custom_food_nutrient_schema for supported macronutrients, micronutrients, amino acids, fatty acids, vitamins, and minerals."),
       barcode: z.string().optional(),
+      duplicatePolicy: z.enum(["fail", "update_existing", "create_new"]).optional().describe("Defaults to update_existing for exactly one same-named food, fails on multiple matches, and creates only when no match exists. Use create_new only when a duplicate is intentional."),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
     },
@@ -442,12 +496,77 @@ export function createCronoServer() {
     async (args) => toMcpToolResponse(await provider.createCustomFood(args as never)),
   );
 
-  registerReadPageTool(
+  register(
     "list_custom_foods",
     "List custom foods",
-    "Lists Cronometer Foods > Custom Foods.",
-    emptyInputSchema,
-    "#custom-foods",
+    "Lists Cronometer Foods > Custom Foods with structured names and optional detail extraction including foodId, serving size, energy, macros, and nutrient rows.",
+    {
+      query: z.string().optional(),
+      includeDetails: z.boolean().optional(),
+      maxDetails: z.number().int().nonnegative().max(25).optional(),
+    },
+    { readOnlyHint: true, openWorldHint: true },
+    async (args) => toMcpToolResponse(await provider.listCustomFoods(args as never)),
+  );
+
+  register(
+    "find_duplicate_custom_foods",
+    "Find duplicate custom foods",
+    "Finds custom foods with matching or similar names and returns IDs plus nutrient summaries so a user can choose a safe update/delete target.",
+    {
+      name: z.string().min(1),
+      maxDetails: z.number().int().positive().max(30).optional(),
+    },
+    { readOnlyHint: true, openWorldHint: true },
+    async (args) => toMcpToolResponse(await provider.findDuplicateCustomFoods(args as never)),
+  );
+
+  register(
+    "update_custom_food",
+    "Update custom food",
+    "Updates one existing Cronometer custom food by exact foodId or unique exact name. Never creates a new custom food.",
+    {
+      foodId: z.string().optional(),
+      name: z.string().optional().describe("Current exact custom food name. If multiple foods match, foodId is required."),
+      newName: z.string().optional(),
+      servingSize: z.string().optional(),
+      nutrients: z.record(z.number()).optional().describe("Numeric nutrient values using custom_food_nutrient_schema keys, aliases, or exact Cronometer labels."),
+      dryRun: z.boolean().optional(),
+      confirmed: z.boolean().optional(),
+    },
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    async (args) => toMcpToolResponse(await provider.updateCustomFood(args as never)),
+  );
+
+  register(
+    "delete_custom_food",
+    "Delete custom food",
+    "Deletes one existing Cronometer custom food by exact foodId or unique exact name. Requires confirmed=true and confirmName matching the selected food name.",
+    {
+      foodId: z.string().optional(),
+      name: z.string().optional(),
+      confirmName: z.string().optional(),
+      ifUsed: z.enum(["stop", "retire", "force"]).optional().describe("Defaults to stop. Use retire to rename instead if Cronometer warns that old diary entries use this food; use force only after explicit user approval."),
+      dryRun: z.boolean().optional(),
+      confirmed: z.boolean().optional(),
+    },
+    { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    async (args) => toMcpToolResponse(await provider.deleteCustomFood(args as never)),
+  );
+
+  register(
+    "retire_custom_food",
+    "Retire custom food",
+    "Renames one existing Cronometer custom food instead of deleting it. Use when old diary entries may depend on the food.",
+    {
+      foodId: z.string().optional(),
+      name: z.string().optional(),
+      retiredName: z.string().optional().describe("Optional exact replacement name. Defaults to 'Retired - <name> - YYYY-MM-DD'."),
+      dryRun: z.boolean().optional(),
+      confirmed: z.boolean().optional(),
+    },
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    async (args) => toMcpToolResponse(await provider.retireCustomFood(args as never)),
   );
 
   registerFrameworkTool(
@@ -478,12 +597,17 @@ export function createCronoServer() {
     "#custom-meals",
   );
 
-  registerReadPageTool(
+  register(
     "list_custom_recipes",
     "List custom recipes",
-    "Lists Cronometer Foods > Custom Recipes.",
-    emptyInputSchema,
-    "#custom-recipes",
+    "Lists Cronometer Foods > Custom Recipes with structured visible names and duplicate groups.",
+    {
+      query: z.string().optional(),
+      includeDetails: z.boolean().optional(),
+      maxDetails: z.number().int().nonnegative().max(25).optional(),
+    },
+    { readOnlyHint: true, openWorldHint: true },
+    async (args) => toMcpToolResponse(await provider.listCustomRecipes(args as never)),
   );
 
   register(
@@ -502,11 +626,55 @@ export function createCronoServer() {
       ),
       servings: z.number().positive().optional(),
       servingName: z.string().optional(),
+      cookedWeight: z.number().positive().optional().describe("Optional total cooked/final recipe weight."),
+      cookedWeightUnit: z.string().optional().describe("Unit for cookedWeight, such as g or oz."),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     async (args) => toMcpToolResponse(await provider.createRecipe(args as never)),
+  );
+
+  register(
+    "update_custom_recipe",
+    "Update custom recipe",
+    "Updates one existing Cronometer custom recipe by exact recipeId or unique exact name. Can edit basics/cooked weight and add resolved ingredients without creating a duplicate.",
+    {
+      recipeId: z.string().optional(),
+      name: z.string().optional().describe("Current exact custom recipe name. If multiple recipes match, recipeId is required."),
+      newName: z.string().optional(),
+      ingredientsToAdd: z.array(
+        z.object({
+          query: z.string().min(1),
+          selectedName: z.string().optional(),
+          amount: z.number().positive().optional(),
+          unit: z.string().optional(),
+        }),
+      ).optional(),
+      servings: z.number().positive().optional(),
+      servingName: z.string().optional(),
+      cookedWeight: z.number().positive().optional(),
+      cookedWeightUnit: z.string().optional(),
+      dryRun: z.boolean().optional(),
+      confirmed: z.boolean().optional(),
+    },
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    async (args) => toMcpToolResponse(await provider.updateCustomRecipe(args as never)),
+  );
+
+  register(
+    "retire_custom_recipe",
+    "Retire custom recipe",
+    "Renames one existing Cronometer custom recipe instead of deleting it.",
+    {
+      recipeId: z.string().optional(),
+      name: z.string().optional(),
+      retiredName: z.string().optional().describe("Optional exact replacement name. Defaults to 'Retired - <name> - YYYY-MM-DD'."),
+      dryRun: z.boolean().optional(),
+      confirmed: z.boolean().optional(),
+    },
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    async (args) => toMcpToolResponse(await provider.retireCustomRecipe(args as never)),
   );
 
   register(
@@ -750,13 +918,38 @@ export function createCronoServer() {
     "#account",
   );
 
-  registerFrameworkTool(
+  register(
     "bulk_delete_entries",
     "Bulk delete entries",
-    "Dangerous framework stub for Cronometer bulk delete.",
+    "Dangerous delete fallback. For custom foods only, pass scope='custom_food:<exact name>' or scope='custom_food_id:<foodId>:<exact name>'. Safer retire fallback: scope='custom_food_retire:<exact name>'. Other bulk deletes remain disabled.",
     { scope: z.string().optional(), dryRun: z.boolean().optional(), confirmed: z.boolean().optional() },
     { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-    "Bulk delete is intentionally disabled until a dedicated review and restore plan exists.",
+    async (args) => {
+      const target = parseCustomFoodFallbackScope(args.scope);
+      if (target) {
+        if (target.action === "retire") {
+          return toMcpToolResponse(await provider.retireCustomFood({
+            foodId: target.foodId,
+            name: target.name,
+            retiredName: target.retiredName,
+            dryRun: args.dryRun as boolean | undefined,
+            confirmed: args.confirmed as boolean | undefined,
+          }));
+        }
+        return toMcpToolResponse(await provider.deleteCustomFood({
+          foodId: target.foodId,
+          name: target.name,
+          confirmName: target.confirmName,
+          dryRun: args.dryRun as boolean | undefined,
+          confirmed: args.confirmed as boolean | undefined,
+        }));
+      }
+      return frameworkOnly(
+        "bulk_delete_entries",
+        args,
+        "Bulk delete is disabled. The only enabled fallback is custom food delete with scope='custom_food:<exact name>' or scope='custom_food_id:<foodId>:<exact name>', or safer retire with scope='custom_food_retire:<exact name>'.",
+      );
+    },
   );
 
   registerFrameworkTool(

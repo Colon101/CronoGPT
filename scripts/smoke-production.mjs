@@ -3,7 +3,7 @@ import "dotenv/config";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
-const serverUrl = process.env.CRONOGPT_SMOKE_URL ?? "https://cronogpt.vercel.app/mcp";
+const serverUrl = process.env.CRONOGPT_SMOKE_URL ?? "https://cronogpt.onrender.com/mcp";
 const token = process.env.CRONOGPT_API_TOKEN;
 
 if (!token) {
@@ -76,7 +76,7 @@ await withClient(async (client) => {
   const dryRun = await client.callTool({
     name: "create_custom_food",
     arguments: {
-      name: "CronoGPT smoke test dry run",
+      name: "cronogpt smoke test dry run",
       servingSize: "1 serving",
       nutrients: { calories: 1 },
       dryRun: true,

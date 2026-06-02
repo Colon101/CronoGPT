@@ -1,0 +1,12 @@
+.git
+.vercel
+node_modules
+dist
+coverage
+exports
+.env
+.env.*
+!.env.example
+.cronometer-storage-state.*
+npm-debug.log*
+.DS_Store

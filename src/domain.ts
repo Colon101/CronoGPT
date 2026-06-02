@@ -93,6 +93,30 @@ export interface RecipeInput {
   ingredients: RecipeIngredientInput[];
   servings?: number;
   servingName?: string;
+  cookedWeight?: number;
+  cookedWeightUnit?: string;
+  dryRun?: boolean;
+  confirmed?: boolean;
+}
+
+export interface CustomRecipeSelectorInput {
+  recipeId?: string;
+  name?: string;
+}
+
+export interface RecipeUpdateInput extends CustomRecipeSelectorInput {
+  newName?: string;
+  ingredientsToAdd?: RecipeIngredientInput[];
+  servings?: number;
+  servingName?: string;
+  cookedWeight?: number;
+  cookedWeightUnit?: string;
+  dryRun?: boolean;
+  confirmed?: boolean;
+}
+
+export interface RecipeRetireInput extends CustomRecipeSelectorInput {
+  retiredName?: string;
   dryRun?: boolean;
   confirmed?: boolean;
 }
@@ -102,8 +126,46 @@ export interface CustomFoodInput {
   servingSize?: string;
   nutrients?: Record<string, number>;
   barcode?: string;
+  duplicatePolicy?: "fail" | "update_existing" | "create_new";
   dryRun?: boolean;
   confirmed?: boolean;
+}
+
+export interface CustomFoodSelectorInput {
+  foodId?: string;
+  name?: string;
+}
+
+export interface CustomFoodListInput {
+  query?: string;
+  includeDetails?: boolean;
+  maxDetails?: number;
+}
+
+export interface CustomFoodUpdateInput extends CustomFoodSelectorInput {
+  newName?: string;
+  servingSize?: string;
+  nutrients?: Record<string, number>;
+  dryRun?: boolean;
+  confirmed?: boolean;
+}
+
+export interface CustomFoodDeleteInput extends CustomFoodSelectorInput {
+  confirmName?: string;
+  ifUsed?: "stop" | "retire" | "force";
+  dryRun?: boolean;
+  confirmed?: boolean;
+}
+
+export interface CustomFoodRetireInput extends CustomFoodSelectorInput {
+  retiredName?: string;
+  dryRun?: boolean;
+  confirmed?: boolean;
+}
+
+export interface CustomFoodDuplicateInput {
+  name: string;
+  maxDetails?: number;
 }
 
 export interface TargetsInput {
@@ -210,8 +272,16 @@ export interface CronometerProvider {
   logExercise(input: ExerciseLogInput): Promise<ProviderResult>;
   logBiometric(input: BiometricLogInput): Promise<ProviderResult>;
   logNote(input: NoteLogInput): Promise<ProviderResult>;
+  listCustomFoods(input: CustomFoodListInput): Promise<ProviderResult>;
+  findDuplicateCustomFoods(input: CustomFoodDuplicateInput): Promise<ProviderResult>;
   createCustomFood(input: CustomFoodInput): Promise<ProviderResult>;
+  updateCustomFood(input: CustomFoodUpdateInput): Promise<ProviderResult>;
+  deleteCustomFood(input: CustomFoodDeleteInput): Promise<ProviderResult>;
+  retireCustomFood(input: CustomFoodRetireInput): Promise<ProviderResult>;
+  listCustomRecipes(input: CustomFoodListInput): Promise<ProviderResult>;
   createRecipe(input: RecipeInput): Promise<ProviderResult>;
+  updateCustomRecipe(input: RecipeUpdateInput): Promise<ProviderResult>;
+  retireCustomRecipe(input: RecipeRetireInput): Promise<ProviderResult>;
   getTargets(input: DateRangeInput): Promise<ProviderResult>;
   setTargets(input: TargetsInput): Promise<ProviderResult>;
   exportData(input: ExportDataInput): Promise<ProviderResult>;

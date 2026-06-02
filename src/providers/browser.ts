@@ -2,7 +2,14 @@ import { chromium, type Browser, type BrowserContext, type Page } from "playwrig
 import type {
   BiometricLogInput,
   Capability,
+  CustomFoodDeleteInput,
+  CustomFoodDuplicateInput,
   CustomFoodInput,
+  CustomFoodListInput,
+  CustomFoodRetireInput,
+  CustomFoodSelectorInput,
+  CustomFoodUpdateInput,
+  CustomRecipeSelectorInput,
   DateRangeInput,
   ExerciseLogInput,
   ExportDataInput,
@@ -11,6 +18,8 @@ import type {
   NoteLogInput,
   ProviderResult,
   RecipeInput,
+  RecipeRetireInput,
+  RecipeUpdateInput,
   ResolveRecipeIngredientsInput,
   RepeatItemInput,
   SearchFoodsInput,
@@ -21,12 +30,15 @@ import type {
 } from "../domain.js";
 import { BaseCronometerProvider } from "./base.js";
 import { capabilitiesForMode } from "../features.js";
+import { customFoodNutrientLabelForKey } from "../nutrients.js";
 
 export interface BrowserConfig {
   email?: string;
   password?: string;
   remoteWsEndpoint?: string;
   storageState?: string;
+  localChromium: boolean;
+  chromiumExecutablePath?: string;
   serverlessChromium: boolean;
   writeEnabled: boolean;
   requireFoodConfirmation: boolean;
@@ -35,6 +47,7 @@ export interface BrowserConfig {
   operationTimeoutMs: number;
   browserRetryCount: number;
   timeZone: string;
+  reuseRemoteContext?: boolean;
 }
 
 interface SearchResult {
@@ -59,10 +72,32 @@ interface FoodSearchOutcome {
   dateStatus: DiaryDateStatus;
 }
 
+interface CustomFoodDetail {
+  foodId?: string;
+  name: string;
+  listIndex?: number;
+  occurrence?: number;
+  servingSize?: string;
+  energy?: { value: number; unit: string };
+  macros?: Record<string, { value: number; unit: string }>;
+  nutrients?: Record<string, { value: number; unit: string; percentDailyValue?: number }>;
+  rawText?: string;
+}
+
+interface CustomRecipeDetail {
+  recipeId?: string;
+  name: string;
+  listIndex?: number;
+  occurrence?: number;
+  rawText?: string;
+}
+
 interface BrowserSession {
   browser: Browser;
   context: BrowserContext;
   page: Page;
+  closeContext?: boolean;
+  closeBrowser?: boolean;
 }
 
 interface ParsedStorageState {
@@ -140,7 +175,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       "cronometer_capabilities",
       browserConfigured ? "ok" : "not_configured",
       capabilities,
-      browserConfigured ? undefined : "Set Cronometer credentials and either enable serverless Chromium or provide REMOTE_CHROME_WS_ENDPOINT.",
+      browserConfigured ? undefined : "Set Cronometer credentials and enable local Chromium, serverless Chromium, or provide REMOTE_CHROME_WS_ENDPOINT.",
     );
   }
 
@@ -154,6 +189,8 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       browserConfigured: this.hasRunnableBrowser(),
       hasCredentials: Boolean(this.config.email && this.config.password),
       hasRemoteBrowser: Boolean(this.config.remoteWsEndpoint),
+      localChromium: this.config.localChromium,
+      chromiumExecutablePathConfigured: Boolean(this.config.chromiumExecutablePath),
       serverlessChromium: this.config.serverlessChromium,
       storageStateConfigured: Boolean(this.config.storageState),
       storageStateUsable: storageStateInfo.usable,
@@ -173,7 +210,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       guidance: [
         "Use dryRun=true for validation and previews; dry-run write tools do not open Cronometer.",
         "Call refresh_cronometer_session before a long browser workflow to warm and verify the current hosted session.",
-        "Use resolve_recipe_ingredients with a low limitPerIngredient and maxSeconds for large recipes.",
+        "Use resolve_recipe_ingredients with a low limitPerIngredient and a larger maxSeconds value for large recipes.",
         "If loginPaused is true, wait or provide durable storage state/remote browser before retrying browser actions.",
         "For the most reliable hosted writes, configure a persistent remote browser or CRONOMETER_STORAGE_STATE_BASE64.",
       ],
@@ -333,7 +370,8 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   async resolveRecipeIngredients(input: ResolveRecipeIngredientsInput) {
     const limit = Math.min(input.limitPerIngredient ?? 3, 5);
-    const maxMs = Math.min(input.maxSeconds ?? 45, 50) * 1000;
+    const operationBudgetMs = Math.max(30000, this.config.operationTimeoutMs - 15000);
+    const maxMs = Math.min((input.maxSeconds ?? 180) * 1000, operationBudgetMs, 900000);
     return this.withPage("resolve_recipe_ingredients", async (page) => {
       const startedAt = Date.now();
       const deadline = startedAt + maxMs;
@@ -349,7 +387,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           resolved.push({
             ingredient,
             status: "skipped",
-            warning: "Skipped before the hosted function timeout. Call resolve_recipe_ingredients again with the remaining ingredients.",
+            warning: "Skipped before the hosted operation budget expired. Call resolve_recipe_ingredients again with the remaining ingredients.",
             matches: { query: ingredient.query, results: [] },
           });
           continue;
@@ -476,8 +514,357 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     return this.writeViaQuickAdd("log_note", "NOTE", input);
   }
 
+  async listCustomFoods(input: CustomFoodListInput = {}) {
+    return this.withPage("list_custom_foods", async (page) => {
+      await this.openApp(page, "#custom-foods");
+      const rawText = await waitForCustomItemListText(page, "Custom Foods", this.config.navigationTimeoutMs);
+      const names = parseCustomItemListNames(rawText, "Custom Foods");
+      const filteredNames = filterCustomItemNames(names, input.query);
+      const includeDetails = input.includeDetails !== false;
+      const maxDetails = Math.max(0, Math.min(input.maxDetails ?? 10, 25));
+      const details = includeDetails ? await customFoodDetailsForNames(page, filteredNames, maxDetails) : [];
+      return this.result("list_custom_foods", "ok", {
+        query: input.query,
+        count: filteredNames.length,
+        names: filteredNames,
+        foods: details,
+        duplicateGroups: duplicateGroups(details.length ? details.map((food) => food.name) : filteredNames),
+        rawText: compactText(rawText, 12000),
+      });
+    });
+  }
+
+  async findDuplicateCustomFoods(input: CustomFoodDuplicateInput) {
+    return this.withPage("find_duplicate_custom_foods", async (page) => {
+      await this.openApp(page, "#custom-foods");
+      const rawText = await waitForCustomItemListText(page, "Custom Foods", this.config.navigationTimeoutMs);
+      const names = filterCustomItemNames(parseCustomItemListNames(rawText, "Custom Foods"), input.name);
+      const maxDetails = Math.max(1, Math.min(input.maxDetails ?? 15, 30));
+      const matches = await customFoodDetailsForNames(page, names, maxDetails);
+      return this.result("find_duplicate_custom_foods", "ok", {
+        query: input.name,
+        matchCount: matches.length,
+        matches,
+        duplicateGroups: duplicateGroups(matches.map((food) => food.name)),
+        rawText: compactText(rawText, 6000),
+      });
+    });
+  }
+
   async createCustomFood(input: CustomFoodInput & { confirmed?: boolean }) {
-    return this.createCustomItem("create_custom_food", "#custom-foods", "CREATE FOOD", input);
+    const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
+    const duplicatePolicy = input.duplicatePolicy ?? "update_existing";
+    if (!confirmedWrite) {
+      return this.result("create_custom_food", "dry_run", {
+        input: safeInput(input),
+        duplicatePolicy,
+        reason: writeGateReason(input, this.config.writeEnabled),
+        nextStep: this.config.writeEnabled
+          ? "Call again with confirmed=true. duplicatePolicy defaults to update_existing for exactly one same-named food, fails on multiple matches, and creates only when no match exists."
+          : "Set CRONOMETER_ENABLE_WRITES=true to allow Cronometer custom food writes.",
+      });
+    }
+
+      return this.withPage("create_custom_food", async (page) => {
+      await this.openApp(page, "#custom-foods");
+      const existing = await resolveCustomFoodTargets(page, { name: input.name }, { maxDetails: 12, timeoutMs: this.config.navigationTimeoutMs });
+      if (existing.targets.length > 0 && duplicatePolicy === "fail") {
+        return this.result("create_custom_food", "needs_manual_step", {
+          input: safeInput(input),
+          duplicatePolicy,
+          existingFoods: existing.targets,
+          duplicateGroups: duplicateGroups(existing.targets.map((food) => food.name)),
+          nextStep: "Use update_custom_food with foodId/name to edit an existing food, or call create_custom_food with duplicatePolicy=create_new if a duplicate is intentional.",
+        }, "A custom food with this name already exists. Refusing to create a duplicate by default.");
+      }
+
+      const shouldUpdateExisting = existing.targets.length === 1 && duplicatePolicy === "update_existing";
+      if (existing.targets.length > 1 && duplicatePolicy === "update_existing") {
+        return this.result("create_custom_food", "needs_manual_step", {
+          input: safeInput(input),
+          duplicatePolicy,
+          existingFoods: existing.targets,
+          nextStep: "More than one matching custom food exists. Call update_custom_food with a specific foodId.",
+        }, "Cannot update existing because multiple matching custom foods were found.");
+      }
+
+      const openedExisting = shouldUpdateExisting ? await openCustomFoodTarget(page, existing.targets[0]) : false;
+      const openedCreateForm = openedExisting || await clickByText(page, /^CREATE FOOD$/i);
+      if (!openedCreateForm) {
+        const visibleText = compactText(await this.visibleText(page), 10000);
+        return this.result("create_custom_food", "needs_manual_step", { input: safeInput(input), visibleText }, "Could not find an existing custom food or CREATE FOOD.");
+      }
+
+      await page.waitForTimeout(1200);
+      const nameFilled = await fillCustomFoodName(page, input.name);
+      const serving = await fillCustomFoodServing(page, input.servingSize);
+      const nutrients = await fillCustomFoodNutrients(page, input.nutrients ?? {});
+
+      const saved = await clickByText(page, /^SAVE CHANGES$/i);
+      if (!saved) {
+        return this.result(
+          "create_custom_food",
+          "needs_manual_step",
+          {
+            input: safeInput(input),
+            nameFilled,
+            serving,
+            nutrients,
+            visibleText: compactText(await this.visibleText(page), 12000),
+          },
+          "Filled the custom food form but could not find Save Changes.",
+        );
+      }
+
+      await page.waitForTimeout(900);
+      const confirmationClicked = await clickOptionalSaveConfirmation(page);
+      if (confirmationClicked) await page.waitForTimeout(1300);
+      const afterSaveText = compactText(await this.visibleText(page).catch(() => ""), 12000);
+      await page.waitForTimeout(900);
+      await this.openApp(page, "#custom-foods");
+      const listText = await this.visibleText(page);
+      const listed = textHasFoodName(listText, input.name);
+      return this.result(
+        "create_custom_food",
+        listed ? "ok" : "needs_manual_step",
+        {
+          created: listed,
+          updated: openedExisting,
+          action: openedExisting ? "updated_existing" : "created_new",
+          duplicatePolicy,
+          foodName: input.name,
+          nameFilled,
+          serving,
+          nutrients,
+          confirmationClicked,
+          afterSaveText,
+          visibleText: compactText(listText, 12000),
+        },
+        listed ? undefined : "Clicked Save Changes, but the custom food was not found in the Custom Foods list afterward.",
+      );
+    });
+  }
+
+  async updateCustomFood(input: CustomFoodUpdateInput & { confirmed?: boolean }) {
+    const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
+    return this.withPage("update_custom_food", async (page) => {
+      await this.openApp(page, "#custom-foods");
+      const resolved = await resolveCustomFoodTargets(page, input, { maxDetails: 20, timeoutMs: this.config.navigationTimeoutMs });
+      if (resolved.targets.length !== 1) {
+        return this.result("update_custom_food", "needs_manual_step", {
+          input: safeInput(input),
+          visibleNames: resolved.names,
+          candidates: resolved.targets,
+          candidateCount: resolved.targets.length,
+          nextStep: resolved.targets.length > 1 ? "Call update_custom_food again with the exact foodId." : "No matching custom food was found.",
+        }, resolved.targets.length > 1 ? "Multiple matching custom foods were found; update requires an exact target." : "No matching custom food was found.");
+      }
+
+      const before = resolved.targets[0];
+      const after = {
+        foodId: before.foodId,
+        name: input.newName ?? before.name,
+        servingSize: input.servingSize ?? before.servingSize,
+        nutrients: input.nutrients,
+      };
+      if (!confirmedWrite) {
+        return this.result("update_custom_food", "dry_run", {
+          input: safeInput(input),
+          before,
+          after,
+          reason: writeGateReason(input, this.config.writeEnabled),
+          nextStep: "Review the before/after diff, then call with confirmed=true to update this exact custom food.",
+        });
+      }
+
+      const opened = await openCustomFoodTarget(page, before);
+      if (!opened) {
+        return this.result("update_custom_food", "needs_manual_step", { input: safeInput(input), before }, "Could not reopen the selected custom food.");
+      }
+
+      const nameFilled = input.newName ? await fillCustomFoodName(page, input.newName) : true;
+      const serving = input.servingSize ? await fillCustomFoodServing(page, input.servingSize) : undefined;
+      const nutrients = input.nutrients ? await fillCustomFoodNutrients(page, input.nutrients) : [];
+      const saved = await clickByText(page, /^SAVE CHANGES$/i);
+      if (!saved) {
+        return this.result("update_custom_food", "needs_manual_step", {
+          input: safeInput(input),
+          before,
+          nameFilled,
+          serving,
+          nutrients,
+          visibleText: compactText(await this.visibleText(page), 12000),
+        }, "Filled the custom food editor but could not find Save Changes.");
+      }
+
+      await page.waitForTimeout(1200);
+      const afterSaveText = compactText(await this.visibleText(page).catch(() => ""), 12000);
+      const finalDetail = await extractCustomFoodDetail(page);
+      return this.result("update_custom_food", "ok", {
+        updated: true,
+        action: "updated_existing",
+        before,
+        after: finalDetail ?? after,
+        nameFilled,
+        serving,
+        nutrients,
+        afterSaveText,
+      });
+    });
+  }
+
+  async deleteCustomFood(input: CustomFoodDeleteInput & { confirmed?: boolean }) {
+    const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
+    const ifUsed = input.ifUsed ?? "stop";
+    return this.withPage("delete_custom_food", async (page) => {
+      await this.openApp(page, "#custom-foods");
+      const resolved = await resolveCustomFoodTargets(page, input, { maxDetails: 25, timeoutMs: this.config.navigationTimeoutMs });
+      if (resolved.targets.length !== 1) {
+        return this.result("delete_custom_food", "needs_manual_step", {
+          input: safeInput(input),
+          visibleNames: resolved.names,
+          candidates: resolved.targets,
+          candidateCount: resolved.targets.length,
+          nextStep: resolved.targets.length > 1 ? "Call delete_custom_food again with the exact foodId and confirmName." : "No matching custom food was found.",
+        }, resolved.targets.length > 1 ? "Multiple matching custom foods were found; delete requires an exact target." : "No matching custom food was found.");
+      }
+
+      const target = resolved.targets[0];
+      if (input.confirmName !== target.name) {
+        return this.result("delete_custom_food", "dry_run", {
+          input: safeInput(input),
+          target,
+          requiredConfirmName: target.name,
+          nextStep: "Call delete_custom_food with confirmed=true and confirmName exactly matching the target name.",
+        }, "Deletion requires confirmName to match the selected custom food name.");
+      }
+
+      if (!confirmedWrite) {
+        return this.result("delete_custom_food", "dry_run", {
+          input: safeInput(input),
+          target,
+          reason: writeGateReason(input, this.config.writeEnabled),
+          ifUsed,
+          nextStep: "Review the target food, then call with confirmed=true and the same confirmName to delete it. If old diary entries may depend on it, use retire_custom_food or ifUsed='retire'.",
+        });
+      }
+
+      const opened = await openCustomFoodTarget(page, target);
+      if (!opened) {
+        return this.result("delete_custom_food", "needs_manual_step", { input: safeInput(input), target }, "Could not reopen the selected custom food.");
+      }
+      const menuClicked = await clickByText(page, /^more_horiz$/i) || await clickByText(page, /^(MORE|ACTIONS)$/i);
+      if (!menuClicked) {
+        return this.result("delete_custom_food", "needs_manual_step", {
+          input: safeInput(input),
+          target,
+          visibleText: compactText(await this.visibleText(page), 12000),
+        }, "Could not find the custom food actions menu.");
+      }
+      await page.waitForTimeout(500);
+      const deleteClicked = await clickByText(page, /^(DELETE|DELETE FOOD|REMOVE)$/i);
+      if (!deleteClicked) {
+        return this.result("delete_custom_food", "needs_manual_step", {
+          input: safeInput(input),
+          target,
+          visibleText: compactText(await this.visibleText(page), 12000),
+        }, "Opened the actions menu but could not find a delete action.");
+      }
+      await page.waitForTimeout(500);
+      const confirmation = await handleOptionalDeleteConfirmation(page, target.name, ifUsed);
+      if (confirmation.blocked) {
+        return this.result("delete_custom_food", "needs_manual_step", {
+          input: safeInput(input),
+          target,
+          deleteConfirmation: confirmation,
+          nextStep: "Cronometer warned that this food may be used by existing entries. Use retire_custom_food, or call delete_custom_food with ifUsed='force' only after explicit approval.",
+        }, "Cronometer showed a dependency warning, so deletion was stopped.");
+      }
+
+      if (confirmation.retireInstead) {
+        const retiredName = retiredItemName(input.name ?? target.name, input.foodId);
+        const retired = await retireOpenCustomFood(page, target, retiredName);
+        return this.result(retired.saved ? "delete_custom_food" : "delete_custom_food", retired.saved ? "ok" : "needs_manual_step", {
+          deleted: false,
+          action: "retired_instead",
+          target,
+          retiredName,
+          deleteConfirmation: confirmation,
+          retired,
+        }, retired.saved ? "Cronometer warned about existing references, so the custom food was retired instead of deleted." : "Cronometer warned about existing references, and the retire fallback could not be saved.");
+      }
+
+      await page.waitForTimeout(1200);
+      await this.openApp(page, "#custom-foods");
+      const listText = await waitForCustomItemListText(page, "Custom Foods", this.config.navigationTimeoutMs);
+      const stillListed = textHasFoodName(listText, target.name);
+      return this.result("delete_custom_food", stillListed ? "needs_manual_step" : "ok", {
+        deleted: !stillListed,
+        target,
+        confirmation,
+        visibleText: compactText(listText, 8000),
+      }, stillListed ? "Delete was clicked, but the food name still appeared in the Custom Foods list afterward." : undefined);
+    });
+  }
+
+  async retireCustomFood(input: CustomFoodRetireInput & { confirmed?: boolean }) {
+    const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
+    return this.withPage("retire_custom_food", async (page) => {
+      await this.openApp(page, "#custom-foods");
+      const resolved = await resolveCustomFoodTargets(page, input, { maxDetails: 25, timeoutMs: this.config.navigationTimeoutMs });
+      if (resolved.targets.length !== 1) {
+        return this.result("retire_custom_food", "needs_manual_step", {
+          input: safeInput(input),
+          visibleNames: resolved.names,
+          candidates: resolved.targets,
+          candidateCount: resolved.targets.length,
+          nextStep: resolved.targets.length > 1 ? "Call retire_custom_food again with the exact foodId." : "No matching custom food was found.",
+        }, resolved.targets.length > 1 ? "Multiple matching custom foods were found; retire requires an exact target." : "No matching custom food was found.");
+      }
+
+      const target = resolved.targets[0];
+      const retiredName = input.retiredName ?? retiredItemName(target.name, target.foodId);
+      if (!confirmedWrite) {
+        return this.result("retire_custom_food", "dry_run", {
+          input: safeInput(input),
+          target,
+          retiredName,
+          reason: writeGateReason(input, this.config.writeEnabled),
+          nextStep: "Review the exact target and retiredName, then call with confirmed=true to rename instead of delete.",
+        });
+      }
+
+      const opened = await openCustomFoodTarget(page, target);
+      if (!opened) {
+        return this.result("retire_custom_food", "needs_manual_step", { input: safeInput(input), target }, "Could not reopen the selected custom food.");
+      }
+      const retired = await retireOpenCustomFood(page, target, retiredName);
+      return this.result("retire_custom_food", retired.saved ? "ok" : "needs_manual_step", {
+        action: "retired",
+        target,
+        retiredName,
+        retired,
+      }, retired.saved ? undefined : "The custom food editor opened, but the retired name could not be saved.");
+    });
+  }
+
+  async listCustomRecipes(input: CustomFoodListInput = {}) {
+    return this.withPage("list_custom_recipes", async (page) => {
+      await this.openApp(page, "#custom-recipes");
+      const rawText = await waitForCustomItemListText(page, "Custom Recipes", this.config.navigationTimeoutMs);
+      const names = filterCustomItemNames(parseCustomItemListNames(rawText, "Custom Recipes"), input.query);
+      const includeDetails = input.includeDetails !== false;
+      const maxDetails = Math.max(0, Math.min(input.maxDetails ?? 10, 25));
+      const details = includeDetails ? await customRecipeDetailsForNames(page, names, maxDetails) : [];
+      return this.result("list_custom_recipes", "ok", {
+        query: input.query,
+        count: names.length,
+        names,
+        recipes: details.length ? details : names.map((name) => ({ name })),
+        duplicateGroups: duplicateGroups(details.length ? details.map((recipe) => recipe.name) : names),
+        rawText: compactText(rawText, 12000),
+      });
+    });
   }
 
   async createRecipe(input: RecipeInput & { confirmed?: boolean }) {
@@ -485,42 +872,190 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       recipeName: input.name,
       servings: input.servings,
       servingName: input.servingName,
+      cookedWeight: input.cookedWeight,
+      cookedWeightUnit: input.cookedWeightUnit,
       ingredients: input.ingredients,
     };
 
-    if (input.dryRun !== false || !input.confirmed || !this.config.writeEnabled) {
+    const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
+    if (!confirmedWrite) {
       return this.result("create_recipe", "dry_run", {
         input: safeInput(input),
         preview,
-        nextStep: "Call again with dryRun=false and confirmed=true after reviewing exact Cronometer ingredient matches.",
+        reason: writeGateReason(input, this.config.writeEnabled),
+        nextStep: this.config.writeEnabled
+          ? "Call again with confirmed=true after reviewing exact Cronometer ingredient matches. Leave dryRun unset, or set dryRun=false."
+          : "Set CRONOMETER_ENABLE_WRITES=true to allow Cronometer recipe writes.",
       });
     }
 
     return this.withPage("create_recipe", async (page) => {
+      const deadline = Date.now() + Math.max(30000, Math.min(this.config.operationTimeoutMs - 15000, 900000));
       await this.openApp(page, "#custom-recipes");
       const opened = await clickByText(page, /^CREATE RECIPE$/i);
       if (!opened) {
         return this.result("create_recipe", "needs_manual_step", { input: safeInput(input) }, "Could not find CREATE RECIPE.");
       }
 
-      await page.waitForTimeout(1200);
-      await fillRecipeBasics(page, input);
+      await page.waitForTimeout(450);
+      const basics = await fillRecipeBasics(page, input);
 
       const addedIngredients = [];
-      for (const ingredient of input.ingredients) {
-        const added = await addRecipeIngredient(page, ingredient);
+      for (const [index, ingredient] of input.ingredients.entries()) {
+        if (Date.now() > deadline - 4500) {
+          return this.result("create_recipe", "needs_manual_step", {
+            recipeName: input.name,
+            basics,
+            addedIngredients,
+            stoppedBeforeIngredient: { index, ingredient },
+            visibleText: compactText(await this.visibleText(page).catch(() => ""), 10000),
+          }, "Stopped before the hosted operation budget expired. Retry with the remaining ingredients or use fewer ingredients per call.");
+        }
+        const added = await addRecipeIngredient(page, ingredient, { deadline });
         addedIngredients.push({ ingredient, ...added });
+        if (added.status !== "ok") break;
       }
 
       const visibleText = await this.visibleText(page);
       const allAdded = addedIngredients.every((item) => item.status === "ok");
       const nameVisible = visibleText.toLowerCase().includes(input.name.toLowerCase());
+      const saveClicked = allAdded && nameVisible
+        ? await clickByText(page, /^SAVE CHANGES$/i) || await clickByText(page, /^SAVE$/i)
+        : false;
+      if (saveClicked) {
+        await page.waitForTimeout(1200);
+        await clickOptionalSaveConfirmation(page).catch(() => false);
+        await page.waitForTimeout(1000);
+      }
+      let listed = false;
+      let listText = "";
+      if (saveClicked && Date.now() < deadline) {
+        await this.openApp(page, "#custom-recipes");
+        listText = await waitForCustomItemListText(page, "Custom Recipes", Math.min(this.config.navigationTimeoutMs, 10000)).catch(() => "");
+        listed = textHasFoodName(listText, input.name);
+      }
 
-      return this.result(allAdded && nameVisible ? "create_recipe" : "create_recipe", allAdded && nameVisible ? "ok" : "needs_manual_step", {
+      const ok = allAdded && nameVisible && saveClicked && listed;
+      return this.result("create_recipe", ok ? "ok" : "needs_manual_step", {
         recipeName: input.name,
+        basics,
         addedIngredients,
+        saveClicked,
+        listed,
+        customRecipesText: listText ? compactText(listText, 8000) : undefined,
         visibleText: compactText(visibleText, 12000),
-      }, allAdded && nameVisible ? "Cronometer recipe editor was filled. Cronometer appears to autosave recipe edits in this UI." : "Recipe editor opened, but one or more ingredients could not be verified.");
+      }, ok ? undefined : "Recipe editor opened, but the saved recipe could not be verified in Custom Recipes.");
+    });
+  }
+
+  async updateCustomRecipe(input: RecipeUpdateInput & { confirmed?: boolean }) {
+    const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
+    return this.withPage("update_custom_recipe", async (page) => {
+      await this.openApp(page, "#custom-recipes");
+      const resolved = await resolveCustomRecipeTargets(page, input, { maxDetails: 20, timeoutMs: this.config.navigationTimeoutMs });
+      if (resolved.targets.length !== 1) {
+        return this.result("update_custom_recipe", "needs_manual_step", {
+          input: safeInput(input),
+          visibleNames: resolved.names,
+          candidates: resolved.targets,
+          candidateCount: resolved.targets.length,
+          nextStep: resolved.targets.length > 1 ? "Call update_custom_recipe again with the exact recipeId." : "No matching custom recipe was found.",
+        }, resolved.targets.length > 1 ? "Multiple matching custom recipes were found; update requires an exact target." : "No matching custom recipe was found.");
+      }
+
+      const before = resolved.targets[0];
+      const basicsInput: RecipeInput = {
+        name: input.newName ?? before.name,
+        ingredients: input.ingredientsToAdd ?? [],
+        servings: input.servings,
+        servingName: input.servingName,
+        cookedWeight: input.cookedWeight,
+        cookedWeightUnit: input.cookedWeightUnit,
+      };
+      const after = {
+        recipeId: before.recipeId,
+        name: basicsInput.name,
+        servings: input.servings,
+        servingName: input.servingName,
+        cookedWeight: input.cookedWeight,
+        cookedWeightUnit: input.cookedWeightUnit,
+        ingredientsToAdd: input.ingredientsToAdd,
+      };
+      if (!confirmedWrite) {
+        return this.result("update_custom_recipe", "dry_run", {
+          input: safeInput(input),
+          before,
+          after,
+          reason: writeGateReason(input, this.config.writeEnabled),
+          nextStep: "Review the before/after diff, then call with confirmed=true to update this exact custom recipe.",
+        });
+      }
+
+      const opened = await openCustomRecipeTarget(page, before);
+      if (!opened) {
+        return this.result("update_custom_recipe", "needs_manual_step", { input: safeInput(input), before }, "Could not reopen the selected custom recipe.");
+      }
+      const basics = await fillRecipeBasics(page, basicsInput);
+      const addedIngredients = [];
+      for (const ingredient of input.ingredientsToAdd ?? []) {
+        const added = await addRecipeIngredient(page, ingredient);
+        addedIngredients.push({ ingredient, ...added });
+      }
+      const saveClicked = await clickByText(page, /^SAVE CHANGES$/i) || await clickByText(page, /^SAVE$/i);
+      await page.waitForTimeout(1000);
+      const finalDetail = await extractCustomRecipeDetail(page);
+      const allAdded = addedIngredients.every((item) => item.status === "ok");
+      return this.result("update_custom_recipe", allAdded ? "ok" : "needs_manual_step", {
+        updated: allAdded,
+        action: "updated_existing",
+        before,
+        after: finalDetail ?? after,
+        basics,
+        addedIngredients,
+        saveClicked,
+        visibleText: compactText(await this.visibleText(page), 12000),
+      }, allAdded ? undefined : "Recipe editor opened, but one or more added ingredients could not be verified.");
+    });
+  }
+
+  async retireCustomRecipe(input: RecipeRetireInput & { confirmed?: boolean }) {
+    const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
+    return this.withPage("retire_custom_recipe", async (page) => {
+      await this.openApp(page, "#custom-recipes");
+      const resolved = await resolveCustomRecipeTargets(page, input, { maxDetails: 25, timeoutMs: this.config.navigationTimeoutMs });
+      if (resolved.targets.length !== 1) {
+        return this.result("retire_custom_recipe", "needs_manual_step", {
+          input: safeInput(input),
+          visibleNames: resolved.names,
+          candidates: resolved.targets,
+          candidateCount: resolved.targets.length,
+          nextStep: resolved.targets.length > 1 ? "Call retire_custom_recipe again with the exact recipeId." : "No matching custom recipe was found.",
+        }, resolved.targets.length > 1 ? "Multiple matching custom recipes were found; retire requires an exact target." : "No matching custom recipe was found.");
+      }
+
+      const target = resolved.targets[0];
+      const retiredName = input.retiredName ?? retiredItemName(target.name, target.recipeId);
+      if (!confirmedWrite) {
+        return this.result("retire_custom_recipe", "dry_run", {
+          input: safeInput(input),
+          target,
+          retiredName,
+          reason: writeGateReason(input, this.config.writeEnabled),
+          nextStep: "Review the exact target and retiredName, then call with confirmed=true to rename instead of delete.",
+        });
+      }
+
+      const opened = await openCustomRecipeTarget(page, target);
+      if (!opened) {
+        return this.result("retire_custom_recipe", "needs_manual_step", { input: safeInput(input), target }, "Could not reopen the selected custom recipe.");
+      }
+      const retired = await retireOpenCustomRecipe(page, target, retiredName);
+      return this.result("retire_custom_recipe", retired.saved ? "ok" : "needs_manual_step", {
+        action: "retired",
+        target,
+        retiredName,
+        retired,
+      }, retired.saved ? undefined : "The custom recipe editor opened, but the retired name could not be saved.");
     });
   }
 
@@ -533,10 +1068,14 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   async exportData(input: ExportDataInput & { confirmed?: boolean }) {
-    if (input.dryRun !== false || !input.confirmed || !this.config.writeEnabled) {
+    const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
+    if (!confirmedWrite) {
       return this.result("export_data", "dry_run", {
         input: safeInput(input),
-        nextStep: "Call with dryRun=false and confirmed=true to click EXPORT DATA.",
+        reason: writeGateReason(input, this.config.writeEnabled),
+        nextStep: this.config.writeEnabled
+          ? "Call with confirmed=true to click EXPORT DATA. Leave dryRun unset, or set dryRun=false."
+          : "Set CRONOMETER_ENABLE_WRITES=true to allow Cronometer export clicks.",
       });
     }
 
@@ -587,10 +1126,14 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private async createCustomItem(feature: string, hash: string, createButtonText: string, input: { name: string; dryRun?: boolean; confirmed?: boolean }) {
-    if (input.dryRun !== false || !input.confirmed || !this.config.writeEnabled) {
+    const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
+    if (!confirmedWrite) {
       return this.result(feature, "dry_run", {
         input: safeInput(input),
-        nextStep: `Call again with dryRun=false and confirmed=true to open ${createButtonText}.`,
+        reason: writeGateReason(input, this.config.writeEnabled),
+        nextStep: this.config.writeEnabled
+          ? `Call again with confirmed=true to open ${createButtonText}. Leave dryRun unset, or set dryRun=false.`
+          : `Set CRONOMETER_ENABLE_WRITES=true to allow Cronometer ${createButtonText.toLowerCase()} writes.`,
       });
     }
 
@@ -619,10 +1162,14 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private async writeViaQuickAdd(feature: string, buttonText: string, input: { dryRun?: boolean; confirmed?: boolean }) {
-    if (input.dryRun !== false || !input.confirmed || !this.config.writeEnabled) {
+    const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
+    if (!confirmedWrite) {
       return this.result(feature, "dry_run", {
         input: safeInput(input),
-        nextStep: `Call again with dryRun=false and confirmed=true to open ${buttonText}.`,
+        reason: writeGateReason(input, this.config.writeEnabled),
+        nextStep: this.config.writeEnabled
+          ? `Call again with confirmed=true to open ${buttonText}. Leave dryRun unset, or set dryRun=false.`
+          : `Set CRONOMETER_ENABLE_WRITES=true to allow Cronometer ${buttonText.toLowerCase()} writes.`,
       });
     }
 
@@ -647,12 +1194,15 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private async confirmedPageWrite(feature: string, hash: string, input: { dryRun?: boolean; confirmed?: boolean }, warning: string) {
-    const confirmedWrite = input.dryRun === false && input.confirmed && this.config.writeEnabled;
+    const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
     if (!confirmedWrite) {
       return this.result(feature, "dry_run", {
         input: safeInput(input),
         hash,
-        nextStep: "Call again with dryRun=false and confirmed=true after reviewing the requested change.",
+        reason: writeGateReason(input, this.config.writeEnabled),
+        nextStep: this.config.writeEnabled
+          ? "Call again with confirmed=true after reviewing the requested change. Leave dryRun unset, or set dryRun=false."
+          : "Set CRONOMETER_ENABLE_WRITES=true to allow this Cronometer write.",
       }, warning);
     }
 
@@ -830,8 +1380,8 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   private async isLoggedIn(page: Page, text?: string) {
     const bodyText = text ?? (await this.visibleText(page).catch(() => ""));
-    if (/\bWelcome Back\b|\bLOG IN\b|Too Many Attempts|captcha|robot|verify/i.test(bodyText)) return false;
-    return /\bDashboard\b|\bDiary\b|\bTrends\b|\bFoods\b/.test(bodyText);
+    if (/\bWelcome Back\b|\bLog In\b|\bSign Up\b|Too Many Attempts|captcha|robot|verify|Science-backed nutrition tracking|Sign Up For Free/i.test(bodyText)) return false;
+    return /\bDashboard\b/i.test(bodyText) && /\b(Diary|Trends|Foods)\b/i.test(bodyText);
   }
 
   private pauseLoginAttempts(reason: string) {
@@ -859,9 +1409,10 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         {
           hasCredentials: Boolean(this.config.email && this.config.password),
           hasRemoteBrowser: Boolean(this.config.remoteWsEndpoint),
+          localChromium: this.config.localChromium,
           serverlessChromium: this.config.serverlessChromium,
         },
-        "Enable CRONOMETER_SERVERLESS_CHROMIUM or set REMOTE_CHROME_WS_ENDPOINT to a Browserless-compatible Chrome WebSocket endpoint.",
+        "Enable CRONOMETER_LOCAL_CHROMIUM, enable CRONOMETER_SERVERLESS_CHROMIUM, or set REMOTE_CHROME_WS_ENDPOINT to a Browserless-compatible Chrome WebSocket endpoint.",
         "browser",
       );
     }
@@ -906,8 +1457,8 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       const message = error instanceof Error ? error.message : "Unknown browser automation error";
       return this.result(feature, "error", { attempt }, message, "browser");
     } finally {
-      await session?.context.close().catch(() => undefined);
-      await session?.browser.close().catch(() => undefined);
+      if (session?.closeContext !== false) await session?.context.close().catch(() => undefined);
+      if (session?.closeBrowser !== false) await session?.browser.close().catch(() => undefined);
     }
   }
 
@@ -916,7 +1467,21 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       ? await chromium.connectOverCDP(this.config.remoteWsEndpoint, {
           timeout: this.config.navigationTimeoutMs,
         })
-      : await this.launchServerlessChromium();
+      : this.config.serverlessChromium
+        ? await this.launchServerlessChromium()
+        : await this.launchLocalChromium();
+    if (this.config.remoteWsEndpoint && this.config.reuseRemoteContext) {
+      const context = browser.contexts()[0] ?? await browser.newContext({
+        viewport: { width: 1440, height: 1100 },
+        locale: "en-US",
+        storageState: this.storageState(),
+      });
+      const page = context.pages().find((candidate) => candidate.url().includes("cronometer.com")) ?? context.pages()[0] ?? await context.newPage();
+      page.setDefaultTimeout(this.config.navigationTimeoutMs);
+      page.setDefaultNavigationTimeout(this.config.navigationTimeoutMs);
+      return { browser, context, page, closeContext: false, closeBrowser: false };
+    }
+
     const context = await browser.newContext({
       viewport: { width: 1440, height: 1100 },
       locale: "en-US",
@@ -929,7 +1494,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private hasRunnableBrowser() {
-    return Boolean(this.config.remoteWsEndpoint || this.config.serverlessChromium);
+    return Boolean(this.config.remoteWsEndpoint || this.config.serverlessChromium || this.config.localChromium);
   }
 
   private storageState(): ParsedStorageState | undefined {
@@ -994,23 +1559,224 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       timeout: this.config.navigationTimeoutMs,
     });
   }
+
+  private async launchLocalChromium() {
+    return chromium.launch({
+      executablePath: this.config.chromiumExecutablePath,
+      args: ["--disable-dev-shm-usage", "--disable-gpu", "--no-sandbox"],
+      headless: true,
+      timeout: this.config.navigationTimeoutMs,
+    });
+  }
 }
 
 async function clickByText(page: Page, label: string | RegExp) {
   const candidates = [
     page.getByRole("button", { name: label }),
     page.getByRole("link", { name: label }),
-    page.locator("button,a,[role='button']").filter({ hasText: label }),
+    page.locator(clickableTextSelector()).filter({ hasText: label }),
+    label instanceof RegExp ? page.getByText(label) : page.getByText(label, { exact: true }),
+    ...(typeof label === "string" ? [page.getByText(label)] : []),
   ];
 
   for (const candidate of candidates) {
-    if ((await candidate.count().catch(() => 0)) === 0) continue;
-    const first = candidate.first();
-    if (!(await first.isVisible().catch(() => false))) continue;
-    await first.click();
+    if (await clickFirstVisible(candidate)) return true;
+  }
+
+  const box = await findVisibleTextClickBox(page, label);
+  if (box) {
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    await page.waitForTimeout(300);
     return true;
   }
   return false;
+}
+
+async function clickOptionalSaveConfirmation(page: Page) {
+  const dialog = page.locator(".gwt-DialogBox:visible, [role='dialog']:visible, .modal:visible, .popupContent:visible").last();
+  if ((await dialog.count().catch(() => 0)) === 0 || !(await dialog.isVisible().catch(() => false))) return false;
+  return clickFirstVisible(dialog.locator(clickableTextSelector()).filter({ hasText: /^(SAVE|CONFIRM|YES|OK)$/i }));
+}
+
+interface DeleteConfirmationOutcome {
+  dialogVisible: boolean;
+  dialogText?: string;
+  dependencyWarning: boolean;
+  clicked: boolean;
+  cancelled: boolean;
+  blocked: boolean;
+  retireInstead: boolean;
+}
+
+async function handleOptionalDeleteConfirmation(page: Page, name: string, ifUsed: "stop" | "retire" | "force" = "stop"): Promise<DeleteConfirmationOutcome> {
+  const dialog = page.locator(".gwt-DialogBox:visible, [role='dialog']:visible, .modal:visible, .popupContent:visible").last();
+  if ((await dialog.count().catch(() => 0)) === 0 || !(await dialog.isVisible().catch(() => false))) {
+    return { dialogVisible: false, dependencyWarning: false, clicked: false, cancelled: false, blocked: false, retireInstead: false };
+  }
+  const dialogText = await dialog.innerText().catch(() => "");
+  if (dialogText && !dialogText.toLowerCase().includes(name.toLowerCase()) && !/\b(delete|remove)\b/i.test(dialogText)) {
+    return { dialogVisible: true, dialogText, dependencyWarning: false, clicked: false, cancelled: false, blocked: false, retireInstead: false };
+  }
+
+  const dependencyWarning = deleteDialogHasDependencyWarning(dialogText);
+  if (dependencyWarning && ifUsed !== "force") {
+    const cancelled = await cancelVisibleDialog(page, dialog);
+    return {
+      dialogVisible: true,
+      dialogText,
+      dependencyWarning,
+      clicked: false,
+      cancelled,
+      blocked: ifUsed === "stop",
+      retireInstead: ifUsed === "retire",
+    };
+  }
+
+  const clicked = await clickFirstVisible(dialog.locator(clickableTextSelector()).filter({ hasText: /^(DELETE|REMOVE|YES|OK|CONFIRM)$/i }));
+  return { dialogVisible: true, dialogText, dependencyWarning, clicked, cancelled: false, blocked: false, retireInstead: false };
+}
+
+function deleteDialogHasDependencyWarning(text: string) {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) return false;
+  return /\b(used|in use|referenced|associated|linked|logged|diary|entries|servings|recipes|meals|history)\b/i.test(normalized)
+    && /\b(delete|remove|deleting|removing)\b/i.test(normalized);
+}
+
+async function cancelVisibleDialog(page: Page, dialog: ReturnType<Page["locator"]>) {
+  const clicked = await clickFirstVisible(dialog.locator(clickableTextSelector()).filter({ hasText: /^(CANCEL|NO|KEEP|CLOSE|BACK)$/i }));
+  if (clicked) return true;
+  await page.keyboard.press("Escape").catch(() => undefined);
+  await page.waitForTimeout(350);
+  return !(await dialog.isVisible().catch(() => false));
+}
+
+async function clickFirstVisible(locator: ReturnType<Page["locator"]>) {
+  const count = await locator.count().catch(() => 0);
+  for (let index = 0; index < Math.min(count, 12); index += 1) {
+    const item = locator.nth(index);
+    if (!(await item.isVisible().catch(() => false))) continue;
+    await item.scrollIntoViewIfNeeded().catch(() => undefined);
+    try {
+      await item.click({ timeout: 2500 });
+      return true;
+    } catch {
+      try {
+        await item.click({ timeout: 2500, force: true });
+        return true;
+      } catch {
+        // Keep trying lower-confidence candidates.
+      }
+    }
+  }
+  return false;
+}
+
+function clickableTextSelector() {
+  return [
+    "button",
+    "a",
+    "[role='button']",
+    "input[type='button']",
+    "input[type='submit']",
+    "[onclick]",
+    "[tabindex]",
+    ".gwt-Button",
+    ".gwt-ToggleButton",
+    ".button-panel-btn",
+    ".btn",
+    ".clickable",
+  ].join(",");
+}
+
+async function findVisibleTextClickBox(page: Page, label: string | RegExp) {
+  return page.evaluate((matcher) => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
+    const regex = matcher.kind === "regex" ? new RegExp(matcher.source, matcher.flags) : undefined;
+    const expected = matcher.kind === "text" ? normalize(matcher.value).toLowerCase() : undefined;
+    const selector = matcher.clickableSelector;
+
+    const textMatches = (value: string) => {
+      const normalized = normalize(value);
+      if (!normalized) return false;
+      if (regex) return regex.test(normalized);
+      return Boolean(expected && normalized.toLowerCase().includes(expected));
+    };
+
+    const isVisible = (element: Element) => {
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
+
+    const depth = (element: Element) => {
+      let current: Element | null = element;
+      let total = 0;
+      while (current) {
+        total += 1;
+        current = current.parentElement;
+      }
+      return total;
+    };
+
+    const candidates = Array.from(document.querySelectorAll("body *"))
+      .filter((element): element is HTMLElement => element instanceof HTMLElement && isVisible(element))
+      .map((element) => {
+        const text =
+          normalize(element.innerText) ||
+          normalize(element.textContent) ||
+          normalize(element.getAttribute("aria-label")) ||
+          normalize(element.getAttribute("title")) ||
+          (element instanceof HTMLInputElement ? normalize(element.value) : "");
+        if (!textMatches(text)) return undefined;
+
+        const rect = element.getBoundingClientRect();
+        const clickable = element.closest(selector);
+        return {
+          x: rect.x,
+          y: rect.y,
+          width: rect.width,
+          height: rect.height,
+          score: [
+            regex || text.toLowerCase() === expected ? 0 : 1,
+            clickable ? 0 : 1,
+            Math.round(rect.width * rect.height),
+            -depth(element),
+          ],
+        };
+      })
+      .filter((candidate): candidate is NonNullable<typeof candidate> => Boolean(candidate))
+      .sort((a, b) => {
+        for (let index = 0; index < a.score.length; index += 1) {
+          const delta = a.score[index] - b.score[index];
+          if (delta !== 0) return delta;
+        }
+        return 0;
+      });
+
+    return candidates[0] ? {
+      x: candidates[0].x,
+      y: candidates[0].y,
+      width: candidates[0].width,
+      height: candidates[0].height,
+    } : undefined;
+  }, serializeTextMatcher(label));
+}
+
+function serializeTextMatcher(label: string | RegExp) {
+  if (label instanceof RegExp) {
+    return {
+      kind: "regex" as const,
+      source: label.source,
+      flags: label.flags.replace(/[gy]/g, ""),
+      clickableSelector: clickableTextSelector(),
+    };
+  }
+  return {
+    kind: "text" as const,
+    value: label,
+    clickableSelector: clickableTextSelector(),
+  };
 }
 
 async function enqueueBrowserJob<T>(task: () => Promise<T>): Promise<T> {
@@ -1049,6 +1815,17 @@ function isTransientAutomationError(message: string) {
   return /Target page|context.*closed|browser.*closed|browser.*disconnected|Execution context|Navigation timeout|Timeout .* exceeded|Timed out|Protocol error|net::ERR|ECONNRESET|EPIPE/i.test(message);
 }
 
+function shouldRunConfirmedWrite(input: { dryRun?: boolean; confirmed?: boolean }, writeEnabled: boolean) {
+  return writeEnabled && input.confirmed === true && input.dryRun !== true;
+}
+
+function writeGateReason(input: { dryRun?: boolean; confirmed?: boolean }, writeEnabled: boolean) {
+  if (!writeEnabled) return "Cronometer writes are disabled on the server.";
+  if (input.dryRun === true) return "Dry-run preview requested.";
+  if (input.confirmed !== true) return "User confirmation is required before this write tool opens Cronometer.";
+  return "Write gate did not pass.";
+}
+
 async function clickDiaryDateArrow(page: Page, direction: "previous" | "next") {
   const nav = page.locator(".sidebar-diary-date .diary-date-nav:visible, .diary-date-nav:visible").first();
   if (!(await nav.isVisible().catch(() => false))) return false;
@@ -1070,7 +1847,7 @@ function normalizeDiaryDateInput(value: string | undefined, today: string): { da
   if (lower === "yesterday") return { date: addDaysIso(today, -1) };
   if (lower === "tomorrow") return { date: addDaysIso(today, 1) };
   if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
-    return { warning: "CronoGPT currently accepts diary dates as YYYY-MM-DD, today, yesterday, or tomorrow." };
+    return { warning: "cronogpt currently accepts diary dates as YYYY-MM-DD, today, yesterday, or tomorrow." };
   }
 
   return isValidIsoDate(normalized)
@@ -1205,7 +1982,7 @@ function isDangerousClickText(value: string) {
 }
 
 function activeDialog(page: Page) {
-  return page.locator(".pretty-dialog, [role='dialog'], .gwt-DialogBox").last();
+  return page.locator(".pretty-dialog, [role='dialog'], .gwt-DialogBox, .popupContent").last();
 }
 
 async function clickDialogButton(page: Page, label: string | RegExp) {
@@ -1222,7 +1999,42 @@ async function clickDialogButton(page: Page, label: string | RegExp) {
     await first.click();
     return true;
   }
+  return clickVisibleControlByLabel(dialog, label);
+}
+
+async function clickVisibleControlByLabel(scope: ReturnType<Page["locator"]>, label: string | RegExp) {
+  const controls = scope.locator(clickableTextSelector());
+  const count = await controls.count().catch(() => 0);
+  for (let index = 0; index < Math.min(count, 60); index += 1) {
+    const control = controls.nth(index);
+    const meta = await control.evaluate((element) => {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      const input = element instanceof HTMLInputElement ? element : undefined;
+      return {
+        visible: rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden",
+        text: (element.textContent ?? "").replace(/\s+/g, " ").trim(),
+        innerText: element instanceof HTMLElement ? element.innerText.replace(/\s+/g, " ").trim() : "",
+        aria: element.getAttribute("aria-label") ?? "",
+        title: element.getAttribute("title") ?? "",
+        value: input?.value ?? "",
+      };
+    }).catch(() => undefined);
+    if (!meta?.visible) continue;
+    const labels = [meta.innerText, meta.text, meta.aria, meta.title, meta.value].filter(Boolean);
+    if (!labels.some((value) => matchesButtonLabel(value, label))) continue;
+    await control.click({ timeout: 2500 }).catch(async () => control.click({ timeout: 2500, force: true }));
+    return true;
+  }
   return false;
+}
+
+function matchesButtonLabel(value: string, label: string | RegExp) {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized) return false;
+  if (typeof label === "string") return normalized === label;
+  label.lastIndex = 0;
+  return label.test(normalized);
 }
 
 async function clickFoodDialogFilter(page: Page, label: string) {
@@ -1355,30 +2167,1001 @@ async function fillFoodUnit(page: Page, unit?: string) {
   }
 }
 
-async function fillLikelyAmount(page: Page, amount?: number) {
-  if (!amount) return;
+async function fillLikelyAmount(page: Page, amount?: number, selectedName?: string) {
+  if (amount === undefined) return { filled: true, skipped: true };
   const amountText = String(amount);
-  const selectors = [
-    page.getByLabel(/amount|serving|quantity/i),
-    page.locator("input[type='number']:visible").first(),
-  ];
-  for (const selector of selectors) {
-    if ((await selector.count().catch(() => 0)) === 0) continue;
-    if (!(await selector.first().isVisible().catch(() => false))) continue;
-    await selector.first().fill(amountText);
-    return;
+  const dialogText = await activeDialog(page).innerText({ timeout: 800 }).catch(() => "");
+  const selectedPanel = await recipeIngredientSelectedPanel(page, selectedName);
+  if (/\bDescription\s+Source\b/i.test(dialogText) && !selectedPanel) {
+    return { filled: false, warning: "Still on ingredient search results; refused to fill the search box as an amount." };
   }
+  const input = await editableAmountInput(page, 2500);
+  if (!input) {
+    return { filled: false, warning: "No editable amount input was found; refused to fill radio/checkbox controls." };
+  }
+  const elementType = await input.evaluate((element) => element instanceof HTMLInputElement ? element.type : "").catch(() => "");
+  if (/^(radio|checkbox|button|submit)$/i.test(elementType)) {
+    return { filled: false, warning: `Refused to fill non-text ingredient amount input: ${elementType}.` };
+  }
+  await input.fill(amountText);
+  await page.keyboard.press("Tab").catch(() => undefined);
+  return { filled: true, value: amountText, inputType: elementType || undefined, selectedPanel };
+}
+
+async function editableAmountInput(page: Page, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const dialog = activeDialog(page);
+    const input = await editableAmountInputInScope(dialog) ?? await editableAmountInputInScope(page.locator("body"));
+    if (input) return input;
+    await page.waitForTimeout(150);
+  }
+  return undefined;
+}
+
+async function editableAmountInputInScope(scope: ReturnType<Page["locator"]>) {
+  const inputs = scope.locator("input:visible");
+  const count = await inputs.count().catch(() => 0);
+  let fallback: ReturnType<Page["locator"]> | undefined;
+  for (let index = count - 1; index >= 0; index -= 1) {
+    const input = inputs.nth(index);
+    const meta = await input.evaluate((element) => {
+      if (!(element instanceof HTMLInputElement)) return undefined;
+      return {
+        type: element.type,
+        readOnly: element.readOnly,
+        disabled: element.disabled,
+        placeholder: element.placeholder,
+        className: String(element.className ?? ""),
+        name: element.name,
+        id: element.id,
+        aria: element.getAttribute("aria-label") ?? "",
+        value: element.value,
+      };
+    }).catch(() => undefined);
+    if (!meta || meta.disabled || meta.readOnly) continue;
+    if (!/^(text|number|tel|decimal|)$/i.test(meta.type)) continue;
+    const haystack = `${meta.placeholder} ${meta.className} ${meta.name} ${meta.id} ${meta.aria}`.toLowerCase();
+    if (/\b(search|filter|barcode)\b/.test(haystack)) continue;
+    if (meta.className.includes("search-field")) continue;
+    if (meta.type === "number" || /number-box/.test(meta.className)) return input;
+    fallback ??= input;
+  }
+  return fallback;
 }
 
 async function fillLikelyUnit(page: Page, unit?: string) {
-  if (!unit) return;
+  if (!unit) return { filled: true, skipped: true };
+  const normalizedUnit = unit.trim();
   const selects = page.locator("select");
   const count = await selects.count().catch(() => 0);
   for (let index = 0; index < count; index += 1) {
     const select = selects.nth(index);
     if (!(await select.isVisible().catch(() => false))) continue;
-    await select.selectOption({ label: unit }).catch(() => undefined);
+    const selected = await select.selectOption({ label: normalizedUnit }).then(() => true).catch(() => false);
+    if (selected) return { filled: true, unit: normalizedUnit, strategy: "select-label" };
   }
+
+  const dialog = activeDialog(page);
+  const unitButton = await recipeUnitDropdownButton(page);
+  if (!unitButton) return { filled: false, unit: normalizedUnit, warning: "No visible unit dropdown was found." };
+  const currentUnitText = await unitButton.innerText().catch(() => "");
+  if (unitTextAlreadyMatches(currentUnitText, normalizedUnit)) {
+    return { filled: true, unit: normalizedUnit, strategy: "already-selected", currentUnitText };
+  }
+
+  await unitButton.click({ timeout: 2500 }).catch(async () => unitButton.click({ timeout: 2500, force: true }));
+  await page.waitForTimeout(200);
+  const clicked = await clickVisibleOptionByExactText(page, normalizedUnit)
+    || await clickVisibleOptionByExactText(page, unitAliases(normalizedUnit)[0])
+    || await clickVisibleControlByLabel(dialog, new RegExp(`^${escapeRegExp(normalizedUnit)}$`, "i"));
+  if (clicked) {
+    await page.waitForTimeout(250);
+    const updatedUnitText = await unitButton.innerText().catch(() => "");
+    if (unitTextAlreadyMatches(updatedUnitText, normalizedUnit)) {
+      return { filled: true, unit: normalizedUnit, strategy: "dropdown-option", currentUnitText: updatedUnitText };
+    }
+    return { filled: false, unit: normalizedUnit, strategy: "dropdown-option", currentUnitText: updatedUnitText, warning: `Clicked a unit option, but the unit is still ${updatedUnitText || "unknown"}.` };
+  }
+
+  await page.keyboard.press("Escape").catch(() => undefined);
+  const updatedUnitText = await unitButton.innerText().catch(() => currentUnitText);
+  return { filled: false, unit: normalizedUnit, currentUnitText: updatedUnitText, warning: `Could not select unit option: ${normalizedUnit}.` };
+}
+
+async function currentRecipeUnitText(page: Page) {
+  const unitButton = await recipeUnitDropdownButton(page);
+  return unitButton ? unitButton.innerText().catch(() => "") : "";
+}
+
+function unitTextAlreadyMatches(text: string, unit: string) {
+  const normalizedText = text.replace(/\s+/g, " ").trim().toLowerCase();
+  const normalizedUnit = unit.trim().toLowerCase();
+  return normalizedText === normalizedUnit || unitAliases(normalizedUnit).some((alias) => normalizedText === alias);
+}
+
+async function recipeUnitDropdownButton(page: Page) {
+  const dialog = activeDialog(page);
+  const buttons = dialog.locator("button.dropdown-toggle:visible, button.dropdown-btn:visible");
+  const count = await buttons.count().catch(() => 0);
+  let fallback: ReturnType<Page["locator"]> | undefined;
+  for (let index = count - 1; index >= 0; index -= 1) {
+    const button = buttons.nth(index);
+    const meta = await button.evaluate((element) => {
+      const rect = element.getBoundingClientRect();
+      const text = (element.textContent ?? "").replace(/\s+/g, " ").trim();
+      return {
+        text,
+        x: Math.round(rect.x),
+        y: Math.round(rect.y),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+      };
+    }).catch(() => undefined);
+    if (!meta || meta.width < 30 || meta.height < 20) continue;
+    if (/\b(AM|PM|All|Custom|NCCDB|USDA|CRDB|Category|Source|Show score)\b/i.test(meta.text)) continue;
+    if (/\b(g|gram|oz|lb|ml|cup|tbsp|tsp|large|small|medium|serving|pat|slice|piece)\b/i.test(meta.text)) return button;
+    fallback ??= button;
+  }
+  return fallback;
+}
+
+async function clickVisibleOptionByExactText(page: Page, value?: string) {
+  if (!value) return false;
+  const normalizedValue = value.replace(/\s+/g, " ").trim().toLowerCase();
+  const box = await page.evaluate((normalizedValue) => {
+    const normalize = (text: string | null | undefined) => (text ?? "").replace(/\s+/g, " ").trim();
+    const isVisible = (element: Element) => {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    };
+    const candidates = Array.from(document.querySelectorAll(".dropdown-menu *,.popupContent *,.gwt-PopupPanel *,.select-popup *,.dropdown-item,li,button,div,td"))
+      .filter(isVisible)
+      .map((element) => {
+        const text = normalize(element.textContent);
+        const rect = element.getBoundingClientRect();
+        return { text, x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+      })
+      .filter((candidate) => candidate.text.toLowerCase() === normalizedValue)
+      .sort((a, b) => (a.width * a.height) - (b.width * b.height));
+    return candidates[0];
+  }, normalizedValue).catch(() => undefined);
+  if (!box) return false;
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  return true;
+}
+
+function unitAliases(unit: string) {
+  const normalized = unit.trim().toLowerCase();
+  if (normalized === "g") return ["gram", "grams"];
+  if (normalized === "oz") return ["ounce", "ounces"];
+  if (normalized === "ml") return ["milliliter", "milliliters"];
+  return [];
+}
+
+async function fillCustomFoodName(page: Page, name: string) {
+  const nameInput = await customFoodNameInput(page);
+  if (!nameInput) return false;
+  await nameInput.click({ timeout: 2500 }).catch(() => undefined);
+  await page.keyboard.press("ControlOrMeta+A").catch(() => undefined);
+  await page.keyboard.type(name, { delay: 15 }).catch(() => undefined);
+  await nameInput.evaluate((element, value) => {
+    if (!(element instanceof HTMLInputElement)) return;
+    element.value = value;
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+  }, name).catch(() => undefined);
+  await page.keyboard.press("Tab").catch(() => undefined);
+  await page.waitForTimeout(550);
+  const updatedValue = await nameInput.inputValue().catch(() => "");
+  return updatedValue.trim() === name;
+}
+
+async function customFoodNameInput(page: Page) {
+  const inputs = page.locator("#main-food-editor-info-area input.text-box:visible");
+  const count = await inputs.count().catch(() => 0);
+  let fallback: ReturnType<Page["locator"]> | undefined;
+
+  for (let index = 0; index < Math.min(count, 12); index += 1) {
+    const input = inputs.nth(index);
+    if (!(await input.isVisible().catch(() => false))) continue;
+    const value = (await input.inputValue().catch(() => "")).trim();
+    if (/^New Food$/i.test(value)) return input;
+    if (!fallback && value && !/^(Serving|g|gram|grams|n\/a)$/i.test(value) && !/^\d+(?:\.\d+)?$/.test(value)) {
+      fallback = input;
+    }
+  }
+
+  return fallback ?? firstVisibleLocator(page, [inputs.first()]);
+}
+
+async function openCustomFoodByName(page: Page, name: string) {
+  const clicked = await clickByText(page, new RegExp(`^${escapeRegExp(name)}$`, "i"));
+  if (!clicked) return false;
+  await page.waitForTimeout(1200);
+  const text = await page.locator("body").innerText({ timeout: 5000 }).catch(() => "");
+  return textHasFoodName(text, name) && /\b(Food Name|Nutrition Label|ADD TO DIARY)\b/i.test(text);
+}
+
+async function fillCustomFoodServing(page: Page, servingSize?: string) {
+  const parsed = parseServingSize(servingSize);
+  const result = {
+    requested: servingSize,
+    parsed,
+    amountFilled: false,
+    measureFilled: false,
+    warning: undefined as string | undefined,
+  };
+
+  if (!parsed) {
+    result.warning = servingSize ? "Could not parse servingSize. Expected values like '100 g'." : undefined;
+    return result;
+  }
+
+  result.amountFilled = await fillServingSizeCell(page, 0, String(parsed.amount));
+  result.measureFilled = await fillServingSizeCell(page, 1, parsed.unit);
+
+  const rowText = await servingSizeRowText(page);
+  if (!result.amountFilled || !result.measureFilled || !new RegExp(`\\b${escapeRegExp(String(parsed.amount))}\\b`, "i").test(rowText) || !/\bg\b/i.test(rowText)) {
+    result.warning = "Could not verify Cronometer serving size row after editing.";
+  }
+  return result;
+}
+
+function parseServingSize(value?: string) {
+  const match = value?.trim().match(/^([0-9]+(?:\.[0-9]+)?)\s*(g|gram|grams)$/i);
+  if (!match) return undefined;
+  const grams = Number(match[1]);
+  if (!Number.isFinite(grams) || grams <= 0) return undefined;
+  return { amount: grams, unit: "g", grams };
+}
+
+async function fillServingSizeCell(page: Page, cellIndex: number, value: string) {
+  await scrollServingSizeRowIntoView(page);
+  await page.waitForTimeout(250);
+  const cellBox = await servingSizeCellBox(page, cellIndex);
+  if (!cellBox) return false;
+  await page.mouse.click(cellBox.x + cellBox.width / 2, cellBox.y + cellBox.height / 2);
+  await page.waitForTimeout(450);
+
+  const editor = await firstVisibleLocator(page, [
+    page.locator("#main-food-editor-info-area input.number-box:focus").first(),
+    page.locator("#main-food-editor-info-area input.text-box:focus").first(),
+    page.locator("#main-food-editor-info-area input.number-box:visible").last(),
+    page.locator("#main-food-editor-info-area input.text-box:visible").last(),
+  ]);
+  if (!editor) return false;
+  const filled = await editor.fill(value).then(() => true).catch(() => false);
+  if (!filled) return false;
+  await page.keyboard.press("Enter").catch(() => undefined);
+  await page.waitForTimeout(500);
+
+  const rowText = await servingSizeRowText(page);
+  return rowText.toLowerCase().includes(value.toLowerCase());
+}
+
+async function scrollServingSizeRowIntoView(page: Page) {
+  await page.evaluate(() => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
+    const rows = Array.from(document.querySelectorAll("#main-food-editor-info-area table.crono-table tr"));
+    for (const row of rows) {
+      const cells = Array.from(row.querySelectorAll("td"));
+      const rowText = normalize(row.textContent);
+      if (cells.length >= 3 && !row.classList.contains("table-header") && /^\d+(?:\.\d+)?\s+\S+/.test(rowText)) {
+        row.scrollIntoView({ block: "center" });
+        return;
+      }
+    }
+  }).catch(() => undefined);
+}
+
+async function servingSizeCellBox(page: Page, cellIndex: number) {
+  return page.evaluate((cellIndex) => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
+    const rows = Array.from(document.querySelectorAll("#main-food-editor-info-area table.crono-table tr"));
+    for (const row of rows) {
+      const cells = Array.from(row.querySelectorAll("td"));
+      const rowText = normalize(row.textContent);
+      if (cells.length >= 3 && !row.classList.contains("table-header") && /^\d+(?:\.\d+)?\s+\S+/.test(rowText)) {
+        const rect = (cells[cellIndex] ?? cells[0])?.getBoundingClientRect();
+        if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+      }
+    }
+    return undefined;
+  }, cellIndex);
+}
+
+async function servingSizeRowText(page: Page) {
+  return page.evaluate(() => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
+    const rows = Array.from(document.querySelectorAll("#main-food-editor-info-area table.crono-table tr"));
+    for (const row of rows) {
+      const cells = Array.from(row.querySelectorAll("td"));
+      const rowText = normalize(row.textContent);
+      if (cells.length >= 3 && !row.classList.contains("table-header") && /^\d+(?:\.\d+)?\s+\S+/.test(rowText)) {
+        return rowText;
+      }
+    }
+    return "";
+  }).catch(() => "");
+}
+
+async function fillCustomFoodNutrients(page: Page, nutrients: Record<string, number>) {
+  const entries = customFoodNutrientEntries(nutrients);
+  const results = [];
+  for (const entry of entries) {
+    const filled = await fillCustomFoodNutrient(page, entry.label, entry.value);
+    results.push({ ...entry, ...filled });
+  }
+  return results;
+}
+
+function customFoodNutrientEntries(nutrients: Record<string, number>) {
+  const mapped = new Map<string, { label: string; value: number; sourceKey: string }>();
+  for (const [key, value] of Object.entries(nutrients)) {
+    if (!Number.isFinite(value)) continue;
+    const label = customFoodNutrientLabelForKey(key);
+    if (!label) continue;
+    mapped.set(label, { label, value, sourceKey: key });
+  }
+  return Array.from(mapped.values());
+}
+
+async function fillCustomFoodNutrient(page: Page, label: string, value: number) {
+  await scrollNutrientRowIntoView(page, label);
+  await page.waitForTimeout(250);
+  const cellBox = await nutrientAmountCellBox(page, label);
+  if (!cellBox) {
+    const fallback = await fillNutritionLabelNutrient(page, label, value);
+    if (fallback) return fallback;
+    return { status: "not_found" as const, warning: `Could not find nutrient row: ${label}` };
+  }
+
+  const inputCountsBeforeClick = await visibleInputCounts(page, ["input.number-box:visible"]);
+  const clickedCellBox = await clickNutrientAmountCell(page, label);
+  if (!clickedCellBox) {
+    await page.mouse.click(cellBox.x + cellBox.width / 2, cellBox.y + cellBox.height / 2);
+  }
+  await page.waitForTimeout(450);
+
+  const input = await focusedOrNearestInput(page, clickedCellBox ?? cellBox, ["input.number-box:visible"])
+    ?? await newestVisibleInputIfAdded(page, ["input.number-box:visible"], inputCountsBeforeClick);
+  if (!input) {
+    const fallback = await fillNutritionLabelNutrient(page, label, value);
+    if (fallback) return fallback;
+    return { status: "not_found" as const, warning: `No editable amount input appeared for ${label}.` };
+  }
+
+  await input.fill(String(value));
+  await page.keyboard.press("Enter").catch(() => undefined);
+  await page.waitForTimeout(550);
+
+  const rowText = await nutrientRowText(page, label);
+  const verified = rowTextIncludesValue(rowText, value);
+  return {
+    status: verified ? ("ok" as const) : ("unverified" as const),
+    rowText,
+    warning: verified ? undefined : `Filled ${label}, but the updated row text could not be verified.`,
+  };
+}
+
+async function fillNutritionLabelNutrient(page: Page, label: string, value: number) {
+  const nutritionLabel = customFoodNutritionLabel(label);
+  if (!nutritionLabel) return undefined;
+
+  const cellBox = await nutritionLabelAmountCellBox(page, nutritionLabel);
+  if (!cellBox) {
+    return { status: "not_found" as const, warning: `Could not find nutrition label amount for ${nutritionLabel}.` };
+  }
+
+  const selectors = ["input.number-box:visible", "input.text-box:visible"];
+  const inputCountsBeforeClick = await visibleInputCounts(page, selectors);
+  await page.mouse.click(cellBox.x + cellBox.width / 2, cellBox.y + cellBox.height / 2);
+  await page.waitForTimeout(450);
+  const input = await focusedOrNearestInput(page, cellBox, selectors)
+    ?? await newestVisibleInputIfAdded(page, selectors, inputCountsBeforeClick);
+  if (!input) {
+    return { status: "not_found" as const, warning: `No editable nutrition label input appeared for ${nutritionLabel}.` };
+  }
+
+  const filled = await input.fill(String(value)).then(() => true).catch(() => false);
+  if (!filled) {
+    return { status: "not_found" as const, warning: `Could not fill nutrition label input for ${nutritionLabel}.` };
+  }
+  await page.keyboard.press("Enter").catch(() => undefined);
+  await page.waitForTimeout(600);
+
+  const labelText = await nutritionLabelText(page, nutritionLabel);
+  const verified = rowTextIncludesValue(labelText, value);
+  return {
+    status: verified ? ("ok" as const) : ("unverified" as const),
+    rowText: labelText,
+    source: "nutrition_label" as const,
+    warning: verified ? undefined : `Filled ${nutritionLabel}, but the updated nutrition label text could not be verified.`,
+  };
+}
+
+function customFoodNutritionLabel(label: string) {
+  const labels: Record<string, string> = {
+    Energy: "Calories",
+    Sodium: "Sodium",
+    Protein: "Protein",
+  };
+  return labels[label];
+}
+
+async function focusedOrNearestInput(page: Page, box: { x: number; y: number; width: number; height: number }, selectors: string[]) {
+  const focused = await firstVisibleLocator(page, [
+    page.locator("input.number-box:focus").first(),
+    page.locator("input.text-box:focus").first(),
+  ]);
+  if (focused) return focused;
+
+  const boxCenter = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  let best: { selector: string; index: number; distance: number } | undefined;
+  for (const selector of selectors) {
+    const locator = page.locator(selector);
+    const count = await locator.count().catch(() => 0);
+    for (let index = 0; index < Math.min(count, 20); index += 1) {
+      const candidate = locator.nth(index);
+      if (!(await candidate.isVisible().catch(() => false))) continue;
+      const candidateBox = await candidate.boundingBox().catch(() => undefined);
+      if (!candidateBox) continue;
+      const candidateCenter = {
+        x: candidateBox.x + candidateBox.width / 2,
+        y: candidateBox.y + candidateBox.height / 2,
+      };
+      const distance = Math.hypot(candidateCenter.x - boxCenter.x, candidateCenter.y - boxCenter.y);
+      if (distance > 220) continue;
+      if (!best || distance < best.distance) best = { selector, index, distance };
+    }
+  }
+  return best ? page.locator(best.selector).nth(best.index) : undefined;
+}
+
+async function visibleInputCounts(page: Page, selectors: string[]) {
+  const counts = [];
+  for (const selector of selectors) {
+    const locator = page.locator(selector);
+    const count = await locator.count().catch(() => 0);
+    let visibleCount = 0;
+    for (let index = 0; index < Math.min(count, 30); index += 1) {
+      if (await locator.nth(index).isVisible().catch(() => false)) visibleCount += 1;
+    }
+    counts.push(visibleCount);
+  }
+  return counts;
+}
+
+async function newestVisibleInputIfAdded(page: Page, selectors: string[], beforeCounts: number[]) {
+  for (const [selectorIndex, selector] of selectors.entries()) {
+    const locator = page.locator(selector);
+    const count = await locator.count().catch(() => 0);
+    const beforeCount = beforeCounts[selectorIndex] ?? 0;
+    if (count <= beforeCount) continue;
+    for (let index = count - 1; index >= beforeCount; index -= 1) {
+      const candidate = locator.nth(index);
+      if (await candidate.isVisible().catch(() => false)) return candidate;
+    }
+  }
+  return undefined;
+}
+
+async function nutritionLabelAmountCellBox(page: Page, label: string) {
+  return page.evaluate((label) => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
+    const isVisible = (element: Element) => {
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
+    const rectJson = (rect: DOMRect) => ({ x: rect.x, y: rect.y, width: rect.width, height: rect.height });
+    const elements = Array.from(document.querySelectorAll("body *")).filter((element): element is HTMLElement => element instanceof HTMLElement && isVisible(element));
+    const labelElements = elements.filter((element) => normalize(element.innerText || element.textContent) === label);
+
+    for (const labelElement of labelElements) {
+      const labelRect = labelElement.getBoundingClientRect();
+      const ancestors: HTMLElement[] = [];
+      let current: HTMLElement | null = labelElement;
+      while (current && current !== document.body) {
+        ancestors.push(current);
+        current = current.parentElement;
+      }
+
+      for (const ancestor of ancestors.slice(0, 6)) {
+        const text = normalize(ancestor.textContent);
+        if (!text.includes(label) || text.length > 600) continue;
+        const candidates = Array.from(ancestor.querySelectorAll("*"))
+          .filter((element): element is HTMLElement => element instanceof HTMLElement && isVisible(element))
+          .map((element) => {
+            const rect = element.getBoundingClientRect();
+            const elementText = normalize(element.innerText || element.textContent);
+            const smallAmountText = /^(?:-|[0-9]+(?:\.[0-9]+)?)(?:\s*(?:kcal|g|mg|mcg|%))?$/i.test(elementText);
+            const horizontallyNear = rect.left >= labelRect.left - 8 && rect.left <= labelRect.right + 240;
+            const verticallyNear = Math.abs((rect.top + rect.height / 2) - (labelRect.top + labelRect.height / 2)) <= 70;
+            if (!smallAmountText || !horizontallyNear || !verticallyNear) return undefined;
+            return { rect, distance: Math.abs(rect.left - labelRect.right) + Math.abs(rect.top - labelRect.top), text: elementText };
+          })
+          .filter((candidate): candidate is NonNullable<typeof candidate> => Boolean(candidate))
+          .sort((a, b) => a.distance - b.distance);
+        if (candidates[0]) return rectJson(candidates[0].rect);
+      }
+
+      return {
+        x: Math.min(Math.max(labelRect.right + 28, labelRect.left + 20), window.innerWidth - 30),
+        y: labelRect.y + labelRect.height / 2,
+        width: 24,
+        height: Math.max(labelRect.height, 18),
+      };
+    }
+    return undefined;
+  }, label);
+}
+
+async function nutritionLabelText(page: Page, label: string) {
+  return page.evaluate((label) => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
+    const isVisible = (element: Element) => {
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
+    const elements = Array.from(document.querySelectorAll("body *")).filter((element): element is HTMLElement => element instanceof HTMLElement && isVisible(element));
+    const labelElement = elements.find((element) => normalize(element.innerText || element.textContent) === label);
+    let current: HTMLElement | null | undefined = labelElement;
+    while (current && current !== document.body) {
+      const text = normalize(current.textContent);
+      if (text.includes(label) && text.length <= 600) return text;
+      current = current.parentElement;
+    }
+    return "";
+  }, label).catch(() => "");
+}
+
+async function scrollNutrientRowIntoView(page: Page, label: string) {
+  await page.evaluate((label) => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
+    const isHeader = (cells: Element[]) => normalize(cells[1]?.textContent).toLowerCase() === "amount";
+    const expected = normalize(label).toLowerCase();
+    const rows = Array.from(document.querySelectorAll(".food-editor-nutrition-summary table.crono-table tr"));
+    for (const row of rows) {
+      const cells = Array.from(row.querySelectorAll("td"));
+      if (cells.length < 3 || normalize(cells[0]?.textContent).toLowerCase() !== expected) continue;
+      if (isHeader(cells)) continue;
+      const rect = (cells[1] ?? cells[0]).getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) continue;
+      {
+        row.scrollIntoView({ block: "center" });
+        return;
+      }
+    }
+  }, label).catch(() => undefined);
+}
+
+async function nutrientAmountCellBox(page: Page, label: string) {
+  return page.evaluate((label) => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
+    const isHeader = (cells: Element[]) => normalize(cells[1]?.textContent).toLowerCase() === "amount";
+    const expected = normalize(label).toLowerCase();
+    const rows = Array.from(document.querySelectorAll(".food-editor-nutrition-summary table.crono-table tr"));
+    for (const row of rows) {
+      const cells = Array.from(row.querySelectorAll("td"));
+      if (cells.length < 3 || normalize(cells[0]?.textContent).toLowerCase() !== expected) continue;
+      if (isHeader(cells)) continue;
+      const target = cells[1] ?? cells[0];
+      const rect = target.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) continue;
+      return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+    }
+    return undefined;
+  }, label);
+}
+
+async function clickNutrientAmountCell(page: Page, label: string) {
+  return page.evaluate((label) => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
+    const isHeader = (cells: Element[]) => normalize(cells[1]?.textContent).toLowerCase() === "amount";
+    const expected = normalize(label).toLowerCase();
+    const rows = Array.from(document.querySelectorAll(".food-editor-nutrition-summary table.crono-table tr"));
+    for (const row of rows) {
+      const cells = Array.from(row.querySelectorAll("td"));
+      if (cells.length < 3 || normalize(cells[0]?.textContent).toLowerCase() !== expected) continue;
+      if (isHeader(cells)) continue;
+      const target = cells[1] ?? cells[0];
+      target.scrollIntoView({ block: "center" });
+      const rect = target.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) continue;
+      for (const type of ["mousedown", "mouseup", "click"]) {
+        target.dispatchEvent(new MouseEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          clientX: rect.x + rect.width / 2,
+          clientY: rect.y + rect.height / 2,
+        }));
+      }
+      const nextRect = target.getBoundingClientRect();
+      return { x: nextRect.x, y: nextRect.y, width: nextRect.width, height: nextRect.height };
+    }
+    return undefined;
+  }, label).catch(() => undefined);
+}
+
+async function nutrientRowText(page: Page, label: string) {
+  return page.evaluate((label) => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
+    const isHeader = (cells: Element[]) => normalize(cells[1]?.textContent).toLowerCase() === "amount";
+    const expected = normalize(label).toLowerCase();
+    const rows = Array.from(document.querySelectorAll(".food-editor-nutrition-summary table.crono-table tr"));
+    for (const row of rows) {
+      const cells = Array.from(row.querySelectorAll("td"));
+      if (cells.length < 3 || normalize(cells[0]?.textContent).toLowerCase() !== expected) continue;
+      if (isHeader(cells)) continue;
+      return normalize(row.textContent);
+    }
+    return "";
+  }, label).catch(() => "");
+}
+
+function rowTextIncludesValue(rowText: string, value: number) {
+  const normalized = rowText.replace(/,/g, "");
+  const valueText = String(value);
+  if (new RegExp(`(^|\\D)${escapeRegExp(valueText)}(\\D|$)`).test(normalized)) return true;
+  return normalized.includes(String(Number(value.toFixed(4))));
+}
+
+function textHasFoodName(text: string, name: string) {
+  return text.toLowerCase().includes(name.toLowerCase());
+}
+
+function parseCustomItemListNames(rawText: string, sectionTitle: string) {
+  const lines = rawText.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  const startIndex = Math.max(
+    lines.findIndex((line) => /^Sorted by/i.test(line)),
+    lines.findIndex((line) => line === sectionTitle),
+  );
+  const navAndAction = /^(menu|Dashboard|Diary|Trends|Foods|Custom Meals|Custom Recipes|Custom Foods|Repeat Items|Suggest Food|Ask the Oracle|Search Foods|More|Plans|Support|About|Account|campaign|CREATE FOOD|CREATE RECIPE|IMPORT RECIPE|BACK TO FOODS LIST|BACK TO RECIPE LIST|Create a new food|Create a new recipe|Sorted by)/i;
+  return lines
+    .slice(Math.max(0, startIndex + 1))
+    .filter((line) => !navAndAction.test(line))
+    .filter((line) => !isCustomItemEmptyStateLine(line))
+    .filter((line) => !/^(Food #\d+|Recipe #\d+|Data Source:|Info|Serving Sizes|Nutrition Label|Nutrition Facts|ADD TO DIARY|more_horiz)$/i.test(line))
+    .slice(0, 120);
+}
+
+function isCustomItemEmptyStateLine(line: string) {
+  return /^Create a custom (food|recipe|meal) using the button above\.?$/i.test(line)
+    || /^Create your own recipe or import a recipe from a website using the buttons above\.?$/i.test(line)
+    || /^No custom (foods|recipes|meals)(?: found)?\.?$/i.test(line)
+    || /^You have no custom (foods|recipes|meals)\.?$/i.test(line);
+}
+
+function filterCustomItemNames(names: string[], query?: string) {
+  const normalizedQuery = query?.trim().toLowerCase();
+  const filtered = normalizedQuery ? names.filter((name) => name.toLowerCase().includes(normalizedQuery)) : names;
+  return filtered.filter(Boolean);
+}
+
+function duplicateGroups(names: string[]) {
+  const grouped = new Map<string, string[]>();
+  for (const name of names) {
+    const key = name.replace(/\s+/g, " ").trim().toLowerCase();
+    if (!key) continue;
+    grouped.set(key, [...(grouped.get(key) ?? []), name]);
+  }
+  return Array.from(grouped.entries())
+    .filter(([, values]) => values.length > 1)
+    .map(([normalizedName, values]) => ({ normalizedName, count: values.length, names: values }));
+}
+
+async function customFoodDetailsForNames(page: Page, names: string[], maxDetails: number) {
+  const details: CustomFoodDetail[] = [];
+  const occurrences = new Map<string, number>();
+  const limitedNames = names.slice(0, maxDetails);
+  for (const [listIndex, name] of limitedNames.entries()) {
+    const normalized = name.toLowerCase();
+    const occurrence = occurrences.get(normalized) ?? 0;
+    occurrences.set(normalized, occurrence + 1);
+    await page.goto(`${CRONOMETER_ORIGIN}/#custom-foods`);
+    await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+    await page.waitForTimeout(900);
+    const clicked = await clickCustomListItemByName(page, name, occurrence);
+    if (!clicked) {
+      continue;
+    }
+    await page.waitForTimeout(1000);
+    const detail = await extractCustomFoodDetail(page);
+    details.push({ ...(detail ?? { name }), name: detail?.name ?? name, listIndex, occurrence });
+  }
+  await page.goto(`${CRONOMETER_ORIGIN}/#custom-foods`).catch(() => undefined);
+  await page.waitForTimeout(700).catch(() => undefined);
+  return details;
+}
+
+async function resolveCustomFoodTargets(page: Page, selector: CustomFoodSelectorInput, options: { maxDetails: number; timeoutMs?: number }) {
+  const rawText = await waitForCustomItemListText(page, "Custom Foods", options.timeoutMs ?? 12000);
+  const names = parseCustomItemListNames(rawText, "Custom Foods");
+  const query = selector.name;
+  const matchingNames = query ? exactOrFuzzyCustomItemNames(names, query) : names;
+  const candidateNames = query && matchingNames.length === 0 ? [query] : matchingNames;
+  const details = await customFoodDetailsForNames(page, candidateNames, options.maxDetails);
+  const targets = details.filter((detail) => {
+    if (selector.foodId && detail.foodId !== selector.foodId) return false;
+    if (selector.name && detail.name.toLowerCase() !== selector.name.toLowerCase()) return false;
+    return Boolean(selector.foodId || selector.name);
+  });
+  return { names, targets };
+}
+
+async function customRecipeDetailsForNames(page: Page, names: string[], maxDetails: number) {
+  const details: CustomRecipeDetail[] = [];
+  const occurrences = new Map<string, number>();
+  const limitedNames = names.slice(0, maxDetails);
+  for (const [listIndex, name] of limitedNames.entries()) {
+    const normalized = name.toLowerCase();
+    const occurrence = occurrences.get(normalized) ?? 0;
+    occurrences.set(normalized, occurrence + 1);
+    await page.goto(`${CRONOMETER_ORIGIN}/#custom-recipes`);
+    await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+    await waitForCustomItemListText(page, "Custom Recipes", 12000).catch(() => "");
+    const clicked = await clickCustomListItemByName(page, name, occurrence);
+    if (!clicked) continue;
+    await page.waitForTimeout(1000);
+    const detail = await extractCustomRecipeDetail(page);
+    details.push({ ...(detail ?? { name }), name: detail?.name ?? name, listIndex, occurrence });
+  }
+  await page.goto(`${CRONOMETER_ORIGIN}/#custom-recipes`).catch(() => undefined);
+  await page.waitForTimeout(700).catch(() => undefined);
+  return details;
+}
+
+async function resolveCustomRecipeTargets(page: Page, selector: CustomRecipeSelectorInput, options: { maxDetails: number; timeoutMs?: number }) {
+  const rawText = await waitForCustomItemListText(page, "Custom Recipes", options.timeoutMs ?? 12000);
+  const names = parseCustomItemListNames(rawText, "Custom Recipes");
+  const query = selector.name;
+  const matchingNames = query ? exactOrFuzzyCustomItemNames(names, query) : names;
+  const candidateNames = query && matchingNames.length === 0 ? [query] : matchingNames;
+  const details = await customRecipeDetailsForNames(page, candidateNames, options.maxDetails);
+  const targets = details.filter((detail) => {
+    if (selector.recipeId && detail.recipeId !== selector.recipeId) return false;
+    if (selector.name && detail.name.toLowerCase() !== selector.name.toLowerCase()) return false;
+    return Boolean(selector.recipeId || selector.name);
+  });
+  return { names, targets };
+}
+
+function exactOrFuzzyCustomItemNames(names: string[], query: string) {
+  const normalizedQuery = query.toLowerCase();
+  const exact = names.filter((name) => name.toLowerCase() === normalizedQuery);
+  return exact.length ? exact : names.filter((name) => name.toLowerCase().includes(normalizedQuery));
+}
+
+async function openCustomFoodTarget(page: Page, target: CustomFoodDetail) {
+  await page.goto(`${CRONOMETER_ORIGIN}/#custom-foods`);
+  await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+  await waitForCustomItemListText(page, "Custom Foods", 12000).catch(() => "");
+  const clicked = await clickCustomListItemByName(page, target.name, target.occurrence ?? 0);
+  if (!clicked) return false;
+  await page.waitForTimeout(1000);
+  if (!target.foodId) return true;
+  const detail = await extractCustomFoodDetail(page);
+  return detail?.foodId === target.foodId;
+}
+
+async function openCustomRecipeTarget(page: Page, target: CustomRecipeDetail) {
+  await page.goto(`${CRONOMETER_ORIGIN}/#custom-recipes`);
+  await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+  await waitForCustomItemListText(page, "Custom Recipes", 12000).catch(() => "");
+  const clicked = await clickCustomListItemByName(page, target.name, target.occurrence ?? 0);
+  if (!clicked) return false;
+  await page.waitForTimeout(1000);
+  if (!target.recipeId) return true;
+  const detail = await extractCustomRecipeDetail(page);
+  return detail?.recipeId === target.recipeId;
+}
+
+async function clickCustomListItemByName(page: Page, name: string, occurrence: number) {
+  return page.evaluate(({ name, occurrence }) => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
+    const isVisible = (element: Element) => {
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
+    const depth = (element: Element) => {
+      let total = 0;
+      let current: Element | null = element;
+      while (current) {
+        total += 1;
+        current = current.parentElement;
+      }
+      return total;
+    };
+    const candidates = Array.from(document.querySelectorAll("body *"))
+      .filter((element): element is HTMLElement => element instanceof HTMLElement && isVisible(element))
+      .filter((element) => normalize(element.innerText || element.textContent) === name)
+      .map((element) => ({ element, rect: element.getBoundingClientRect(), depth: depth(element) }))
+      .filter((candidate) => candidate.rect.y > 120)
+      .sort((a, b) => a.rect.y - b.rect.y || b.depth - a.depth || a.rect.x - b.rect.x);
+    const target = candidates[occurrence]?.element ?? candidates[0]?.element;
+    if (!target) return false;
+    target.scrollIntoView({ block: "center" });
+    const rect = target.getBoundingClientRect();
+    for (const type of ["mousedown", "mouseup", "click"]) {
+      target.dispatchEvent(new MouseEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        clientX: rect.x + rect.width / 2,
+        clientY: rect.y + rect.height / 2,
+      }));
+    }
+    return true;
+  }, { name, occurrence }).catch(() => false);
+}
+
+async function waitForCustomItemListText(page: Page, sectionTitle: string, timeoutMs: number) {
+  const hash = sectionTitle === "Custom Foods" ? "#custom-foods" : "#custom-recipes";
+  const backPattern = sectionTitle === "Custom Foods" ? /^BACK TO FOODS LIST$/i : /^BACK TO RECIPE LIST$/i;
+  const hasBackLink = (value: string) => sectionTitle === "Custom Foods" ? /BACK TO FOODS LIST/i.test(value) : /BACK TO RECIPE LIST/i.test(value);
+  let text = await waitForVisibleText(page, (value) => customItemTextIsReady(value, sectionTitle), Math.min(timeoutMs, 14000));
+
+  if (!/Sorted by/i.test(text) && hasBackLink(text)) {
+    await clickByText(page, backPattern).catch(() => false);
+    await page.waitForTimeout(900);
+    text = await waitForVisibleText(page, (value) => customItemTextIsReady(value, sectionTitle), Math.min(timeoutMs, 14000));
+  }
+
+  if (!/Sorted by/i.test(text)) {
+    await page.goto(`${CRONOMETER_ORIGIN}/${hash}`).catch(() => undefined);
+    await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+    await page.waitForTimeout(900);
+    text = await waitForVisibleText(page, (value) => customItemTextIsReady(value, sectionTitle), Math.min(timeoutMs, 14000));
+    if (!/Sorted by/i.test(text) && hasBackLink(text)) {
+      await clickByText(page, backPattern).catch(() => false);
+      await page.waitForTimeout(900);
+      text = await waitForVisibleText(page, (value) => customItemTextIsReady(value, sectionTitle), Math.min(timeoutMs, 14000));
+    }
+  }
+
+  return text;
+}
+
+function customItemTextIsReady(text: string, sectionTitle: string) {
+  if (!new RegExp(`\\b${escapeRegExp(sectionTitle)}\\b`, "i").test(text)) return false;
+  return /Sorted by/i.test(text);
+}
+
+async function extractCustomFoodDetail(page: Page): Promise<CustomFoodDetail | undefined> {
+  return page.evaluate(() => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
+    const numberFromText = (value: string | null | undefined) => {
+      const match = normalize(value).match(/-?[0-9]+(?:\.[0-9]+)?/);
+      return match ? Number(match[0]) : undefined;
+    };
+    const isVisible = (element: Element) => {
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
+    const bodyText = normalize(document.body.innerText);
+    const foodId = bodyText.match(/Food\s+#(\d+)/i)?.[1];
+    const nameInput = Array.from(document.querySelectorAll("#main-food-editor-info-area input.text-box"))
+      .find((element): element is HTMLInputElement => element instanceof HTMLInputElement && isVisible(element) && Boolean(normalize(element.value)));
+    const titleName = bodyText.match(/BACK TO FOODS LIST\s+(.+?)\s+(?:ADD TO DIARY|more_horiz|Food #)/i)?.[1];
+    const name = normalize(nameInput?.value || titleName || "");
+    if (!name) return undefined;
+
+    let servingSize: string | undefined;
+    const servingRows = Array.from(document.querySelectorAll("#main-food-editor-info-area table.crono-table tr"));
+    for (const row of servingRows) {
+      const cells = Array.from(row.querySelectorAll("td"));
+      const rowText = normalize(row.textContent);
+      if (cells.length >= 3 && !row.classList.contains("table-header") && /^\d+(?:\.\d+)?\s+\S+/.test(rowText)) {
+        servingSize = `${normalize(cells[0]?.textContent)} ${normalize(cells[1]?.textContent)}`;
+        break;
+      }
+    }
+
+    const nutrients: Record<string, { value: number; unit: string; percentDailyValue?: number }> = {};
+    const rows = Array.from(document.querySelectorAll(".food-editor-nutrition-summary table.crono-table tr"));
+    for (const row of rows) {
+      const cells = Array.from(row.querySelectorAll("td"));
+      if (cells.length < 3) continue;
+      const label = normalize(cells[0]?.textContent);
+      const amountText = normalize(cells[1]?.textContent);
+      const unit = normalize(cells[2]?.textContent);
+      if (!label || amountText.toLowerCase() === "amount" || amountText === "-") continue;
+      const value = numberFromText(amountText);
+      if (value === undefined || !Number.isFinite(value)) continue;
+      const percentDailyValue = numberFromText(cells[3]?.textContent);
+      nutrients[label] = { value, unit, percentDailyValue };
+    }
+
+    const macros: Record<string, { value: number; unit: string }> = {};
+    for (const label of ["Protein", "Total Carbs", "Fat", "Sugars", "Added Sugars", "Sugar Alcohol", "Allulose", "Fiber", "Sodium"]) {
+      const nutrient = nutrients[label];
+      if (nutrient) macros[label] = { value: nutrient.value, unit: nutrient.unit };
+    }
+
+    return {
+      foodId,
+      name,
+      servingSize,
+      energy: nutrients.Energy ? { value: nutrients.Energy.value, unit: nutrients.Energy.unit } : undefined,
+      macros,
+      nutrients,
+      rawText: bodyText.slice(0, 8000),
+    };
+  }).catch(() => undefined);
+}
+
+async function extractCustomRecipeDetail(page: Page): Promise<CustomRecipeDetail | undefined> {
+  return page.evaluate(() => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
+    const isVisible = (element: Element) => {
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
+    const bodyText = normalize(document.body.innerText);
+    const recipeId = bodyText.match(/Recipe\s+#(\d+)/i)?.[1];
+    const nameInput = Array.from(document.querySelectorAll("input.text-box"))
+      .find((element): element is HTMLInputElement => element instanceof HTMLInputElement && isVisible(element) && Boolean(normalize(element.value)));
+    const titleName = bodyText.match(/BACK TO RECIPE LIST\s+(.+?)\s+(?:ADD TO DIARY|more_horiz|Recipe #|Info)/i)?.[1];
+    const name = normalize(nameInput?.value || titleName || "");
+    if (!name) return undefined;
+    return {
+      recipeId,
+      name,
+      rawText: bodyText.slice(0, 8000),
+    };
+  }).catch(() => undefined);
+}
+
+async function retireOpenCustomFood(page: Page, target: CustomFoodDetail, retiredName: string) {
+  const nameFilled = await fillCustomFoodName(page, retiredName);
+  const saved = await clickByText(page, /^SAVE CHANGES$/i);
+  if (saved) {
+    await page.waitForTimeout(1200);
+    await clickOptionalSaveConfirmation(page).catch(() => false);
+    await page.waitForTimeout(900);
+  }
+  const finalDetail = await extractCustomFoodDetail(page).catch(() => undefined);
+  return {
+    target,
+    retiredName,
+    nameFilled,
+    saved: Boolean(saved && nameFilled),
+    finalDetail,
+    visibleText: compactText(await page.locator("body").innerText().catch(() => ""), 8000),
+  };
+}
+
+async function retireOpenCustomRecipe(page: Page, target: CustomRecipeDetail, retiredName: string) {
+  const basics = await fillRecipeBasics(page, { name: retiredName, ingredients: [] });
+  const saveClicked = await clickByText(page, /^SAVE CHANGES$/i) || await clickByText(page, /^SAVE$/i);
+  await page.waitForTimeout(1000);
+  const finalDetail = await extractCustomRecipeDetail(page).catch(() => undefined);
+  const saved = basics.nameFilled && (finalDetail?.name === retiredName || Boolean(saveClicked));
+  return {
+    target,
+    retiredName,
+    basics,
+    saveClicked,
+    saved,
+    finalDetail,
+    visibleText: compactText(await page.locator("body").innerText().catch(() => ""), 8000),
+  };
+}
+
+function retiredItemName(name: string, id?: string) {
+  const today = new Date().toISOString().slice(0, 10);
+  const suffix = id ? ` #${id}` : "";
+  const base = name.replace(/^Retired\s+-\s+/i, "").trim();
+  return `Retired - ${base}${suffix} - ${today}`;
 }
 
 async function chooseMeal(page: Page, meal?: string) {
@@ -1418,60 +3201,441 @@ async function fillLikelyName(page: Page, name: string) {
 }
 
 async function fillRecipeBasics(page: Page, input: RecipeInput) {
-  const textBoxes = page.locator("input.text-box:visible");
-  if ((await textBoxes.count().catch(() => 0)) > 0) {
-    await textBoxes.nth(0).fill(input.name).catch(() => undefined);
-  } else {
+  const result = {
+    nameFilled: false,
+    servingNameFilled: false,
+    servingsFilled: false,
+    cookedWeightFilled: false,
+    cookedWeightUnitFilled: false,
+  };
+  result.nameFilled = await fillRecipeEditorInput(page, 0, input.name);
+  if (!result.nameFilled) {
     await fillLikelyName(page, input.name);
+    result.nameFilled = true;
   }
 
-  if (input.servingName && (await textBoxes.count().catch(() => 0)) > 1) {
-    await textBoxes.nth(1).fill(input.servingName).catch(() => undefined);
+  if (input.servingName) {
+    result.servingNameFilled = await fillRecipeEditorInput(page, 1, input.servingName);
   }
 
-  if (input.servings && (await textBoxes.count().catch(() => 0)) > 2) {
-    await textBoxes.nth(2).fill(String(input.servings)).catch(() => undefined);
+  if (input.servings) {
+    result.servingsFilled = await fillRecipeEditorInput(page, 2, String(input.servings));
   }
+
+  if (input.cookedWeight !== undefined) {
+    result.cookedWeightFilled = await fillRecipeCookedWeight(page, input.cookedWeight, input.cookedWeightUnit);
+    result.cookedWeightUnitFilled = Boolean(input.cookedWeightUnit && result.cookedWeightFilled);
+  }
+  return result;
 }
 
-async function addRecipeIngredient(page: Page, ingredient: RecipeInput["ingredients"][number]) {
+async function fillRecipeEditorInput(page: Page, index: number, value: string) {
+  const filled = await page.evaluate(({ index, value }) => {
+    const isVisible = (element: Element) => {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width >= 40 && rect.height >= 18 && style.display !== "none" && style.visibility !== "hidden";
+    };
+    const inputs = Array.from(document.querySelectorAll("input.text-box, input.number-box"))
+      .filter((element): element is HTMLInputElement => element instanceof HTMLInputElement)
+      .filter((element) => isVisible(element))
+      .filter((element) => !String(element.className ?? "").includes("search-field"))
+      .filter((element) => !element.closest(".popupContent,.gwt-DialogBox,[role='dialog']"))
+      .map((element) => ({ element, rect: element.getBoundingClientRect() }))
+      .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x)
+      .map((candidate) => candidate.element);
+    const input = inputs[index];
+    if (!input) return false;
+    input.focus();
+    input.value = value;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "Enter" }));
+    input.blur();
+    return input.value === value;
+  }, { index, value }).catch(() => false);
+  await page.waitForTimeout(250);
+  return filled;
+}
+
+async function fillRecipeCookedWeight(page: Page, cookedWeight: number, unit?: string) {
+  const labels = [/cooked.*weight/i, /final.*weight/i, /total.*weight/i, /recipe.*weight/i];
+  for (const label of labels) {
+    const labelled = page.getByLabel(label).first();
+    if (await labelled.isVisible().catch(() => false)) {
+      await labelled.fill(String(cookedWeight)).catch(() => undefined);
+      await page.keyboard.press("Tab").catch(() => undefined);
+      if (unit) await fillLikelyUnit(page, unit);
+      return true;
+    }
+  }
+
+  const clicked = await clickByText(page, /^(Cooked Weight|Final Weight|Total Weight|Recipe Weight)$/i);
+  if (!clicked) return false;
+  await page.waitForTimeout(400);
+  const input = await firstVisibleLocator(page, [
+    page.locator("input.number-box:focus").first(),
+    page.locator("input.text-box:focus").first(),
+    page.locator("input.number-box:visible").last(),
+    page.locator("input.text-box:visible").last(),
+  ]);
+  if (!input) return false;
+  const filled = await input.fill(String(cookedWeight)).then(() => true).catch(() => false);
+  await page.keyboard.press("Enter").catch(() => undefined);
+  if (unit) await fillLikelyUnit(page, unit);
+  return filled;
+}
+
+async function addRecipeIngredient(page: Page, ingredient: RecipeInput["ingredients"][number], options: { deadline?: number } = {}) {
   const clickedAdd = await clickByText(page, /^ADD INGREDIENTS$/i);
   if (!clickedAdd) return { status: "not_found", warning: "ADD INGREDIENTS button was not found." };
 
-  await page.waitForTimeout(800);
-  const search = await firstVisibleLocator(page, [
-    page.getByPlaceholder(/Search all foods/i),
-    page.getByPlaceholder(/Search/i),
-    page.locator("input.gwt-TextBox.search-field:visible").last(),
-    page.locator('input[type="text"]:visible').last(),
-  ]);
+  const search = await waitForFoodSearchInput(page, 2500);
   if (!search) {
     return { status: "not_found", warning: "Ingredient search input was not found." };
   }
 
   await search.fill(ingredient.selectedName ?? ingredient.query);
-  await clickByText(page, /^SEARCH$/i);
-  await page.waitForTimeout(1200);
+  const searched = await clickDialogButton(page, /^SEARCH$/i);
+  if (!searched) await clickByText(page, /^SEARCH$/i);
+  await waitForIngredientSearchResult(page, ingredient.selectedName ?? ingredient.query, Math.min(5500, Math.max(1200, (options.deadline ?? Date.now() + 5500) - Date.now() - 2500)));
 
-  const selected = await clickByText(page, ingredient.selectedName ?? ingredient.query);
+  const selectedName = ingredient.selectedName ?? ingredient.query;
+  await waitForRecipeSearchResultRow(page, selectedName, Math.min(4000, Math.max(700, (options.deadline ?? Date.now() + 4000) - Date.now() - 2500)));
+  const selected = await selectRecipeIngredientSearchResult(page, selectedName);
   if (!selected) {
+    const selectionDebug = await recipeIngredientSelectionDebug(page, selectedName);
     const results = parseFoodSearchResults(await page.locator("body").innerText(), 5);
     if (results[0]?.name) {
-      const clickedFirst = await clickByText(page, results[0].name);
-      if (!clickedFirst) return { status: "not_found", warning: "Could not select a searched ingredient.", candidates: results };
+      const clickedFirst = await selectRecipeIngredientSearchResult(page, results[0].name);
+      if (!clickedFirst) return { status: "not_found", warning: "Could not select a searched ingredient.", candidates: results, selectionDebug };
     } else {
-      return { status: "not_found", warning: "No ingredient candidates found." };
+      return { status: "not_found", warning: "No ingredient candidates found.", selectionDebug };
     }
+    return { status: "not_found", warning: "Could not select a searched ingredient.", candidates: results, selectionDebug };
   }
 
-  await page.waitForTimeout(800);
-  await fillLikelyAmount(page, ingredient.amount);
-  await fillLikelyUnit(page, ingredient.unit);
+  const editorReady = await waitForRecipeIngredientEditor(page, 2500, selectedName);
+  if (!editorReady) {
+    return { status: "not_found", warning: "Selected ingredient result did not open the ingredient amount editor." };
+  }
 
-  await clickByText(page, /^(ADD|ADD TO RECIPE|SAVE|DONE)$/i).catch(() => false);
-  await page.waitForTimeout(800);
+  const amount = await fillLikelyAmount(page, ingredient.amount, selectedName);
+  if (amount?.filled === false) {
+    return { status: "not_found", warning: amount.warning ?? "Ingredient amount input was not found.", amount };
+  }
+  const unit = await fillLikelyUnit(page, ingredient.unit);
+  const convertedAmount = unit?.filled === false
+    ? await convertGramAmountForCurrentServingUnit(page, ingredient.amount, ingredient.unit, selectedName)
+    : undefined;
 
-  return { status: "ok" };
+  const added = await clickDialogButton(page, /^(ADD|ADD INGREDIENT|ADD TO RECIPE|ADD SERVING|SAVE|DONE|OK)$/i);
+  await page.waitForTimeout(250);
+  if (!added) return {
+    status: "not_found",
+    warning: "Could not find the ingredient add/save button after selecting amount.",
+    amount,
+    unit,
+    convertedAmount,
+    editorDebug: await recipeIngredientEditorDebug(page),
+  };
+
+  return { status: "ok", amount, unit, convertedAmount };
+}
+
+async function recipeIngredientEditorDebug(page: Page) {
+  return page.evaluate(() => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
+    const isVisible = (element: Element) => {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    };
+    const dialog = Array.from(document.querySelectorAll(".pretty-dialog, [role='dialog'], .gwt-DialogBox, .popupContent"))
+      .filter(isVisible)
+      .at(-1) ?? document.body;
+    const controls = Array.from(dialog.querySelectorAll("input, button, select, .gwt-Button, [role='button']"))
+      .filter(isVisible)
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        const input = element instanceof HTMLInputElement ? element : undefined;
+        return {
+          tag: element.tagName,
+          className: String((element as HTMLElement).className ?? ""),
+          role: element.getAttribute("role") ?? "",
+          text: normalize(element.textContent),
+          type: input?.type,
+          value: input?.value,
+          placeholder: input?.placeholder,
+          x: Math.round(rect.x),
+          y: Math.round(rect.y),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+        };
+      });
+    const selectedPanels = Array.from(dialog.querySelectorAll(".food-search-name, .d-flex, .my-3"))
+      .filter(isVisible)
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        return {
+          tag: element.tagName,
+          className: String((element as HTMLElement).className ?? ""),
+          text: normalize(element.textContent).slice(0, 240),
+          x: Math.round(rect.x),
+          y: Math.round(rect.y),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+        };
+      });
+    return { controls, selectedPanels };
+  }).catch((error) => ({ error: error instanceof Error ? error.message : String(error) }));
+}
+
+async function recipeIngredientSelectionDebug(page: Page, selectedName: string) {
+  return page.evaluate((selectedName) => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
+    const target = normalize(selectedName).toLowerCase();
+    const isVisible = (element: Element) => {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    };
+    const containers = Array.from(document.querySelectorAll(".pretty-dialog, [role='dialog'], .gwt-DialogBox, .popupContent"))
+      .filter(isVisible)
+      .map((element) => ({
+        tag: element.tagName,
+        className: String((element as HTMLElement).className ?? ""),
+        textStart: normalize(element.textContent).slice(0, 240),
+        hasTarget: normalize(element.textContent).toLowerCase().includes(target),
+        hasDescriptionSource: /description\s+source/i.test(element.textContent ?? ""),
+      }));
+    const matchingElements = Array.from(document.querySelectorAll("body *"))
+      .filter(isVisible)
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        const text = normalize(element.textContent);
+        return {
+          tag: element.tagName,
+          className: String((element as HTMLElement).className ?? ""),
+          role: element.getAttribute("role") ?? "",
+          text,
+          x: Math.round(rect.x),
+          y: Math.round(rect.y),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+        };
+      })
+      .filter((element) => element.text.toLowerCase().includes(target))
+      .sort((a, b) => a.text.length - b.text.length)
+      .slice(0, 20);
+    return { target: selectedName, containers, matchingElements };
+  }, selectedName).catch((error) => ({ target: selectedName, error: error instanceof Error ? error.message : String(error) }));
+}
+
+async function selectRecipeIngredientSearchResult(page: Page, selectedName: string) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const clicked = await clickRecipeFoodResultRow(page, selectedName, attempt === 1);
+    if (!clicked) return false;
+    if (await waitForRecipeIngredientEditor(page, 1600, selectedName)) return true;
+  }
+  return false;
+}
+
+async function clickRecipeFoodResultRow(page: Page, selectedName: string, doubleClick: boolean) {
+  const box = await page.evaluate((selectedName) => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+    const target = normalize(selectedName);
+    const isVisible = (element: Element) => {
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    };
+    const containers = Array.from(document.querySelectorAll(".pretty-dialog, [role='dialog'], .gwt-DialogBox, .popupContent"))
+      .filter(isVisible);
+    const dialog = containers
+      .slice()
+      .reverse()
+      .find((element) => normalize(element.textContent).includes(target) && /description\s+source/i.test(element.textContent ?? ""))
+      ?? containers.slice().reverse().find((element) => normalize(element.textContent).includes(target))
+      ?? document.body;
+
+    const exactTextElements = Array.from(dialog.querySelectorAll("*"))
+      .filter(isVisible)
+      .filter((element) => normalize(element.textContent) === target)
+      .map((element) => ({ element, rect: element.getBoundingClientRect(), depth: elementDepth(element) }))
+      .filter((candidate) => candidate.rect.width > 0 && candidate.rect.height > 0)
+      .sort((a, b) => b.depth - a.depth || a.rect.y - b.rect.y);
+    if (exactTextElements[0]) {
+      const rect = exactTextElements[0].rect;
+      return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+    }
+
+    const prefixElements = Array.from(dialog.querySelectorAll("*"))
+      .filter(isVisible)
+      .map((element) => {
+        const text = normalize(element.textContent);
+        const rect = element.getBoundingClientRect();
+        return { element, text, rect, depth: elementDepth(element), area: rect.width * rect.height };
+      })
+      .filter((candidate) => candidate.rect.width > 0 && candidate.rect.height > 0)
+      .filter((candidate) => candidate.text.startsWith(target) && candidate.text.length <= target.length + 30)
+      .sort((a, b) => a.area - b.area || b.depth - a.depth || a.rect.y - b.rect.y);
+    if (prefixElements[0]) {
+      const rect = prefixElements[0].rect;
+      return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+    }
+
+    const rows = Array.from(dialog.querySelectorAll("tr"));
+    for (const row of rows) {
+      const cells = Array.from(row.querySelectorAll("td,th"));
+      const firstCellText = normalize(cells[0]?.textContent);
+      const rowText = normalize(row.textContent);
+      if (firstCellText !== target && !rowText.startsWith(`${target} `)) continue;
+      const targetElement = (cells[0] as HTMLElement | undefined) ?? (row as HTMLElement);
+      targetElement.scrollIntoView({ block: "center" });
+      const rect = targetElement.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return undefined;
+      return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+    }
+    return undefined;
+
+    function elementDepth(element: Element) {
+      let depth = 0;
+      let current: Element | null = element;
+      while (current) {
+        depth += 1;
+        current = current.parentElement;
+      }
+      return depth;
+    }
+  }, selectedName).catch(() => undefined);
+  if (!box) return false;
+  const x = box.x + box.width / 2;
+  const y = box.y + box.height / 2;
+  if (doubleClick) {
+    await page.mouse.dblclick(x, y);
+  } else {
+    await page.mouse.click(x, y);
+  }
+  await page.keyboard.press("Enter").catch(() => undefined);
+  await page.waitForTimeout(250);
+  return true;
+}
+
+async function waitForRecipeIngredientEditor(page: Page, timeoutMs: number, selectedName?: string) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await recipeIngredientSelectedPanel(page, selectedName)) return true;
+    const dialogText = await activeDialog(page).innerText({ timeout: 500 }).catch(() => "");
+    const hasSearchResults = /\bDescription\s+Source\b/i.test(dialogText);
+    const hasAddButton = /\b(ADD TO RECIPE|ADD SERVING|DONE|SAVE|OK)\b/i.test(dialogText);
+    if (!hasSearchResults && hasAddButton) return true;
+    await page.waitForTimeout(150);
+  }
+  return false;
+}
+
+async function recipeIngredientSelectedPanel(page: Page, selectedName?: string) {
+  return page.evaluate((selectedName) => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
+    const target = normalize(selectedName).toLowerCase();
+    const isVisible = (element: Element) => {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    };
+    const dialogs = Array.from(document.querySelectorAll(".pretty-dialog, [role='dialog'], .gwt-DialogBox, .popupContent"))
+      .filter(isVisible);
+    const root = dialogs.at(-1) ?? document.body;
+    const panels = Array.from(root.querySelectorAll(".food-search-name, .selected-food, .food-search-serving-size, .d-flex.justify-content-center.my-3"))
+      .filter(isVisible)
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        const text = normalize(element.textContent);
+        return {
+          text,
+          className: String((element as HTMLElement).className ?? ""),
+          x: Math.round(rect.x),
+          y: Math.round(rect.y),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+        };
+      })
+      .filter((panel) => panel.text && (!target || panel.text.toLowerCase().includes(target)));
+    return panels[0];
+  }, selectedName).catch(() => undefined);
+}
+
+async function waitForRecipeSearchResultRow(page: Page, selectedName: string, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const found = await page.evaluate((selectedName) => {
+      const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+      const target = normalize(selectedName);
+      const isVisible = (element: Element) => {
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+      };
+      return Array.from(document.querySelectorAll("tr,td,.gwt-HTML,.food-search-name"))
+        .filter(isVisible)
+        .some((element) => normalize(element.textContent).includes(target));
+    }, selectedName).catch(() => false);
+    if (found) return true;
+    await page.waitForTimeout(200);
+  }
+  return false;
+}
+
+async function convertGramAmountForCurrentServingUnit(page: Page, amount?: number, unit?: string, selectedName?: string) {
+  if (amount === undefined || unit?.trim().toLowerCase() !== "g") return undefined;
+  const unitText = await currentRecipeUnitText(page);
+  const gramsPerServing = gramsPerServingUnit(unitText);
+  if (!gramsPerServing) return { converted: false, unitText, warning: "Current serving unit does not expose a gram weight for conversion." };
+  const convertedAmount = Number((amount / gramsPerServing).toFixed(6));
+  const filled = await fillLikelyAmount(page, convertedAmount, selectedName);
+  return {
+    converted: filled?.filled === true,
+    originalAmount: amount,
+    originalUnit: unit,
+    convertedAmount,
+    currentUnitText: unitText,
+    gramsPerServing,
+    amount: filled,
+  };
+}
+
+function gramsPerServingUnit(text: string) {
+  const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
+  const exact = normalized.match(/^([0-9]+(?:\.[0-9]+)?)\s*g$/i);
+  if (exact?.[1]) return Number(exact[1]);
+  const annotated = normalized.match(/[—-]\s*([0-9]+(?:\.[0-9]+)?)\s*g\b/i);
+  if (annotated?.[1]) return Number(annotated[1]);
+  return undefined;
+}
+
+async function waitForFoodSearchInput(page: Page, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const input = await firstVisibleLocator(page, [
+      activeDialog(page).getByPlaceholder(/Search all foods/i),
+      activeDialog(page).getByPlaceholder(/Search/i),
+      activeDialog(page).locator("input.gwt-TextBox.search-field:visible").last(),
+      activeDialog(page).locator('input[type="text"]:visible').last(),
+    ]);
+    if (input) return input;
+    await page.waitForTimeout(150);
+  }
+  return undefined;
+}
+
+async function waitForIngredientSearchResult(page: Page, name: string, timeoutMs: number) {
+  const expected = name.toLowerCase();
+  return waitForVisibleText(
+    page,
+    (text) => text.toLowerCase().includes(expected) || /\b(no results|no foods found|did not match)\b/i.test(text),
+    Math.max(500, timeoutMs),
+  );
 }
 
 function parseDailySummary(rawText: string) {
@@ -1495,9 +3659,8 @@ function parseDailySummary(rawText: string) {
 }
 
 function parseFoodSearchResults(rawText: string, limit: number): SearchResult[] {
-  const marker = "Description Source";
-  const start = rawText.indexOf(marker);
-  const searchText = start >= 0 ? rawText.slice(start + marker.length) : rawText;
+  const markerIndex = foodSearchResultMarkerIndex(rawText);
+  const searchText = markerIndex >= 0 ? rawText.slice(markerIndex) : rawText;
   const stopMarkers = ["Energy Summary", "Nutrient Targets", "DAILY TARGET EDITOR"];
   const stop = stopMarkers
     .map((markerText) => searchText.indexOf(markerText))
@@ -1520,6 +3683,19 @@ function parseFoodSearchResults(rawText: string, limit: number): SearchResult[] 
     })
     .filter((item, index, items) => items.findIndex((candidate) => candidate.name === item.name) === index)
     .slice(0, limit);
+}
+
+function foodSearchResultMarkerIndex(rawText: string) {
+  const direct = rawText.match(/\bDescription\s+Source\b/i);
+  if (direct?.index !== undefined) return direct.index + direct[0].length;
+
+  const lineMatches = Array.from(rawText.matchAll(/^Description\s*$/gim));
+  for (const match of lineMatches) {
+    const after = rawText.slice((match.index ?? 0) + match[0].length, (match.index ?? 0) + match[0].length + 120);
+    const source = after.match(/^\s*Source\s*$/im);
+    if (source?.index !== undefined) return (match.index ?? 0) + match[0].length + source.index + source[0].length;
+  }
+  return -1;
 }
 
 async function extractFoodSearchResults(page: Page, limit: number): Promise<SearchResult[]> {

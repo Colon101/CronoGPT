@@ -2,7 +2,12 @@ import type {
   BiometricLogInput,
   Capability,
   CronometerProvider,
+  CustomFoodDeleteInput,
+  CustomFoodDuplicateInput,
   CustomFoodInput,
+  CustomFoodListInput,
+  CustomFoodRetireInput,
+  CustomFoodUpdateInput,
   DateRangeInput,
   ExerciseLogInput,
   ExportDataInput,
@@ -11,6 +16,8 @@ import type {
   NoteLogInput,
   ProviderResult,
   RecipeInput,
+  RecipeRetireInput,
+  RecipeUpdateInput,
   ResolveRecipeIngredientsInput,
   RepeatItemInput,
   SearchFoodsInput,
@@ -113,12 +120,44 @@ export class BaseCronometerProvider implements CronometerProvider {
     return this.unsupported("log_note", input);
   }
 
+  async listCustomFoods(input: CustomFoodListInput): Promise<ProviderResult> {
+    return this.unsupported("list_custom_foods", input);
+  }
+
+  async findDuplicateCustomFoods(input: CustomFoodDuplicateInput): Promise<ProviderResult> {
+    return this.unsupported("find_duplicate_custom_foods", input);
+  }
+
   async createCustomFood(input: CustomFoodInput): Promise<ProviderResult> {
     return this.unsupported("create_custom_food", input);
   }
 
+  async updateCustomFood(input: CustomFoodUpdateInput): Promise<ProviderResult> {
+    return this.unsupported("update_custom_food", input);
+  }
+
+  async deleteCustomFood(input: CustomFoodDeleteInput): Promise<ProviderResult> {
+    return this.unsupported("delete_custom_food", input);
+  }
+
+  async retireCustomFood(input: CustomFoodRetireInput): Promise<ProviderResult> {
+    return this.unsupported("retire_custom_food", input);
+  }
+
+  async listCustomRecipes(input: CustomFoodListInput): Promise<ProviderResult> {
+    return this.unsupported("list_custom_recipes", input);
+  }
+
   async createRecipe(input: RecipeInput): Promise<ProviderResult> {
     return this.unsupported("create_recipe", input);
+  }
+
+  async updateCustomRecipe(input: RecipeUpdateInput): Promise<ProviderResult> {
+    return this.unsupported("update_custom_recipe", input);
+  }
+
+  async retireCustomRecipe(input: RecipeRetireInput): Promise<ProviderResult> {
+    return this.unsupported("retire_custom_recipe", input);
   }
 
   async getTargets(input: DateRangeInput): Promise<ProviderResult> {

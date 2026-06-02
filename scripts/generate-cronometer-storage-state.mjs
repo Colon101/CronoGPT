@@ -67,7 +67,7 @@ try {
     base64Path,
     cookieCount: state.cookies.length,
     originCount: state.origins.length,
-    nextStep: `vercel env add CRONOMETER_STORAGE_STATE_BASE64 production < ${base64Path}`,
+    nextStep: `Add ${base64Path} to the hosted CRONOMETER_STORAGE_STATE_BASE64 environment variable before deploying.`,
   }, null, 2));
 } finally {
   await browser.close().catch(() => undefined);
@@ -97,8 +97,8 @@ async function visibleText(page) {
 }
 
 async function isLoggedIn(text) {
-  if (/\bWelcome Back\b|\bLOG IN\b|Too Many Attempts|captcha|robot|verify/i.test(text)) return false;
-  return /\bDashboard\b|\bDiary\b|\bTrends\b|\bFoods\b/.test(text);
+  if (/\bWelcome Back\b|\bLog In\b|\bSign Up\b|Too Many Attempts|captcha|robot|verify|Science-backed nutrition tracking|Sign Up For Free/i.test(text)) return false;
+  return /\bDashboard\b/i.test(text) && /\b(Diary|Trends|Foods)\b/i.test(text);
 }
 
 function loginFailureReason(text) {

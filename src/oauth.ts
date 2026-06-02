@@ -1,7 +1,7 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-const AUTH_REALM = "CronoGPT MCP";
+const AUTH_REALM = "cronogpt MCP";
 const MCP_PATH = "/mcp";
 const SCOPES = ["cronometer:read", "cronometer:write"];
 const ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30;
@@ -94,7 +94,7 @@ export function authorizeMcpRequest(req: IncomingMessage) {
 
   const scopes = new Set((payload.scope ?? "").split(/\s+/).filter(Boolean));
   if (!SCOPES.every((scope) => scopes.has(scope))) {
-    return { ok: false, reason: "Bearer token does not include the required CronoGPT scopes." };
+    return { ok: false, reason: "Bearer token does not include the required cronogpt scopes." };
   }
 
   return { ok: true, reason: undefined };
@@ -204,12 +204,12 @@ function authorizationServerMetadata(req: IncomingMessage) {
 function handleAuthorizePost(req: IncomingMessage, res: ServerResponse, params: Record<string, string>) {
   const linkSecret = getLinkSecret();
   if (!linkSecret) {
-    renderAuthorizeForm(req, res, params, "CronoGPT link secret is not configured.", 500);
+    renderAuthorizeForm(req, res, params, "cronogpt link secret is not configured.", 500);
     return;
   }
 
   if (!params.link_secret || !safeEqual(params.link_secret, linkSecret)) {
-    renderAuthorizeForm(req, res, params, "Invalid CronoGPT link code.", 401);
+    renderAuthorizeForm(req, res, params, "Invalid cronogpt link code.", 401);
     return;
   }
 
@@ -356,7 +356,7 @@ function renderAuthorizeForm(
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Link CronoGPT</title>
+    <title>Link cronogpt</title>
     <style>
       body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #101418; color: #f4f7f8; }
       main { max-width: 520px; margin: 12vh auto; padding: 32px; }
@@ -371,12 +371,12 @@ function renderAuthorizeForm(
   </head>
   <body>
     <main>
-      <h1>Link CronoGPT</h1>
-      <p>Enter your private CronoGPT link code to let ChatGPT access <code>${escapeHtml(appOrigin)}</code>. This authorizes ChatGPT to use the Cronometer tools exposed by your MCP server.</p>
+      <h1>Link cronogpt</h1>
+      <p>Enter your private cronogpt link code to let ChatGPT access <code>${escapeHtml(appOrigin)}</code>. This authorizes ChatGPT to use the Cronometer tools exposed by your MCP server.</p>
       ${error ? `<p class="error">${escapeHtml(error)}</p>` : ""}
       <form method="post" action="/oauth/authorize">
         ${hidden}
-        <label for="link_secret">CronoGPT link code</label>
+        <label for="link_secret">cronogpt link code</label>
         <input id="link_secret" name="link_secret" type="password" autocomplete="one-time-code" required autofocus />
         <button type="submit">Authorize ChatGPT</button>
       </form>
