@@ -3115,13 +3115,15 @@ async function fillCustomFoodNutrient(page: Page, label: string, value: number) 
     return { status: "not_found" as const, warning: `Could not find nutrient row: ${label}` };
   }
 
-  const inputCountsBeforeClick = await visibleInputCounts(page, ["input.number-box:visible"]);
   const clickedCellBox = await clickNutrientAmountCell(page, label);
   if (!clickedCellBox) {
     await page.mouse.click(cellBox.x + cellBox.width / 2, cellBox.y + cellBox.height / 2);
   }
+  const fastFill = await fillFocusedCellInput(page, clickedCellBox ?? cellBox, value);
+  if (fastFill) return fastFill;
   await page.waitForTimeout(100);
 
+  const inputCountsBeforeClick = await visibleInputCounts(page, ["input.number-box:visible"]);
   const input = await focusedOrNearestInput(page, clickedCellBox ?? cellBox, ["input.number-box:visible"])
     ?? await newestVisibleInputIfAdded(page, ["input.number-box:visible"], inputCountsBeforeClick);
   if (!input) {
@@ -3153,9 +3155,14 @@ async function fillNutritionLabelNutrient(page: Page, label: string, value: numb
   }
 
   const selectors = ["input.number-box:visible", "input.text-box:visible"];
-  const inputCountsBeforeClick = await visibleInputCounts(page, selectors);
   await page.mouse.click(cellBox.x + cellBox.width / 2, cellBox.y + cellBox.height / 2);
+  const fastFill = await fillFocusedCellInput(page, cellBox, value);
+  if (fastFill) return {
+    ...fastFill,
+    source: "nutrition_label" as const,
+  };
   await page.waitForTimeout(100);
+  const inputCountsBeforeClick = await visibleInputCounts(page, selectors);
   const input = await focusedOrNearestInput(page, cellBox, selectors)
     ?? await newestVisibleInputIfAdded(page, selectors, inputCountsBeforeClick);
   if (!input) {
@@ -3176,6 +3183,30 @@ async function fillNutritionLabelNutrient(page: Page, label: string, value: numb
     rowText: labelText,
     source: "nutrition_label" as const,
     warning: verified ? undefined : `Filled ${nutritionLabel}, but the updated nutrition label text could not be verified.`,
+  };
+}
+
+async function fillFocusedCellInput(page: Page, box: { x: number; y: number; width: number; height: number }, value: number) {
+  await page.waitForTimeout(35);
+  const focusedIsNearCell = await page.evaluate((box) => {
+    const element = document.activeElement;
+    if (!(element instanceof HTMLInputElement)) return false;
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    const inputCenter = { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+    const boxCenter = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+    return Math.hypot(inputCenter.x - boxCenter.x, inputCenter.y - boxCenter.y) <= 240;
+  }, box).catch(() => false);
+  if (!focusedIsNearCell) return undefined;
+
+  const input = page.locator("input.number-box:focus, input.text-box:focus").first();
+  const filled = await input.fill(String(value), { timeout: 800 }).then(() => true).catch(() => false);
+  if (!filled) return undefined;
+  await page.keyboard.press("Enter").catch(() => undefined);
+  await page.waitForTimeout(35);
+  return {
+    status: "filled" as const,
+    verification: "skipped_for_speed" as const,
   };
 }
 
