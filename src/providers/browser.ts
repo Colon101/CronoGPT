@@ -2615,7 +2615,7 @@ async function fillLikelyUnit(page: Page, unit?: string) {
   for (let index = 0; index < count; index += 1) {
     const select = selects.nth(index);
     if (!(await select.isVisible().catch(() => false))) continue;
-    const selected = await select.selectOption({ label: normalizedUnit }).then(() => true).catch(() => false);
+    const selected = await select.selectOption({ label: normalizedUnit }, { timeout: 700 }).then(() => true).catch(() => false);
     if (selected) return { filled: true, unit: normalizedUnit, strategy: "select-label" };
   }
 
@@ -2680,13 +2680,21 @@ function unitTextAlreadyMatches(text: string, unit: string) {
   const normalizedText = text.replace(/\s+/g, " ").trim().toLowerCase();
   const normalizedUnit = unit.trim().toLowerCase();
   const labels = [normalizedUnit, ...unitAliases(normalizedUnit)];
+  const withoutSingleServingPrefix = normalizedText.replace(/^1(?:\.0+)?\s+/, "");
+  if (normalizedUnit === "g" && gramsPerServingUnit(normalizedText) === 1) return true;
   return labels.some((label) =>
     normalizedText === label ||
     normalizedText.startsWith(`${label} `) ||
     normalizedText.startsWith(`${label}—`) ||
     normalizedText.startsWith(`${label} —`) ||
     normalizedText.startsWith(`${label}-`) ||
-    normalizedText.startsWith(`${label} -`)
+    normalizedText.startsWith(`${label} -`) ||
+    withoutSingleServingPrefix === label ||
+    withoutSingleServingPrefix.startsWith(`${label} `) ||
+    withoutSingleServingPrefix.startsWith(`${label}—`) ||
+    withoutSingleServingPrefix.startsWith(`${label} —`) ||
+    withoutSingleServingPrefix.startsWith(`${label}-`) ||
+    withoutSingleServingPrefix.startsWith(`${label} -`)
   );
 }
 
@@ -2721,8 +2729,7 @@ async function clickVisibleOptionByExactText(page: Page, value?: string) {
   const normalizedValue = value.replace(/\s+/g, " ").trim().toLowerCase();
   const roleOption = page.getByRole("option", { name: new RegExp(`^${escapeRegExp(value)}$`, "i") }).last();
   if ((await roleOption.count().catch(() => 0)) > 0 && (await roleOption.isVisible().catch(() => false))) {
-    await roleOption.click().catch(() => undefined);
-    return true;
+    return roleOption.click({ timeout: 1000 }).then(() => true).catch(() => false);
   }
   const box = await page.evaluate((normalizedValue) => {
     const normalize = (text: string | null | undefined) => (text ?? "").replace(/\s+/g, " ").trim();
@@ -2759,16 +2766,33 @@ async function clickVisibleUnitOption(page: Page, unit: string) {
       if (value === "tbsp") return ["tablespoon", "tablespoons", "tbs"];
       return [];
     };
+    const gramsPerServingUnit = (text: string) => {
+      const normalized = normalize(text).toLowerCase();
+      const exact = normalized.match(/^([0-9]+(?:\.[0-9]+)?)\s*(?:g|gram|grams)$/i);
+      if (exact?.[1]) return Number(exact[1]);
+      const annotated = normalized.match(/[—-]\s*([0-9]+(?:\.[0-9]+)?)\s*(?:g|gram|grams)\b/i)
+        ?? normalized.match(/\(\s*([0-9]+(?:\.[0-9]+)?)\s*(?:g|gram|grams)\s*\)/i)
+        ?? normalized.match(/\b([0-9]+(?:\.[0-9]+)?)\s*(?:g|gram|grams)\b/i);
+      return annotated?.[1] ? Number(annotated[1]) : undefined;
+    };
     const matches = (text: string, unit: string) => {
       const normalizedText = normalize(text).toLowerCase();
       const labels = [unit, ...aliases(unit)];
+      const withoutSingleServingPrefix = normalizedText.replace(/^1(?:\.0+)?\s+/, "");
+      if (unit === "g" && gramsPerServingUnit(normalizedText)) return true;
       return labels.some((label) =>
         normalizedText === label ||
         normalizedText.startsWith(`${label} `) ||
         normalizedText.startsWith(`${label}—`) ||
         normalizedText.startsWith(`${label} —`) ||
         normalizedText.startsWith(`${label}-`) ||
-        normalizedText.startsWith(`${label} -`)
+        normalizedText.startsWith(`${label} -`) ||
+        withoutSingleServingPrefix === label ||
+        withoutSingleServingPrefix.startsWith(`${label} `) ||
+        withoutSingleServingPrefix.startsWith(`${label}—`) ||
+        withoutSingleServingPrefix.startsWith(`${label} —`) ||
+        withoutSingleServingPrefix.startsWith(`${label}-`) ||
+        withoutSingleServingPrefix.startsWith(`${label} -`)
       );
     };
     const isVisible = (element: Element) => {
@@ -2781,10 +2805,24 @@ async function clickVisibleUnitOption(page: Page, unit: string) {
       .map((element) => {
         const text = normalize(element.textContent);
         const rect = element.getBoundingClientRect();
-        return { text, x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+        const gramWeight = normalizedUnit === "g" ? gramsPerServingUnit(text) : undefined;
+        const exactText = text.toLowerCase() === normalizedUnit;
+        const optionLike = element.matches("[role='option'],.dropdown-item,li,button,td")
+          || Boolean(element.closest("[role='listbox'],[role='menu'],.dropdown-menu,.select-popup"));
+        return { text, x: rect.x, y: rect.y, width: rect.width, height: rect.height, gramWeight, exactText, optionLike };
       })
-      .filter((candidate) => candidate.text && matches(candidate.text, normalizedUnit))
-      .sort((a, b) => (a.width * a.height) - (b.width * b.height));
+      .filter((candidate) => candidate.text && matches(candidate.text, normalizedUnit) && (normalizedUnit !== "g" || candidate.optionLike || candidate.exactText))
+      .sort((a, b) => {
+        const score = (candidate: typeof a) => {
+          let total = 0;
+          if (candidate.exactText) total += 80;
+          if (candidate.gramWeight === 1) total += 70;
+          else if (candidate.gramWeight) total += 20;
+          total -= Math.min(candidate.width * candidate.height / 1000, 30);
+          return total;
+        };
+        return score(b) - score(a);
+      });
     return candidates[0];
   }, normalizedUnit).catch(() => undefined);
   if (!box) return false;
@@ -3969,11 +4007,26 @@ async function addRecipeIngredient(page: Page, ingredient: RecipeInput["ingredie
   }
 
   options.trace?.("ingredient_unit_fill_start");
-  const unit = await fillLikelyUnit(page, ingredient.unit);
+  let convertedAmount = await convertGramAmountForCurrentServingUnit(page, ingredient.amount, ingredient.unit, selectedCandidate.name);
+  if (convertedAmount) options.trace?.("ingredient_unit_preconvert_done", {
+    converted: convertedAmount.converted,
+    currentUnitText: convertedAmount.currentUnitText,
+    gramsPerServing: convertedAmount.gramsPerServing,
+  });
+  const unit = convertedAmount?.converted === true
+    ? {
+      filled: true,
+      skipped: false,
+      unit: ingredient.unit?.trim() ?? "",
+      strategy: "converted-current-serving",
+      currentUnitText: convertedAmount.currentUnitText,
+      warning: undefined,
+    }
+    : await fillLikelyUnit(page, ingredient.unit);
   options.trace?.("ingredient_unit_fill_done", { filled: unit?.filled, skipped: unit?.skipped, strategy: unit?.strategy });
-  const convertedAmount = unit?.filled === false
+  convertedAmount = unit?.filled === false
     ? await convertGramAmountForCurrentServingUnit(page, ingredient.amount, ingredient.unit, selectedCandidate.name)
-    : undefined;
+    : convertedAmount;
   if (convertedAmount) options.trace?.("ingredient_unit_convert_done", { converted: convertedAmount.converted });
   if (unit?.filled === false && convertedAmount?.converted !== true) {
     return { status: "unit_not_found", warning: unit.warning ?? convertedAmount?.warning ?? "Ingredient unit could not be selected or converted safely.", selectedCandidate, unit, convertedAmount };
@@ -4290,11 +4343,11 @@ async function convertGramAmountForCurrentServingUnit(page: Page, amount?: numbe
 
 function gramsPerServingUnit(text: string) {
   const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
-  const exact = normalized.match(/^([0-9]+(?:\.[0-9]+)?)\s*g$/i);
+  const exact = normalized.match(/^([0-9]+(?:\.[0-9]+)?)\s*(?:g|gram|grams)$/i);
   if (exact?.[1]) return Number(exact[1]);
-  const annotated = normalized.match(/[—-]\s*([0-9]+(?:\.[0-9]+)?)\s*g\b/i)
-    ?? normalized.match(/\(\s*([0-9]+(?:\.[0-9]+)?)\s*g\s*\)/i)
-    ?? normalized.match(/\b([0-9]+(?:\.[0-9]+)?)\s*g\b/i);
+  const annotated = normalized.match(/[—-]\s*([0-9]+(?:\.[0-9]+)?)\s*(?:g|gram|grams)\b/i)
+    ?? normalized.match(/\(\s*([0-9]+(?:\.[0-9]+)?)\s*(?:g|gram|grams)\s*\)/i)
+    ?? normalized.match(/\b([0-9]+(?:\.[0-9]+)?)\s*(?:g|gram|grams)\b/i);
   if (annotated?.[1]) return Number(annotated[1]);
   return undefined;
 }
