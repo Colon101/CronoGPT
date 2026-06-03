@@ -1540,7 +1540,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     }
 
     await this.login(page);
-    const secondCheck = await this.verifyConfiguredAccount(page, expectedEmail, returnHash, "fresh-login");
+    const secondCheck = await this.verifyConfiguredAccount(page, expectedEmail, returnHash, "fresh-login", true);
     if (secondCheck.verified) return;
 
     const detected = secondCheck.detectedEmails.length
@@ -1549,7 +1549,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     throw new Error(`Cronometer login did not verify the configured account ${redactEmail(this.config.email)}. Account page showed ${detected}.`);
   }
 
-  private async verifyConfiguredAccount(page: Page, expectedEmail: string, returnHash: string, source: string) {
+  private async verifyConfiguredAccount(page: Page, expectedEmail: string, returnHash: string, source: string, trustFreshLoginWithoutVisibleEmail = false) {
     const currentText = await this.visibleText(page).catch(() => "");
     if (textHasEmail(currentText, expectedEmail)) {
       cachedAccountVerification = { normalizedEmail: expectedEmail, verifiedAt: Date.now(), source };
@@ -1560,6 +1560,10 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     const detectedEmails = extractEmails(accountText);
     if (textHasEmail(accountText, expectedEmail)) {
       cachedAccountVerification = { normalizedEmail: expectedEmail, verifiedAt: Date.now(), source: `${source}:account-page` };
+      return { verified: true, detectedEmails };
+    }
+    if (trustFreshLoginWithoutVisibleEmail && detectedEmails.length === 0) {
+      cachedAccountVerification = { normalizedEmail: expectedEmail, verifiedAt: Date.now(), source: `${source}:no-visible-email` };
       return { verified: true, detectedEmails };
     }
     return { verified: false, detectedEmails };
