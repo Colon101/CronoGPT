@@ -14,15 +14,25 @@ const checks = [];
 
 await withClient(async (client) => {
   const tools = await client.listTools();
+  const runtimeTool = tools.tools.find((tool) => tool.name === "cronometer_runtime_status");
+  const runtimeSecuritySchemes = runtimeTool?._meta?.securitySchemes;
+  const runtimeVisibility = runtimeTool?._meta?.ui?.visibility;
   checks.push({
     name: "tools",
     ok: tools.tools.length >= 50 &&
       tools.tools.some((tool) => tool.name === "cronometer_stability_check") &&
-      tools.tools.some((tool) => tool.name === "run_cronometer_ui_flow"),
+      tools.tools.some((tool) => tool.name === "run_cronometer_ui_flow") &&
+      Array.isArray(runtimeSecuritySchemes) &&
+      runtimeSecuritySchemes.some((scheme) => scheme?.type === "oauth2") &&
+      Array.isArray(runtimeVisibility) &&
+      runtimeVisibility.includes("model"),
     data: {
       count: tools.tools.length,
       hasStabilityCheck: tools.tools.some((tool) => tool.name === "cronometer_stability_check"),
       hasUiFlow: tools.tools.some((tool) => tool.name === "run_cronometer_ui_flow"),
+      runtimeHasOauthMetadata: Array.isArray(runtimeSecuritySchemes) &&
+        runtimeSecuritySchemes.some((scheme) => scheme?.type === "oauth2"),
+      runtimeVisibleToModel: Array.isArray(runtimeVisibility) && runtimeVisibility.includes("model"),
     },
   });
 

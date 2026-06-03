@@ -93,7 +93,12 @@ export function createCronoServer() {
       securitySchemes: allToolSecuritySchemes,
       annotations,
       _meta: {
-        ui: { resourceUri: widgetUri },
+        securitySchemes: allToolSecuritySchemes,
+        ui: { resourceUri: widgetUri, visibility: ["model", "app"] },
+        "openai/outputTemplate": widgetUri,
+        "openai/widgetAccessible": true,
+        "openai/toolInvocation/invoking": "Running Cronometer tool...",
+        "openai/toolInvocation/invoked": "Cronometer tool complete.",
       },
     };
 
