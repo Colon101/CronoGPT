@@ -868,7 +868,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       await this.openApp(page, "#custom-recipes");
       const rawText = await waitForCustomItemListText(page, "Custom Recipes", this.config.navigationTimeoutMs);
       const names = filterCustomItemNames(parseCustomItemListNames(rawText, "Custom Recipes"), input.query);
-      const includeDetails = input.includeDetails !== false;
+      const includeDetails = input.includeDetails === true;
       const maxDetails = Math.max(0, Math.min(input.maxDetails ?? 10, 25));
       const details = includeDetails ? await customRecipeDetailsForNames(page, names, maxDetails) : [];
       return this.result("list_custom_recipes", "ok", {
