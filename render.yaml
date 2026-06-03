@@ -35,7 +35,7 @@ services:
       - key: CRONOMETER_REUSE_REMOTE_CONTEXT
         value: "false"
       - key: CRONOMETER_REUSE_LOCAL_BROWSER
-        value: "true"
+        value: "false"
       - key: CRONOMETER_NAVIGATION_TIMEOUT_MS
         value: "60000"
       - key: CRONOMETER_OPERATION_TIMEOUT_MS
