@@ -118,7 +118,7 @@ interface ParsedStorageState {
 }
 
 const CRONOMETER_ORIGIN = "https://cronometer.com";
-const BROWSER_VIEWPORT = { width: 1280, height: 900 };
+const BROWSER_VIEWPORT = { width: 1024, height: 768 };
 const DIARY_MEAL_SECTION_RE = /\b(Breakfast|Lunch|Dinner|Snacks|Supplements)\b/i;
 const MAX_DIARY_ARROW_DAYS = 45;
 const CRONOMETER_PAGE_HASHES = {
@@ -1651,13 +1651,18 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         "--disable-popup-blocking",
         "--disable-prompt-on-repost",
         "--disable-sync",
+        "--disable-features=AudioServiceOutOfProcess,BackForwardCache,CalculateNativeWinOcclusion,MediaRouter,OptimizationHints,Translate",
+        "--disable-application-cache",
+        "--disk-cache-size=1",
         "--metrics-recording-only",
         "--mute-audio",
         "--no-first-run",
         "--no-sandbox",
         "--no-zygote",
         "--password-store=basic",
+        "--renderer-process-limit=1",
         "--use-mock-keychain",
+        "--blink-settings=imagesEnabled=false",
       ],
       headless: true,
       timeout: this.config.navigationTimeoutMs,
@@ -1893,8 +1898,10 @@ async function enqueueBrowserJob<T>(task: () => Promise<T>): Promise<T> {
 
 async function blockHeavyBrowserAssets(page: Page) {
   await page.route("**/*", async (route) => {
+    const url = new URL(route.request().url());
     const resourceType = route.request().resourceType();
-    if (resourceType === "image" || resourceType === "media" || resourceType === "font") {
+    const isCronometer = url.hostname === "cronometer.com" || url.hostname.endsWith(".cronometer.com");
+    if (!isCronometer || resourceType === "image" || resourceType === "media" || resourceType === "font") {
       await route.abort().catch(() => undefined);
       return;
     }
