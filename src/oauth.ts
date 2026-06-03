@@ -93,8 +93,8 @@ export function authorizeMcpRequest(req: IncomingMessage) {
   }
 
   const scopes = new Set((payload.scope ?? "").split(/\s+/).filter(Boolean));
-  if (!SCOPES.every((scope) => scopes.has(scope))) {
-    return { ok: false, reason: "Bearer token does not include the required cronogpt scopes." };
+  if (!scopes.has("cronometer:read")) {
+    return { ok: false, reason: "Bearer token does not include the required cronometer:read scope." };
   }
 
   return { ok: true, reason: undefined };

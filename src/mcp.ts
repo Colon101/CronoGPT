@@ -45,7 +45,8 @@ const commonOutputSchema = {
 };
 
 export const MCP_PATH = "/mcp";
-const allToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read", "cronometer:write"] }];
+const readToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read"] }];
+const writeToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read", "cronometer:write"] }];
 
 export function createCronoServer() {
   const server = new McpServer({ name: "cronogpt", version: "0.1.2" });
@@ -85,15 +86,18 @@ export function createCronoServer() {
     annotations: Record<string, boolean>,
     handler: (args: Record<string, unknown>) => Promise<any>,
   ) => {
+    const securitySchemes = annotations.readOnlyHint === true && annotations.destructiveHint !== true
+      ? readToolSecuritySchemes
+      : writeToolSecuritySchemes;
     const toolConfig = {
       title,
       description,
       inputSchema,
       outputSchema: commonOutputSchema,
-      securitySchemes: allToolSecuritySchemes,
+      securitySchemes,
       annotations,
       _meta: {
-        securitySchemes: allToolSecuritySchemes,
+        securitySchemes,
         ui: { resourceUri: widgetUri, visibility: ["model", "app"] },
         "openai/outputTemplate": widgetUri,
         "openai/widgetAccessible": true,
@@ -121,6 +125,51 @@ export function createCronoServer() {
       warning,
       source: "cronometer-ui-inventory",
     });
+  };
+
+  const sanitizedRecipeListResult = (feature: string, result: Awaited<ReturnType<typeof provider.listCustomRecipes>>) => {
+    const data = (result.data ?? {}) as {
+      query?: unknown;
+      count?: unknown;
+      names?: unknown;
+      recipes?: unknown;
+      duplicateGroups?: unknown;
+    };
+    const recipes = Array.isArray(data.recipes)
+      ? data.recipes.map((recipe) => sanitizeRecipeSummary(recipe))
+      : undefined;
+    return {
+      ...result,
+      feature,
+      data: {
+        query: data.query,
+        count: data.count,
+        names: Array.isArray(data.names) ? data.names.filter((name): name is string => typeof name === "string") : [],
+        recipes,
+        duplicateGroups: data.duplicateGroups,
+      },
+    };
+  };
+
+  const sanitizeRecipeSummary = (recipe: unknown) => {
+    const value = recipe && typeof recipe === "object" ? recipe as Record<string, unknown> : {};
+    return {
+      name: typeof value.name === "string" ? value.name : undefined,
+      recipeId: typeof value.recipeId === "string" ? value.recipeId : undefined,
+      servings: typeof value.servings === "number" ? value.servings : undefined,
+      servingName: typeof value.servingName === "string" ? value.servingName : undefined,
+      ingredients: Array.isArray(value.ingredients)
+        ? value.ingredients.map((ingredient) => {
+          const item = ingredient && typeof ingredient === "object" ? ingredient as Record<string, unknown> : {};
+          return {
+            name: typeof item.name === "string" ? item.name : undefined,
+            amount: typeof item.amount === "number" || typeof item.amount === "string" ? item.amount : undefined,
+            unit: typeof item.unit === "string" ? item.unit : undefined,
+            source: typeof item.source === "string" ? item.source : undefined,
+          };
+        })
+        : undefined,
+    };
   };
 
   const parseCustomFoodFallbackScope = (scope: unknown):
@@ -601,6 +650,38 @@ export function createCronoServer() {
     "Lists Cronometer Foods > Custom Meals.",
     emptyInputSchema,
     "#custom-meals",
+  );
+
+  register(
+    "list_private_recipe_names",
+    "List private recipe names",
+    "Reads only the authenticated user's private Cronometer custom recipe names. Returns names and duplicate groups only, without raw page text or recipe nutrition details.",
+    {
+      query: z.string().optional().describe("Optional recipe-name filter. Omit this field to list all visible private custom recipe names."),
+    },
+    { readOnlyHint: true, openWorldHint: false },
+    async (args) => toMcpToolResponse(
+      sanitizedRecipeListResult(
+        "list_private_recipe_names",
+        await provider.listCustomRecipes({ query: args.query as string | undefined, includeDetails: false, maxDetails: 0 }),
+      ),
+    ),
+  );
+
+  register(
+    "find_private_recipe",
+    "Find private recipe",
+    "Reads one authenticated user's private Cronometer custom recipe by exact or near-exact name filter and returns a sanitized summary for verification.",
+    {
+      name: z.string().min(1).describe("Exact private custom recipe name to verify."),
+    },
+    { readOnlyHint: true, openWorldHint: false },
+    async (args) => toMcpToolResponse(
+      sanitizedRecipeListResult(
+        "find_private_recipe",
+        await provider.listCustomRecipes({ query: String(args.name), includeDetails: true, maxDetails: 1 }),
+      ),
+    ),
   );
 
   register(
