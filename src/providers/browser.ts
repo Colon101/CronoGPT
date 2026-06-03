@@ -937,29 +937,28 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       const saveClicked = allAdded && nameVisible
         ? await clickByText(page, /^SAVE CHANGES$/i) || await clickByText(page, /^SAVE$/i)
         : false;
+      let postSaveText = "";
+      let finalDetail: CustomRecipeDetail | undefined;
       if (saveClicked) {
         await page.waitForTimeout(1200);
         await clickOptionalSaveConfirmation(page).catch(() => false);
         await page.waitForTimeout(1000);
-      }
-      let listed = false;
-      let listText = "";
-      if (saveClicked && Date.now() < deadline) {
-        await this.openApp(page, "#custom-recipes");
-        listText = await waitForCustomItemListText(page, "Custom Recipes", Math.min(this.config.navigationTimeoutMs, 10000)).catch(() => "");
-        listed = textHasFoodName(listText, input.name);
+        finalDetail = await extractCustomRecipeDetail(page).catch(() => undefined);
+        postSaveText = await this.visibleText(page).catch(() => "");
       }
 
-      const ok = allAdded && nameVisible && saveClicked && listed;
+      const editorVerified = Boolean(finalDetail?.name.toLowerCase() === input.name.toLowerCase() || textHasFoodName(postSaveText, input.name));
+      const ok = allAdded && nameVisible && saveClicked && editorVerified;
       return this.result("create_recipe", ok ? "ok" : "needs_manual_step", {
         recipeName: input.name,
         basics,
         addedIngredients,
         saveClicked,
-        listed,
-        customRecipesText: listText ? compactText(listText, 8000) : undefined,
+        editorVerified,
+        finalDetail,
+        postSaveText: postSaveText ? compactText(postSaveText, 8000) : undefined,
         visibleText: compactText(visibleText, 12000),
-      }, ok ? undefined : "Recipe editor opened, but the saved recipe could not be verified in Custom Recipes.");
+      }, ok ? undefined : "Recipe editor opened, but the saved recipe could not be verified after clicking Save.");
     });
   }
 
@@ -1564,6 +1563,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       storageState: this.storageState(),
     });
     const page = await context.newPage();
+    await blockHeavyBrowserAssets(page);
     page.setDefaultTimeout(this.config.navigationTimeoutMs);
     page.setDefaultNavigationTimeout(this.config.navigationTimeoutMs);
     return { browser, context, page };
@@ -1891,6 +1891,17 @@ async function enqueueBrowserJob<T>(task: () => Promise<T>): Promise<T> {
   return run;
 }
 
+async function blockHeavyBrowserAssets(page: Page) {
+  await page.route("**/*", async (route) => {
+    const resourceType = route.request().resourceType();
+    if (resourceType === "image" || resourceType === "media" || resourceType === "font") {
+      await route.abort().catch(() => undefined);
+      return;
+    }
+    await route.continue().catch(() => undefined);
+  }).catch(() => undefined);
+}
+
 async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -1907,6 +1918,7 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, message: string):
 
 function isTransientAutomationError(message: string) {
   if (/Too Many Attempts|captcha|robot|verify|invalid|incorrect|two.factor|2fa|login is paused/i.test(message)) return false;
+  if (/Timed out (running|opening)/i.test(message)) return false;
   return /Target page|context.*closed|browser.*closed|browser.*disconnected|Execution context|Navigation timeout|Timeout .* exceeded|Timed out|Protocol error|net::ERR|ECONNRESET|EPIPE/i.test(message);
 }
 
