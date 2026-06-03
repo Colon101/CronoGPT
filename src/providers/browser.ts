@@ -944,7 +944,8 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
     return this.withPage("create_recipe", async (page) => {
       const startedAt = Date.now();
-      const trace: RecipeTrace = (step, details) => logRecipeStep(input.name, startedAt, step, details);
+      const traceEntries: RecipeTraceEntry[] = [];
+      const trace: RecipeTrace = (step, details) => logRecipeStep(input.name, startedAt, step, details, traceEntries);
       const deadline = Date.now() + Math.max(30000, Math.min(this.config.operationTimeoutMs - 15000, 900000));
       trace("open_app_start", { ingredientCount: input.ingredients.length });
       await this.openApp(page, "#custom-recipes");
@@ -970,14 +971,25 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
             basics,
             addedIngredients,
             stoppedBeforeIngredient: { index, ingredient },
+            trace: traceEntries.slice(-40),
             visibleText: compactText(await this.visibleText(page).catch(() => ""), 10000),
           }, "Stopped before the hosted operation budget expired. Retry with the remaining ingredients or use fewer ingredients per call.");
         }
         trace("ingredient_start", { ingredientIndex: index });
-        const added = await addRecipeIngredient(page, ingredient, {
-          deadline,
-          trace: (step, details) => trace(step, { ingredientIndex: index, ...details }),
-        });
+        const ingredientBudgetMs = Math.min(28000, Math.max(9000, deadline - Date.now() - 7000));
+        const added = await withTimeout(
+          addRecipeIngredient(page, ingredient, {
+            deadline: Math.min(deadline, Date.now() + ingredientBudgetMs),
+            trace: (step, details) => trace(step, { ingredientIndex: index, ...details }),
+          }),
+          ingredientBudgetMs,
+          `Timed out adding recipe ingredient ${index + 1} (${ingredient.query}) after ${ingredientBudgetMs}ms.`,
+        ).catch(async (error) => ({
+          status: "ingredient_timeout",
+          warning: error instanceof Error ? error.message : String(error),
+          editorDebug: await recipeIngredientEditorDebug(page),
+          visibleText: compactText(await this.visibleText(page).catch(() => ""), 8000),
+        }));
         trace("ingredient_done", { ingredientIndex: index, status: added.status });
         addedIngredients.push({ ingredient, ...added });
         if (added.status !== "ok") break;
@@ -1028,6 +1040,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         servingsVerified,
         ingredientsVerified,
         finalDetail,
+        trace: traceEntries.slice(-60),
         postSaveText: postSaveText ? compactText(postSaveText, 8000) : undefined,
         visibleText: compactText(visibleText, 12000),
       }, ok ? undefined : "Recipe editor opened, but the saved recipe could not be fully verified after clicking Save.");
@@ -3385,14 +3398,18 @@ function textHasFoodName(text: string, name: string) {
 }
 
 type RecipeTrace = (step: string, details?: Record<string, unknown>) => void;
+type RecipeTraceEntry = { step: string; elapsedMs: number; details: Record<string, unknown> };
 
-function logRecipeStep(recipeName: string, startedAt: number, step: string, details: Record<string, unknown> = {}) {
+function logRecipeStep(recipeName: string, startedAt: number, step: string, details: Record<string, unknown> = {}, entries?: RecipeTraceEntry[]) {
+  const elapsedMs = Date.now() - startedAt;
+  entries?.push({ step, elapsedMs, details });
+  if (entries && entries.length > 80) entries.splice(0, entries.length - 80);
   try {
     console.log(JSON.stringify({
       feature: "create_recipe",
       recipeName,
       step,
-      elapsedMs: Date.now() - startedAt,
+      elapsedMs,
       ...details,
     }));
   } catch {
