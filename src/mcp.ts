@@ -381,16 +381,16 @@ export function createCronoServer() {
   register(
     "search_foods",
     "Search foods",
-    "Searches for Cronometer food matches. Browser implementation must be verified before real use.",
+    "Searches the bounded Cronometer food database and the authenticated user's private Cronometer foods for visible food matches. It does not browse arbitrary websites or access files.",
     { query: z.string().min(1), limit: z.number().int().positive().max(25).optional() },
-    { readOnlyHint: true, openWorldHint: true },
+    { readOnlyHint: true, openWorldHint: false },
     async (args) => toMcpToolResponse(await provider.searchFoods({ query: String(args.query), limit: args.limit as number | undefined })),
   );
 
   register(
     "resolve_recipe_ingredients",
     "Resolve recipe ingredients",
-    "Optionally searches Cronometer for each recipe ingredient when the user wants to review exact food/source choices before creating a custom recipe. For a small straightforward recipe, create_recipe can be called directly with ingredient query, amount, unit, confirmed=true, and dryRun=false.",
+    "Optionally searches the bounded Cronometer food database for each recipe ingredient when the user wants to review exact food/source choices before creating a private custom Cronometer recipe. For a small straightforward recipe, create_recipe can be called directly with ingredient query, amount, unit, confirmed=true, and dryRun=false.",
     {
       recipeName: z.string().optional(),
       ingredients: z.array(
@@ -405,7 +405,7 @@ export function createCronoServer() {
       limitPerIngredient: z.number().int().positive().max(5).optional(),
       maxSeconds: z.number().int().positive().max(900).optional(),
     },
-    { readOnlyHint: true, openWorldHint: true },
+    { readOnlyHint: true, openWorldHint: false },
     async (args) => {
       return toMcpToolResponse(
         await provider.resolveRecipeIngredients({
@@ -606,13 +606,13 @@ export function createCronoServer() {
   register(
     "list_custom_recipes",
     "List custom recipes",
-    "Lists Cronometer Foods > Custom Recipes with structured visible names and duplicate groups.",
+    "Reads only the authenticated user's private Cronometer Foods > Custom Recipes list, returning structured visible recipe names, optional details, and duplicate groups. It does not browse arbitrary websites or access files.",
     {
-      query: z.string().optional(),
+      query: z.string().optional().describe("Optional recipe-name filter. Omit this field to list all visible custom recipes."),
       includeDetails: z.boolean().optional(),
       maxDetails: z.number().int().nonnegative().max(25).optional(),
     },
-    { readOnlyHint: true, openWorldHint: true },
+    { readOnlyHint: true, openWorldHint: false },
     async (args) => toMcpToolResponse(await provider.listCustomRecipes(args as never)),
   );
 
