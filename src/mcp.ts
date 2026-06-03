@@ -49,7 +49,7 @@ const readToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer
 const writeToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read", "cronometer:write"] }];
 
 export function createCronoServer() {
-  const server = new McpServer({ name: "cronogpt", version: "0.1.3" });
+  const server = new McpServer({ name: "cronogpt", version: "0.1.4" });
 
   registerAppResource(
     server,
@@ -721,6 +721,67 @@ export function createCronoServer() {
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     async (args) => toMcpToolResponse(await provider.createRecipe(args as never)),
+  );
+
+  register(
+    "ensure_private_recipe",
+    "Ensure private recipe",
+    "Idempotently ensures one private custom Cronometer recipe exists in the authenticated user's account. If an exact recipe name already exists, it returns that private recipe summary without writing; otherwise it creates and verifies the private recipe after user confirmation. It does not publish, send, share, or write outside that private Cronometer account.",
+    {
+      name: z.string().min(1),
+      ingredients: z.array(
+        z.object({
+          query: z.string().min(1),
+          selectedName: z.string().optional(),
+          selectedSource: z.string().optional().describe("Optional Cronometer result source from resolve_recipe_ingredients, such as CRDB, NCCDB, USDA, Custom Food, or Brand."),
+          amount: z.number().positive().optional(),
+          unit: z.string().optional(),
+        }),
+      ),
+      servings: z.number().positive().optional(),
+      servingName: z.string().optional(),
+      cookedWeight: z.number().positive().optional().describe("Optional total cooked/final recipe weight."),
+      cookedWeightUnit: z.string().optional().describe("Unit for cookedWeight, such as g or oz."),
+      dryRun: z.boolean().optional(),
+      confirmed: z.boolean().optional(),
+    },
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    async (args) => {
+      const name = String(args.name);
+      const existing = await provider.listCustomRecipes({ query: name, includeDetails: true, maxDetails: 1 });
+      const existingData = (existing.data ?? {}) as { recipes?: unknown };
+      const exactRecipe = Array.isArray(existingData.recipes)
+        ? existingData.recipes.find((recipe) => {
+          const value = recipe && typeof recipe === "object" ? recipe as Record<string, unknown> : {};
+          return typeof value.name === "string" && value.name.trim().toLowerCase() === name.trim().toLowerCase();
+        })
+        : undefined;
+
+      if (exactRecipe) {
+        return toMcpToolResponse({
+          provider: existing.provider,
+          mode: existing.mode,
+          feature: "ensure_private_recipe",
+          status: "ok",
+          data: {
+            existed: true,
+            created: false,
+            recipe: sanitizeRecipeSummary(exactRecipe),
+          },
+        });
+      }
+
+      const created = await provider.createRecipe(args as never);
+      return toMcpToolResponse({
+        ...created,
+        feature: "ensure_private_recipe",
+        data: {
+          ...(created.data && typeof created.data === "object" ? created.data as Record<string, unknown> : {}),
+          existed: false,
+          created: created.status === "ok",
+        },
+      });
+    },
   );
 
   register(
