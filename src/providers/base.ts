@@ -15,6 +15,7 @@ import type {
   FoodLogInput,
   NoteLogInput,
   ProviderResult,
+  RecipeDeleteInput,
   RecipeInput,
   RecipeRetireInput,
   RecipeUpdateInput,
@@ -154,6 +155,10 @@ export class BaseCronometerProvider implements CronometerProvider {
 
   async updateCustomRecipe(input: RecipeUpdateInput): Promise<ProviderResult> {
     return this.unsupported("update_custom_recipe", input);
+  }
+
+  async deleteCustomRecipe(input: RecipeDeleteInput): Promise<ProviderResult> {
+    return this.unsupported("delete_custom_recipe", input);
   }
 
   async retireCustomRecipe(input: RecipeRetireInput): Promise<ProviderResult> {

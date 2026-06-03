@@ -105,6 +105,13 @@ export interface CustomRecipeSelectorInput {
   name?: string;
 }
 
+export interface RecipeDeleteInput extends CustomRecipeSelectorInput {
+  confirmName?: string;
+  ifUsed?: "stop" | "retire" | "force";
+  dryRun?: boolean;
+  confirmed?: boolean;
+}
+
 export interface RecipeUpdateInput extends CustomRecipeSelectorInput {
   newName?: string;
   ingredientsToAdd?: RecipeIngredientInput[];
@@ -282,6 +289,7 @@ export interface CronometerProvider {
   listCustomRecipes(input: CustomFoodListInput): Promise<ProviderResult>;
   createRecipe(input: RecipeInput): Promise<ProviderResult>;
   updateCustomRecipe(input: RecipeUpdateInput): Promise<ProviderResult>;
+  deleteCustomRecipe(input: RecipeDeleteInput): Promise<ProviderResult>;
   retireCustomRecipe(input: RecipeRetireInput): Promise<ProviderResult>;
   getTargets(input: DateRangeInput): Promise<ProviderResult>;
   setTargets(input: TargetsInput): Promise<ProviderResult>;

@@ -643,6 +643,22 @@ export function createCronoServer() {
   );
 
   register(
+    "delete_custom_recipe",
+    "Delete custom recipe",
+    "Deletes one existing Cronometer custom recipe by exact recipeId or unique exact name. Requires confirmed=true and confirmName matching the selected recipe name. Use ifUsed='retire' only if Cronometer warns that old diary entries depend on the recipe.",
+    {
+      recipeId: z.string().optional(),
+      name: z.string().optional(),
+      confirmName: z.string().optional(),
+      ifUsed: z.enum(["stop", "retire", "force"]).optional().describe("Defaults to stop. Use retire to rename instead if Cronometer warns that old diary entries use this recipe; use force only after explicit user approval."),
+      dryRun: z.boolean().optional(),
+      confirmed: z.boolean().optional(),
+    },
+    { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    async (args) => toMcpToolResponse(await provider.deleteCustomRecipe(args as never)),
+  );
+
+  register(
     "update_custom_recipe",
     "Update custom recipe",
     "Updates one existing Cronometer custom recipe by exact recipeId or unique exact name. Can edit basics/cooked weight and add resolved ingredients without creating a duplicate.",

@@ -12,6 +12,7 @@ import type {
   FastInput,
   FoodLogInput,
   NoteLogInput,
+  RecipeDeleteInput,
   RecipeInput,
   RecipeRetireInput,
   RecipeUpdateInput,
@@ -155,6 +156,10 @@ export class MockCronometerProvider extends BaseCronometerProvider {
 
   async updateCustomRecipe(input: RecipeUpdateInput) {
     return this.dryRunWrite("update_custom_recipe", input);
+  }
+
+  async deleteCustomRecipe(input: RecipeDeleteInput) {
+    return this.dryRunWrite("delete_custom_recipe", input);
   }
 
   async retireCustomRecipe(input: RecipeRetireInput) {

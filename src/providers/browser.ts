@@ -17,6 +17,7 @@ import type {
   FoodLogInput,
   NoteLogInput,
   ProviderResult,
+  RecipeDeleteInput,
   RecipeInput,
   RecipeRetireInput,
   RecipeUpdateInput,
@@ -1073,6 +1074,100 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         saveClicked,
         visibleText: compactText(await this.visibleText(page), 12000),
       }, allAdded ? undefined : "Recipe editor opened, but one or more added ingredients could not be verified.");
+    });
+  }
+
+  async deleteCustomRecipe(input: RecipeDeleteInput & { confirmed?: boolean }) {
+    const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
+    const ifUsed = input.ifUsed ?? "stop";
+    return this.withPage("delete_custom_recipe", async (page) => {
+      await this.openApp(page, "#custom-recipes");
+      const resolved = await resolveCustomRecipeTargets(page, input, { maxDetails: 25, timeoutMs: this.config.navigationTimeoutMs });
+      if (resolved.targets.length !== 1) {
+        return this.result("delete_custom_recipe", "needs_manual_step", {
+          input: safeInput(input),
+          visibleNames: resolved.names,
+          candidates: resolved.targets,
+          candidateCount: resolved.targets.length,
+          nextStep: resolved.targets.length > 1 ? "Call delete_custom_recipe again with the exact recipeId and confirmName." : "No matching custom recipe was found.",
+        }, resolved.targets.length > 1 ? "Multiple matching custom recipes were found; delete requires an exact target." : "No matching custom recipe was found.");
+      }
+
+      const target = resolved.targets[0];
+      if (input.confirmName !== target.name) {
+        return this.result("delete_custom_recipe", "dry_run", {
+          input: safeInput(input),
+          target,
+          requiredConfirmName: target.name,
+          nextStep: "Call delete_custom_recipe with confirmed=true and confirmName exactly matching the target recipe name.",
+        }, "Deletion requires confirmName to match the selected custom recipe name.");
+      }
+
+      if (!confirmedWrite) {
+        return this.result("delete_custom_recipe", "dry_run", {
+          input: safeInput(input),
+          target,
+          reason: writeGateReason(input, this.config.writeEnabled),
+          ifUsed,
+          nextStep: "Review the target recipe, then call with confirmed=true and the same confirmName to delete it. If old diary entries may depend on it, use retire_custom_recipe or ifUsed='retire'.",
+        });
+      }
+
+      const opened = await openCustomRecipeTarget(page, target);
+      if (!opened) {
+        return this.result("delete_custom_recipe", "needs_manual_step", { input: safeInput(input), target }, "Could not reopen the selected custom recipe.");
+      }
+      const menuClicked = await clickByText(page, /^more_horiz$/i) || await clickByText(page, /^(MORE|ACTIONS)$/i);
+      if (!menuClicked) {
+        return this.result("delete_custom_recipe", "needs_manual_step", {
+          input: safeInput(input),
+          target,
+          visibleText: compactText(await this.visibleText(page), 12000),
+        }, "Could not find the custom recipe actions menu.");
+      }
+      await page.waitForTimeout(500);
+      const deleteClicked = await clickByText(page, /^(DELETE|DELETE RECIPE|DELETE \/ RETIRE RECIPE(?:\.\.\.)?|REMOVE)$/i);
+      if (!deleteClicked) {
+        return this.result("delete_custom_recipe", "needs_manual_step", {
+          input: safeInput(input),
+          target,
+          visibleText: compactText(await this.visibleText(page), 12000),
+        }, "Opened the actions menu but could not find a delete action.");
+      }
+      await page.waitForTimeout(500);
+      const confirmation = await handleOptionalDeleteConfirmation(page, target.name, ifUsed);
+      if (confirmation.blocked) {
+        return this.result("delete_custom_recipe", "needs_manual_step", {
+          input: safeInput(input),
+          target,
+          deleteConfirmation: confirmation,
+          nextStep: "Cronometer warned that this recipe may be used by existing entries. Use retire_custom_recipe, or call delete_custom_recipe with ifUsed='force' only after explicit approval.",
+        }, "Cronometer showed a dependency warning, so deletion was stopped.");
+      }
+
+      if (confirmation.retireInstead) {
+        const retiredName = retiredItemName(input.name ?? target.name, input.recipeId);
+        const retired = await retireOpenCustomRecipe(page, target, retiredName);
+        return this.result("delete_custom_recipe", retired.saved ? "ok" : "needs_manual_step", {
+          deleted: false,
+          action: "retired_instead",
+          target,
+          retiredName,
+          deleteConfirmation: confirmation,
+          retired,
+        }, retired.saved ? "Cronometer warned about existing references, so the custom recipe was retired instead of deleted." : "Cronometer warned about existing references, and the retire fallback could not be saved.");
+      }
+
+      await page.waitForTimeout(1200);
+      await this.openApp(page, "#custom-recipes");
+      const listText = await waitForCustomItemListText(page, "Custom Recipes", this.config.navigationTimeoutMs);
+      const stillListed = textHasFoodName(listText, target.name);
+      return this.result("delete_custom_recipe", stillListed ? "needs_manual_step" : "ok", {
+        deleted: !stillListed,
+        target,
+        confirmation,
+        visibleText: compactText(listText, 8000),
+      }, stillListed ? "Delete was clicked, but the recipe name still appeared in the Custom Recipes list afterward." : undefined);
     });
   }
 
