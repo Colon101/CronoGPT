@@ -45,6 +45,7 @@ export function createProviderFromEnv(): CronometerProvider {
       browserRetryCount: Number(env("CRONOMETER_BROWSER_RETRY_COUNT") ?? 1),
       timeZone: env("CRONOMETER_TIME_ZONE") ?? "Asia/Jerusalem",
       reuseRemoteContext: env("CRONOMETER_REUSE_REMOTE_CONTEXT") === "true",
+      reuseLocalBrowser: env("CRONOMETER_REUSE_LOCAL_BROWSER") === "true",
     });
   }
 

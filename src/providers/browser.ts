@@ -47,6 +47,7 @@ export interface BrowserConfig {
   browserRetryCount: number;
   timeZone: string;
   reuseRemoteContext?: boolean;
+  reuseLocalBrowser?: boolean;
 }
 
 interface SearchResult {
@@ -143,6 +144,7 @@ let lastLoginFailure: string | undefined;
 let browserQueue: Promise<void> = Promise.resolve();
 let activeBrowserJobs = 0;
 let queuedBrowserJobs = 0;
+let cachedLocalSession: BrowserSession | undefined;
 
 interface StorageStateInfo {
   configured: boolean;
@@ -204,6 +206,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       queuedBrowserJobs,
       operationTimeoutMs: this.config.operationTimeoutMs,
       browserRetryCount: this.config.browserRetryCount,
+      reuseLocalBrowser: this.config.reuseLocalBrowser,
       loginPaused,
       loginPauseSecondsRemaining: loginPaused ? Math.ceil((loginBackoffUntil - now) / 1000) : 0,
       lastLoginFailure,
@@ -1503,6 +1506,11 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private async newSession(): Promise<BrowserSession> {
+    if (!this.config.remoteWsEndpoint && this.config.reuseLocalBrowser) {
+      const cached = await this.usableCachedLocalSession();
+      if (cached) return cached;
+    }
+
     const browser = this.config.remoteWsEndpoint
       ? await chromium.connectOverCDP(this.config.remoteWsEndpoint, {
           timeout: this.config.navigationTimeoutMs,
@@ -1520,6 +1528,20 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       return { browser, context, page, closeContext: false, closeBrowser: false };
     }
 
+    if (!this.config.remoteWsEndpoint && this.config.reuseLocalBrowser) {
+      await this.closeCachedLocalSession();
+      const context = await browser.newContext({
+        viewport: { width: 1440, height: 1100 },
+        locale: "en-US",
+        storageState: this.storageState(),
+      });
+      const page = await context.newPage();
+      page.setDefaultTimeout(this.config.navigationTimeoutMs);
+      page.setDefaultNavigationTimeout(this.config.navigationTimeoutMs);
+      cachedLocalSession = { browser, context, page, closeContext: false, closeBrowser: false };
+      return cachedLocalSession;
+    }
+
     const context = await browser.newContext({
       viewport: { width: 1440, height: 1100 },
       locale: "en-US",
@@ -1529,6 +1551,22 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     page.setDefaultTimeout(this.config.navigationTimeoutMs);
     page.setDefaultNavigationTimeout(this.config.navigationTimeoutMs);
     return { browser, context, page };
+  }
+
+  private async usableCachedLocalSession(): Promise<BrowserSession | undefined> {
+    if (!cachedLocalSession) return undefined;
+    if (!cachedLocalSession.browser.isConnected() || cachedLocalSession.page.isClosed()) {
+      await this.closeCachedLocalSession();
+      return undefined;
+    }
+    return cachedLocalSession;
+  }
+
+  private async closeCachedLocalSession() {
+    const cached = cachedLocalSession;
+    cachedLocalSession = undefined;
+    await cached?.context.close().catch(() => undefined);
+    await cached?.browser.close().catch(() => undefined);
   }
 
   private hasRunnableBrowser() {

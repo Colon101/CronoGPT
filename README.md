@@ -64,6 +64,7 @@ CRONOMETER_EMAIL=...
 CRONOMETER_PASSWORD=...
 CRONOMETER_STORAGE_STATE_BASE64=optional-playwright-storage-state
 CRONOMETER_LOCAL_CHROMIUM=true
+CRONOMETER_REUSE_LOCAL_BROWSER=true
 REMOTE_CHROME_WS_ENDPOINT=optional-remote-chrome-endpoint
 CRONOMETER_ENABLE_WRITES=true
 CRONOMETER_REQUIRE_FOOD_CONFIRMATION=false
@@ -73,7 +74,7 @@ CRONOMETER_OPERATION_TIMEOUT_MS=600000
 CRONOMETER_BROWSER_RETRY_COUNT=1
 ```
 
-The Render Docker image includes local Chromium through the Playwright base image. `REMOTE_CHROME_WS_ENDPOINT` is optional if you want to use Browserless or another remote Chrome provider instead. `CRONOMETER_STORAGE_STATE_BASE64` lets the hosted browser reuse a valid Cronometer session instead of logging in from scratch on every tool call. `CRONOMETER_LOGIN_BACKOFF_MS` pauses new login attempts after a rate-limit or bot challenge.
+The Render Docker image includes local Chromium through the Playwright base image. `CRONOMETER_REUSE_LOCAL_BROWSER=true` keeps the hosted Chromium session warm between serialized tool calls, which avoids launching a fresh browser for every ChatGPT request. `REMOTE_CHROME_WS_ENDPOINT` is optional if you want to use Browserless or another remote Chrome provider instead. `CRONOMETER_STORAGE_STATE_BASE64` lets the hosted browser reuse a valid Cronometer session instead of logging in from scratch on every tool call. `CRONOMETER_LOGIN_BACKOFF_MS` pauses new login attempts after a rate-limit or bot challenge.
 
 Food logs write directly when `CRONOMETER_ENABLE_WRITES=true` unless the tool call sets `dryRun=true`. Set `CRONOMETER_REQUIRE_FOOD_CONFIRMATION=true` to restore the older second-step confirmation behavior. Other write tools require `confirmed=true` and will write as long as `dryRun` is not `true`. Dry-run write previews return without opening Cronometer, so recipe/custom-food validation does not burn browser login attempts. Set `CRONOMETER_ENABLE_WRITES=false` for read-only dry-run mode.
 
