@@ -605,6 +605,9 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   async createCustomFood(input: CustomFoodInput & { confirmed?: boolean }) {
+    const startedAt = Date.now();
+    const trace: CustomFoodTraceEntry[] = [];
+    const traceStep = (step: string, details?: Record<string, unknown>) => logCustomFoodStep(input.name, startedAt, step, details, trace);
     const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
     const duplicatePolicy = input.duplicatePolicy ?? "update_existing";
     if (!confirmedWrite) {
@@ -618,15 +621,19 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       });
     }
 
-      return this.withPage("create_custom_food", async (page) => {
+    return this.withPage("create_custom_food", async (page) => {
+      traceStep("open_custom_foods:start");
       await this.openApp(page, "#custom-foods");
+      traceStep("open_custom_foods:done", { url: page.url() });
       const existing = await resolveCustomFoodTargets(page, { name: input.name }, { maxDetails: 12, timeoutMs: this.config.navigationTimeoutMs });
+      traceStep("duplicates_resolved", { existingCount: existing.targets.length, visibleNameCount: existing.names.length, duplicatePolicy });
       if (existing.targets.length > 0 && duplicatePolicy === "fail") {
         return this.result("create_custom_food", "needs_manual_step", {
           input: safeInput(input),
           duplicatePolicy,
           existingFoods: existing.targets,
           duplicateGroups: duplicateGroups(existing.targets.map((food) => food.name)),
+          trace,
           nextStep: "Use update_custom_food with foodId/name to edit an existing food, or call create_custom_food with duplicatePolicy=create_new if a duplicate is intentional.",
         }, "A custom food with this name already exists. Refusing to create a duplicate by default.");
       }
@@ -637,23 +644,28 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           input: safeInput(input),
           duplicatePolicy,
           existingFoods: existing.targets,
+          trace,
           nextStep: "More than one matching custom food exists. Call update_custom_food with a specific foodId.",
         }, "Cannot update existing because multiple matching custom foods were found.");
       }
 
       const openedExisting = shouldUpdateExisting ? await openCustomFoodTarget(page, existing.targets[0]) : false;
       const openedCreateForm = openedExisting || await clickByText(page, /^CREATE FOOD$/i);
+      traceStep("editor_opened", { openedExisting, openedCreateForm });
       if (!openedCreateForm) {
         const visibleText = compactText(await this.visibleText(page), 10000);
-        return this.result("create_custom_food", "needs_manual_step", { input: safeInput(input), visibleText }, "Could not find an existing custom food or CREATE FOOD.");
+        return this.result("create_custom_food", "needs_manual_step", { input: safeInput(input), trace, visibleText }, "Could not find an existing custom food or CREATE FOOD.");
       }
 
       await page.waitForTimeout(1200);
       const nameFilled = await fillCustomFoodName(page, input.name);
       const serving = await fillCustomFoodServing(page, input.servingSize);
+      traceStep("basics_filled", { nameFilled, servingWarning: serving.warning });
       const nutrients = await fillCustomFoodNutrients(page, input.nutrients ?? {});
+      traceStep("nutrients_filled", summarizeFillResults(nutrients));
 
       const saved = await clickByText(page, /^SAVE CHANGES$/i);
+      traceStep("save_clicked", { saved });
       if (!saved) {
         return this.result(
           "create_custom_food",
@@ -663,6 +675,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
             nameFilled,
             serving,
             nutrients,
+            trace,
             visibleText: compactText(await this.visibleText(page), 12000),
           },
           "Filled the custom food form but could not find Save Changes.",
@@ -677,6 +690,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       await this.openApp(page, "#custom-foods");
       const listText = await this.visibleText(page);
       const listed = textHasFoodName(listText, input.name);
+      traceStep("listed_checked", { listed, confirmationClicked });
       return this.result(
         "create_custom_food",
         listed ? "ok" : "needs_manual_step",
@@ -691,6 +705,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           nutrients,
           confirmationClicked,
           afterSaveText,
+          trace,
           visibleText: compactText(listText, 12000),
         },
         listed ? undefined : "Clicked Save Changes, but the custom food was not found in the Custom Foods list afterward.",
@@ -3092,7 +3107,7 @@ function customFoodNutrientEntries(nutrients: Record<string, number>) {
 
 async function fillCustomFoodNutrient(page: Page, label: string, value: number) {
   await scrollNutrientRowIntoView(page, label);
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(60);
   const cellBox = await nutrientAmountCellBox(page, label);
   if (!cellBox) {
     const fallback = await fillNutritionLabelNutrient(page, label, value);
@@ -3105,7 +3120,7 @@ async function fillCustomFoodNutrient(page: Page, label: string, value: number) 
   if (!clickedCellBox) {
     await page.mouse.click(cellBox.x + cellBox.width / 2, cellBox.y + cellBox.height / 2);
   }
-  await page.waitForTimeout(450);
+  await page.waitForTimeout(100);
 
   const input = await focusedOrNearestInput(page, clickedCellBox ?? cellBox, ["input.number-box:visible"])
     ?? await newestVisibleInputIfAdded(page, ["input.number-box:visible"], inputCountsBeforeClick);
@@ -3117,7 +3132,7 @@ async function fillCustomFoodNutrient(page: Page, label: string, value: number) 
 
   await input.fill(String(value));
   await page.keyboard.press("Enter").catch(() => undefined);
-  await page.waitForTimeout(550);
+  await page.waitForTimeout(120);
 
   const rowText = await nutrientRowText(page, label);
   const verified = rowTextIncludesValue(rowText, value);
@@ -3140,7 +3155,7 @@ async function fillNutritionLabelNutrient(page: Page, label: string, value: numb
   const selectors = ["input.number-box:visible", "input.text-box:visible"];
   const inputCountsBeforeClick = await visibleInputCounts(page, selectors);
   await page.mouse.click(cellBox.x + cellBox.width / 2, cellBox.y + cellBox.height / 2);
-  await page.waitForTimeout(450);
+  await page.waitForTimeout(100);
   const input = await focusedOrNearestInput(page, cellBox, selectors)
     ?? await newestVisibleInputIfAdded(page, selectors, inputCountsBeforeClick);
   if (!input) {
@@ -3152,7 +3167,7 @@ async function fillNutritionLabelNutrient(page: Page, label: string, value: numb
     return { status: "not_found" as const, warning: `Could not fill nutrition label input for ${nutritionLabel}.` };
   }
   await page.keyboard.press("Enter").catch(() => undefined);
-  await page.waitForTimeout(600);
+  await page.waitForTimeout(120);
 
   const labelText = await nutritionLabelText(page, nutritionLabel);
   const verified = rowTextIncludesValue(labelText, value);
@@ -3397,8 +3412,40 @@ function textHasFoodName(text: string, name: string) {
   return text.toLowerCase().includes(name.toLowerCase());
 }
 
+type CustomFoodTraceEntry = { step: string; elapsedMs: number; details: Record<string, unknown> };
 type RecipeTrace = (step: string, details?: Record<string, unknown>) => void;
 type RecipeTraceEntry = { step: string; elapsedMs: number; details: Record<string, unknown> };
+
+function logCustomFoodStep(foodName: string, startedAt: number, step: string, details: Record<string, unknown> = {}, entries?: CustomFoodTraceEntry[]) {
+  const elapsedMs = Date.now() - startedAt;
+  entries?.push({ step, elapsedMs, details });
+  if (entries && entries.length > 50) entries.splice(0, entries.length - 50);
+  try {
+    console.log(JSON.stringify({
+      feature: "create_custom_food",
+      foodName,
+      step,
+      elapsedMs,
+      ...details,
+    }));
+  } catch {
+    // Logging must never affect Cronometer writes.
+  }
+}
+
+function summarizeFillResults(results: Array<{ status?: string; warning?: string }>) {
+  const counts = new Map<string, number>();
+  let warningCount = 0;
+  for (const result of results) {
+    counts.set(result.status ?? "unknown", (counts.get(result.status ?? "unknown") ?? 0) + 1);
+    if (result.warning) warningCount += 1;
+  }
+  return {
+    total: results.length,
+    warningCount,
+    statuses: Object.fromEntries(counts.entries()),
+  };
+}
 
 function logRecipeStep(recipeName: string, startedAt: number, step: string, details: Record<string, unknown> = {}, entries?: RecipeTraceEntry[]) {
   const elapsedMs = Date.now() - startedAt;
@@ -3486,6 +3533,9 @@ async function resolveCustomFoodTargets(page: Page, selector: CustomFoodSelector
   const names = parseCustomItemListNames(rawText, "Custom Foods");
   const query = selector.name;
   const matchingNames = query ? exactOrFuzzyCustomItemNames(names, query) : names;
+  if (query && matchingNames.length === 0 && !selector.foodId) {
+    return { names, targets: [] };
+  }
   const candidateNames = query && matchingNames.length === 0 ? [query] : matchingNames;
   const details = await customFoodDetailsForNames(page, candidateNames, options.maxDetails);
   const targets = details.filter((detail) => {
