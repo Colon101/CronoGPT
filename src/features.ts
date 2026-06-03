@@ -240,7 +240,7 @@ export const FEATURE_DEFINITIONS: FeatureDefinition[] = [
     title: "Create custom recipe",
     preferredBackend: "browser",
     supportedModes: ["mock"],
-    notes: "Recipe importer may require Gold. Browser selectors must be verified.",
+    notes: "Creates recipes through the browser UI; straightforward ingredients can be auto-selected from high-confidence official Cronometer matches.",
   },
   {
     id: "update_custom_recipe",

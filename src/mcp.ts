@@ -390,7 +390,7 @@ export function createCronoServer() {
   register(
     "resolve_recipe_ingredients",
     "Resolve recipe ingredients",
-    "Searches Cronometer for each recipe ingredient so ChatGPT can map recipe text to exact foods and sources before creating a custom recipe.",
+    "Optionally searches Cronometer for each recipe ingredient when the user wants to review exact food/source choices before creating a custom recipe. For a small straightforward recipe, create_recipe can be called directly with ingredient query, amount, unit, confirmed=true, and dryRun=false.",
     {
       recipeName: z.string().optional(),
       ingredients: z.array(
@@ -619,7 +619,7 @@ export function createCronoServer() {
   register(
     "create_recipe",
     "Create recipe",
-    "Creates a custom Cronometer recipe after validation and confirmation. Use selectedName and selectedSource from resolve_recipe_ingredients for each ingredient; ambiguous search results are returned without writing.",
+    "Creates and verifies a custom Cronometer recipe after user confirmation. For straightforward ingredients, pass query, amount, and unit directly; the browser provider auto-selects high-confidence official Cronometer matches. Use selectedName and selectedSource only when the user or resolve_recipe_ingredients picked a specific match. Ambiguous low-confidence searches are returned without writing.",
     {
       name: z.string().min(1),
       ingredients: z.array(

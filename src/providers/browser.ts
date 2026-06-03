@@ -89,6 +89,16 @@ interface CustomRecipeDetail {
   name: string;
   listIndex?: number;
   occurrence?: number;
+  servingName?: string;
+  servings?: number;
+  ingredients?: Array<{
+    name: string;
+    database?: string;
+    amount?: number;
+    unit?: string;
+    energyKcal?: number;
+    weight?: string;
+  }>;
   rawText?: string;
 }
 
@@ -945,9 +955,12 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         if (added.status !== "ok") break;
       }
 
+      const allAdded = addedIngredients.every((item) => item.status === "ok");
+      trace("refill_basics_start", { allAdded });
+      const refilledBasics = allAdded ? await fillRecipeBasics(page, input) : undefined;
+      trace("refill_basics_done", refilledBasics);
       trace("read_visible_text_start");
       const visibleText = await this.visibleText(page);
-      const allAdded = addedIngredients.every((item) => item.status === "ok");
       const nameVisible = visibleText.toLowerCase().includes(input.name.toLowerCase());
       trace("read_visible_text_done", { allAdded, nameVisible });
       const saveClicked = allAdded && nameVisible
@@ -956,6 +969,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       trace("save_click_done", { saveClicked });
       let postSaveText = "";
       let finalDetail: CustomRecipeDetail | undefined;
+      let listVerified = false;
       if (saveClicked) {
         trace("post_save_wait_start");
         await page.waitForTimeout(1200);
@@ -965,21 +979,30 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         finalDetail = await extractCustomRecipeDetail(page).catch(() => undefined);
         postSaveText = await this.visibleText(page).catch(() => "");
         trace("extract_final_detail_done", { finalDetailName: finalDetail?.name, hasPostSaveText: Boolean(postSaveText) });
+        trace("list_verify_start");
+        listVerified = await customRecipeExistsInList(page, input.name, this.config.navigationTimeoutMs).catch(() => false);
+        trace("list_verify_done", { listVerified });
       }
 
       const editorVerified = Boolean(finalDetail?.name.toLowerCase() === input.name.toLowerCase() || textHasFoodName(postSaveText, input.name));
-      const ok = allAdded && nameVisible && saveClicked && editorVerified;
-      trace("result", { ok, allAdded, nameVisible, saveClicked, editorVerified });
+      const servingsVerified = recipeServingsVerified(finalDetail, input);
+      const ingredientsVerified = recipeIngredientsVerified(finalDetail, addedIngredients);
+      const ok = allAdded && nameVisible && saveClicked && editorVerified && listVerified && servingsVerified && ingredientsVerified;
+      trace("result", { ok, allAdded, nameVisible, saveClicked, editorVerified, listVerified, servingsVerified, ingredientsVerified });
       return this.result("create_recipe", ok ? "ok" : "needs_manual_step", {
         recipeName: input.name,
         basics,
+        refilledBasics,
         addedIngredients,
         saveClicked,
         editorVerified,
+        listVerified,
+        servingsVerified,
+        ingredientsVerified,
         finalDetail,
         postSaveText: postSaveText ? compactText(postSaveText, 8000) : undefined,
         visibleText: compactText(visibleText, 12000),
-      }, ok ? undefined : "Recipe editor opened, but the saved recipe could not be verified after clicking Save.");
+      }, ok ? undefined : "Recipe editor opened, but the saved recipe could not be fully verified after clicking Save.");
     });
   }
 
@@ -2421,7 +2444,8 @@ async function fillLikelyUnit(page: Page, unit?: string) {
 
   await unitButton.click({ timeout: 2500 }).catch(async () => unitButton.click({ timeout: 2500, force: true }));
   await waitForVisibleUnitOptions(page, 1800);
-  const clicked = await clickVisibleOptionByExactText(page, normalizedUnit)
+  const clicked = await clickVisibleUnitOption(page, normalizedUnit)
+    || await clickVisibleOptionByExactText(page, normalizedUnit)
     || await clickVisibleOptionByExactText(page, unitAliases(normalizedUnit)[0])
     || await clickVisibleControlByLabel(dialog, new RegExp(`^${escapeRegExp(normalizedUnit)}$`, "i"));
   if (clicked) {
@@ -2470,7 +2494,15 @@ async function currentRecipeUnitText(page: Page) {
 function unitTextAlreadyMatches(text: string, unit: string) {
   const normalizedText = text.replace(/\s+/g, " ").trim().toLowerCase();
   const normalizedUnit = unit.trim().toLowerCase();
-  return normalizedText === normalizedUnit || unitAliases(normalizedUnit).some((alias) => normalizedText === alias);
+  const labels = [normalizedUnit, ...unitAliases(normalizedUnit)];
+  return labels.some((label) =>
+    normalizedText === label ||
+    normalizedText.startsWith(`${label} `) ||
+    normalizedText.startsWith(`${label}—`) ||
+    normalizedText.startsWith(`${label} —`) ||
+    normalizedText.startsWith(`${label}-`) ||
+    normalizedText.startsWith(`${label} -`)
+  );
 }
 
 async function recipeUnitDropdownButton(page: Page) {
@@ -2530,11 +2562,58 @@ async function clickVisibleOptionByExactText(page: Page, value?: string) {
   return true;
 }
 
+async function clickVisibleUnitOption(page: Page, unit: string) {
+  const normalizedUnit = unit.replace(/\s+/g, " ").trim().toLowerCase();
+  const box = await page.evaluate((normalizedUnit) => {
+    const normalize = (text: string | null | undefined) => (text ?? "").replace(/\s+/g, " ").trim();
+    const aliases = (value: string) => {
+      if (value === "g") return ["gram", "grams"];
+      if (value === "oz") return ["ounce", "ounces"];
+      if (value === "ml") return ["milliliter", "milliliters", "millilitre", "millilitres"];
+      if (value === "tsp") return ["teaspoon", "teaspoons"];
+      if (value === "tbsp") return ["tablespoon", "tablespoons", "tbs"];
+      return [];
+    };
+    const matches = (text: string, unit: string) => {
+      const normalizedText = normalize(text).toLowerCase();
+      const labels = [unit, ...aliases(unit)];
+      return labels.some((label) =>
+        normalizedText === label ||
+        normalizedText.startsWith(`${label} `) ||
+        normalizedText.startsWith(`${label}—`) ||
+        normalizedText.startsWith(`${label} —`) ||
+        normalizedText.startsWith(`${label}-`) ||
+        normalizedText.startsWith(`${label} -`)
+      );
+    };
+    const isVisible = (element: Element) => {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    };
+    const candidates = Array.from(document.querySelectorAll("[role='option'],.dropdown-item,.dropdown-menu *,.popupContent *,.gwt-PopupPanel *,.select-popup *,li,button,div,td"))
+      .filter(isVisible)
+      .map((element) => {
+        const text = normalize(element.textContent);
+        const rect = element.getBoundingClientRect();
+        return { text, x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+      })
+      .filter((candidate) => candidate.text && matches(candidate.text, normalizedUnit))
+      .sort((a, b) => (a.width * a.height) - (b.width * b.height));
+    return candidates[0];
+  }, normalizedUnit).catch(() => undefined);
+  if (!box) return false;
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  return true;
+}
+
 function unitAliases(unit: string) {
   const normalized = unit.trim().toLowerCase();
   if (normalized === "g") return ["gram", "grams"];
   if (normalized === "oz") return ["ounce", "ounces"];
   if (normalized === "ml") return ["milliliter", "milliliters"];
+  if (normalized === "tsp") return ["teaspoon", "teaspoons"];
+  if (normalized === "tbsp") return ["tablespoon", "tablespoons", "tbs"];
   return [];
 }
 
@@ -3146,6 +3225,13 @@ async function resolveCustomRecipeTargets(page: Page, selector: CustomRecipeSele
   return { names, targets };
 }
 
+async function customRecipeExistsInList(page: Page, name: string, timeoutMs: number) {
+  await page.goto(`${CRONOMETER_ORIGIN}/#custom-recipes`).catch(() => undefined);
+  await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+  const rawText = await waitForCustomItemListText(page, "Custom Recipes", timeoutMs);
+  return parseCustomItemListNames(rawText, "Custom Recipes").some((candidate) => candidate.toLowerCase() === name.toLowerCase());
+}
+
 function exactOrFuzzyCustomItemNames(names: string[], query: string) {
   const normalizedQuery = query.toLowerCase();
   const exact = names.filter((name) => name.toLowerCase() === normalizedQuery);
@@ -3315,6 +3401,10 @@ async function extractCustomFoodDetail(page: Page): Promise<CustomFoodDetail | u
 async function extractCustomRecipeDetail(page: Page): Promise<CustomRecipeDetail | undefined> {
   return page.evaluate(() => {
     const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
+    const numberFromText = (value: string | null | undefined) => {
+      const match = normalize(value).match(/-?[0-9]+(?:\.[0-9]+)?/);
+      return match ? Number(match[0]) : undefined;
+    };
     const isVisible = (element: Element) => {
       const style = window.getComputedStyle(element);
       const rect = element.getBoundingClientRect();
@@ -3327,12 +3417,80 @@ async function extractCustomRecipeDetail(page: Page): Promise<CustomRecipeDetail
     const titleName = bodyText.match(/BACK TO RECIPE LIST\s+(.+?)\s+(?:ADD TO DIARY|more_horiz|Recipe #|Info)/i)?.[1];
     const name = normalize(nameInput?.value || titleName || "");
     if (!name) return undefined;
+
+    const editorInputs = Array.from(document.querySelectorAll("input.text-box, input.number-box"))
+      .filter((element): element is HTMLInputElement => element instanceof HTMLInputElement && isVisible(element))
+      .filter((element) => !String(element.className ?? "").includes("search-field"))
+      .filter((element) => !element.closest(".popupContent,.gwt-DialogBox,[role='dialog']"))
+      .map((element) => ({ element, rect: element.getBoundingClientRect() }))
+      .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x)
+      .map((candidate) => candidate.element);
+    const servingName = normalize(editorInputs[1]?.value) || undefined;
+    const servings = numberFromText(editorInputs[2]?.value);
+
+    const ingredients: Array<{
+      name: string;
+      database?: string;
+      amount?: number;
+      unit?: string;
+      energyKcal?: number;
+      weight?: string;
+    }> = [];
+    const tables = Array.from(document.querySelectorAll("table"));
+    for (const table of tables) {
+      const rows = Array.from(table.querySelectorAll("tr")).filter(isVisible);
+      const header = rows.find((row) => /Description/i.test(normalize(row.textContent)) && /\b(Database|Source)\b/i.test(normalize(row.textContent)) && /Amount/i.test(normalize(row.textContent)));
+      if (!header) continue;
+      for (const row of rows) {
+        if (row === header || row.classList.contains("table-header")) continue;
+        const cells = Array.from(row.querySelectorAll("td")).map((cell) => normalize(cell.textContent));
+        if (cells.length < 4) continue;
+        const ingredientName = cells[0];
+        if (!ingredientName || /^Description$/i.test(ingredientName)) continue;
+        ingredients.push({
+          name: ingredientName,
+          database: cells[1] || undefined,
+          amount: numberFromText(cells[2]),
+          unit: cells[3] || undefined,
+          energyKcal: numberFromText(cells[4]),
+          weight: cells[5] || undefined,
+        });
+      }
+      if (ingredients.length) break;
+    }
+
     return {
       recipeId,
       name,
+      servingName,
+      servings,
+      ingredients,
       rawText: bodyText.slice(0, 8000),
     };
   }).catch(() => undefined);
+}
+
+function recipeServingsVerified(detail: CustomRecipeDetail | undefined, input: RecipeInput) {
+  if (input.servings === undefined) return true;
+  if (detail?.servings === undefined) return false;
+  return Math.abs(detail.servings - input.servings) <= 0.000001;
+}
+
+function recipeIngredientsVerified(
+  detail: CustomRecipeDetail | undefined,
+  addedIngredients: Array<{ status?: string; selectedCandidate?: SearchResult; [key: string]: unknown }>,
+) {
+  const expected = addedIngredients
+    .filter((item) => item.status === "ok")
+    .map((item) => item.selectedCandidate?.name)
+    .filter((name): name is string => Boolean(name));
+  if (expected.length === 0) return true;
+  const actual = detail?.ingredients?.map((ingredient) => normalizeFoodName(ingredient.name)) ?? [];
+  if (actual.length < expected.length) return false;
+  return expected.every((name) => {
+    const normalized = normalizeFoodName(name);
+    return actual.some((candidate) => candidate === normalized || candidate.includes(normalized) || normalized.includes(candidate));
+  });
 }
 
 async function retireOpenCustomFood(page: Page, target: CustomFoodDetail, retiredName: string) {
@@ -3515,9 +3673,45 @@ function chooseRecipeIngredientCandidate(ingredient: RecipeInput["ingredients"][
   const exactQueryMatches = candidates.filter((candidate) => normalizeFoodName(candidate.name) === normalizeFoodName(ingredient.query));
   if (exactQueryMatches.length === 1) return exactQueryMatches[0];
   const officialExactMatches = exactQueryMatches.filter((candidate) => sourcePriority(candidate.source) >= 40);
-  if (officialExactMatches.length === 1) return officialExactMatches[0];
+  if (officialExactMatches.length > 0) return rankFoodResults(ingredient.query, officialExactMatches)[0];
+
+  const confident = confidentRecipeIngredientCandidate(ingredient.query, candidates);
+  if (confident) return confident;
 
   return undefined;
+}
+
+function confidentRecipeIngredientCandidate(query: string, candidates: SearchResult[]) {
+  const ranked = rankFoodResults(query, candidates);
+  const top = ranked[0];
+  if (!top) return undefined;
+
+  const normalizedQuery = normalizeFoodName(query);
+  const normalizedTop = normalizeFoodName(top.name);
+  const queryTokens = meaningfulFoodTokens(normalizedQuery);
+  const topTokens = meaningfulFoodTokens(normalizedTop);
+  const tokenCoverage = queryTokens.length > 0
+    ? queryTokens.filter((token) => topTokens.includes(token)).length / queryTokens.length
+    : 0;
+  const nameCoverage = topTokens.length > 0
+    ? topTokens.filter((token) => queryTokens.includes(token)).length / topTokens.length
+    : 0;
+  const topScore = foodResultScore(top, normalizedQuery);
+  const nextScore = ranked[1] ? foodResultScore(ranked[1], normalizedQuery) : -Infinity;
+  const official = sourcePriority(top.source) >= 40;
+
+  if (official && tokenCoverage >= 0.95) return top;
+  if (official && tokenCoverage >= 0.75 && nameCoverage >= 0.5 && topScore - nextScore >= 15) return top;
+  if (official && topScore - nextScore >= 35 && tokenCoverage >= 0.5) return top;
+  return undefined;
+}
+
+function meaningfulFoodTokens(value: string) {
+  return value
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length > 1)
+    .filter((token) => !/^(the|a|an|and|or|of|with|plain|fresh|raw|dry|dried|cooked|natural|organic)$/.test(token));
 }
 
 async function addRecipeIngredient(page: Page, ingredient: RecipeInput["ingredients"][number], options: { deadline?: number; trace?: RecipeTrace } = {}) {
@@ -3568,10 +3762,11 @@ async function addRecipeIngredient(page: Page, ingredient: RecipeInput["ingredie
   }
 
   options.trace?.("ingredient_row_wait_start", { selectedName: selectedCandidate.name });
-  await waitForRecipeSearchResultRow(page, selectedCandidate.name, ingredient.selectedSource, Math.min(6000, Math.max(700, (options.deadline ?? Date.now() + 6000) - Date.now() - 2500)));
+  const selectedSource = ingredient.selectedSource ?? selectedCandidate.source;
+  await waitForRecipeSearchResultRow(page, selectedCandidate.name, selectedSource, Math.min(6000, Math.max(700, (options.deadline ?? Date.now() + 6000) - Date.now() - 2500)));
   options.trace?.("ingredient_row_wait_done");
   options.trace?.("ingredient_row_select_start");
-  const selected = await selectRecipeIngredientSearchResult(page, selectedCandidate.name, ingredient.selectedSource);
+  const selected = await selectRecipeIngredientSearchResult(page, selectedCandidate.name, selectedSource);
   options.trace?.("ingredient_row_select_done", { selected });
   if (!selected) {
     const selectionDebug = await recipeIngredientSelectionDebug(page, selectedCandidate.name);
@@ -3585,12 +3780,6 @@ async function addRecipeIngredient(page: Page, ingredient: RecipeInput["ingredie
     return { status: "editor_not_opened", warning: "Selected ingredient result did not open the ingredient amount editor.", selectedCandidate };
   }
 
-  options.trace?.("ingredient_amount_fill_start");
-  const amount = await fillLikelyAmount(page, ingredient.amount, selectedCandidate.name);
-  options.trace?.("ingredient_amount_fill_done", { filled: amount?.filled, skipped: amount?.skipped });
-  if (amount?.filled === false) {
-    return { status: "amount_not_filled", warning: amount.warning ?? "Ingredient amount input was not found.", selectedCandidate, amount };
-  }
   options.trace?.("ingredient_unit_fill_start");
   const unit = await fillLikelyUnit(page, ingredient.unit);
   options.trace?.("ingredient_unit_fill_done", { filled: unit?.filled, skipped: unit?.skipped, strategy: unit?.strategy });
@@ -3599,7 +3788,15 @@ async function addRecipeIngredient(page: Page, ingredient: RecipeInput["ingredie
     : undefined;
   if (convertedAmount) options.trace?.("ingredient_unit_convert_done", { converted: convertedAmount.converted });
   if (unit?.filled === false && convertedAmount?.converted !== true) {
-    return { status: "unit_not_found", warning: unit.warning ?? convertedAmount?.warning ?? "Ingredient unit could not be selected or converted safely.", selectedCandidate, amount, unit, convertedAmount };
+    return { status: "unit_not_found", warning: unit.warning ?? convertedAmount?.warning ?? "Ingredient unit could not be selected or converted safely.", selectedCandidate, unit, convertedAmount };
+  }
+  options.trace?.("ingredient_amount_fill_start");
+  const amount = convertedAmount?.converted === true
+    ? convertedAmount.amount
+    : await fillLikelyAmount(page, ingredient.amount, selectedCandidate.name);
+  options.trace?.("ingredient_amount_fill_done", { filled: amount?.filled, skipped: amount?.skipped });
+  if (amount?.filled === false) {
+    return { status: "amount_not_filled", warning: amount.warning ?? "Ingredient amount input was not found.", selectedCandidate, amount, unit, convertedAmount };
   }
 
   options.trace?.("ingredient_confirm_add_start");
