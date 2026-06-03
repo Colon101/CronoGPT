@@ -1336,13 +1336,13 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private async openApp(page: Page, hash = "") {
-    await page.goto(`${CRONOMETER_ORIGIN}/${hash}`);
+    await page.goto(`${CRONOMETER_ORIGIN}/${hash}`, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs });
     await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
     await page.waitForTimeout(1200);
     if (await this.isLoggedIn(page)) return;
 
     await this.login(page);
-    await page.goto(`${CRONOMETER_ORIGIN}/${hash}`);
+    await page.goto(`${CRONOMETER_ORIGIN}/${hash}`, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs });
     await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
     await page.waitForTimeout(1200);
     if (!(await this.isLoggedIn(page))) {
@@ -1356,7 +1356,13 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       throw new Error(`Cronometer login is paused for ${waitSeconds}s to avoid more rate-limit attempts. Last failure: ${lastLoginFailure ?? "unknown"}`);
     }
 
-    await page.goto(`${CRONOMETER_ORIGIN}/login/`);
+    await page.context().clearCookies().catch(() => undefined);
+    await page.goto(`${CRONOMETER_ORIGIN}/login/`, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs });
+    await page.evaluate(() => {
+      localStorage.clear();
+      sessionStorage.clear();
+    }).catch(() => undefined);
+    await page.goto(`${CRONOMETER_ORIGIN}/login/`, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs });
     await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
     await page.waitForTimeout(600);
 
@@ -1372,8 +1378,27 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       throw new Error("Missing CRONOMETER_EMAIL/CRONOMETER_PASSWORD.");
     }
 
-    await page.getByLabel(/email/i).fill(this.config.email);
-    await page.getByLabel(/password/i).fill(this.config.password);
+    const emailInput = await waitForFirstVisibleLocator(page, [
+      page.getByLabel(/email/i),
+      page.locator("#username"),
+      page.locator('input[name="username"]'),
+      page.locator('input[type="email"]'),
+      page.getByPlaceholder(/email/i),
+    ], this.config.navigationTimeoutMs);
+    const passwordInput = await waitForFirstVisibleLocator(page, [
+      page.getByLabel(/^password$/i),
+      page.locator("#password"),
+      page.locator('input[name="password"]'),
+      page.locator('input[type="password"]'),
+      page.getByPlaceholder(/password/i),
+    ], this.config.navigationTimeoutMs);
+    if (!emailInput || !passwordInput) {
+      const loginText = compactText(await this.visibleText(page).catch(() => ""), 2000);
+      throw new Error(`Cronometer login form did not render expected fields. Visible text: ${loginText}`);
+    }
+
+    await emailInput.fill(this.config.email);
+    await passwordInput.fill(this.config.password);
     await page.getByRole("button", { name: /log in/i }).click();
     await page.waitForTimeout(3500);
 
@@ -3993,6 +4018,16 @@ async function firstVisibleLocator(page: Page, locators: ReturnType<Page["locato
     const candidate = locator.first();
     if (!(await candidate.isVisible().catch(() => false))) continue;
     return candidate;
+  }
+  return undefined;
+}
+
+async function waitForFirstVisibleLocator(page: Page, locators: ReturnType<Page["locator"]>[], timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const candidate = await firstVisibleLocator(page, locators);
+    if (candidate) return candidate;
+    await page.waitForTimeout(Math.min(500, Math.max(0, deadline - Date.now())));
   }
   return undefined;
 }
