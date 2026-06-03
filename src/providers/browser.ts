@@ -118,6 +118,7 @@ interface ParsedStorageState {
 }
 
 const CRONOMETER_ORIGIN = "https://cronometer.com";
+const BROWSER_VIEWPORT = { width: 1280, height: 900 };
 const DIARY_MEAL_SECTION_RE = /\b(Breakfast|Lunch|Dinner|Snacks|Supplements)\b/i;
 const MAX_DIARY_ARROW_DAYS = 45;
 const CRONOMETER_PAGE_HASHES = {
@@ -1533,7 +1534,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       : await this.launchLocalChromium();
     if (this.config.remoteWsEndpoint && this.config.reuseRemoteContext) {
       const context = browser.contexts()[0] ?? await browser.newContext({
-        viewport: { width: 1440, height: 1100 },
+        viewport: BROWSER_VIEWPORT,
         locale: "en-US",
         storageState: this.storageState(),
       });
@@ -1546,7 +1547,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     if (!this.config.remoteWsEndpoint && this.config.reuseLocalBrowser) {
       await this.closeCachedLocalSession();
       const context = await browser.newContext({
-        viewport: { width: 1440, height: 1100 },
+        viewport: BROWSER_VIEWPORT,
         locale: "en-US",
         storageState: this.storageState(),
       });
@@ -1558,7 +1559,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     }
 
     const context = await browser.newContext({
-      viewport: { width: 1440, height: 1100 },
+      viewport: BROWSER_VIEWPORT,
       locale: "en-US",
       storageState: this.storageState(),
     });
@@ -1638,7 +1639,26 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   private async launchLocalChromium() {
     return chromium.launch({
       executablePath: this.config.chromiumExecutablePath,
-      args: ["--disable-dev-shm-usage", "--disable-gpu", "--no-sandbox"],
+      args: [
+        "--disable-background-networking",
+        "--disable-client-side-phishing-detection",
+        "--disable-component-update",
+        "--disable-default-apps",
+        "--disable-dev-shm-usage",
+        "--disable-extensions",
+        "--disable-gpu",
+        "--disable-hang-monitor",
+        "--disable-popup-blocking",
+        "--disable-prompt-on-repost",
+        "--disable-sync",
+        "--metrics-recording-only",
+        "--mute-audio",
+        "--no-first-run",
+        "--no-sandbox",
+        "--no-zygote",
+        "--password-store=basic",
+        "--use-mock-keychain",
+      ],
       headless: true,
       timeout: this.config.navigationTimeoutMs,
     });
