@@ -905,19 +905,28 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     }
 
     return this.withPage("create_recipe", async (page) => {
+      const startedAt = Date.now();
+      const trace: RecipeTrace = (step, details) => logRecipeStep(input.name, startedAt, step, details);
       const deadline = Date.now() + Math.max(30000, Math.min(this.config.operationTimeoutMs - 15000, 900000));
+      trace("open_app_start", { ingredientCount: input.ingredients.length });
       await this.openApp(page, "#custom-recipes");
+      trace("open_app_done");
+      trace("create_button_click_start");
       const opened = await clickByText(page, /^CREATE RECIPE$/i);
+      trace("create_button_click_done", { opened });
       if (!opened) {
         return this.result("create_recipe", "needs_manual_step", { input: safeInput(input) }, "Could not find CREATE RECIPE.");
       }
 
       await page.waitForTimeout(450);
+      trace("fill_basics_start");
       const basics = await fillRecipeBasics(page, input);
+      trace("fill_basics_done", basics);
 
       const addedIngredients = [];
       for (const [index, ingredient] of input.ingredients.entries()) {
         if (Date.now() > deadline - 4500) {
+          trace("ingredient_budget_exhausted", { ingredientIndex: index });
           return this.result("create_recipe", "needs_manual_step", {
             recipeName: input.name,
             basics,
@@ -926,29 +935,41 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
             visibleText: compactText(await this.visibleText(page).catch(() => ""), 10000),
           }, "Stopped before the hosted operation budget expired. Retry with the remaining ingredients or use fewer ingredients per call.");
         }
-        const added = await addRecipeIngredient(page, ingredient, { deadline });
+        trace("ingredient_start", { ingredientIndex: index });
+        const added = await addRecipeIngredient(page, ingredient, {
+          deadline,
+          trace: (step, details) => trace(step, { ingredientIndex: index, ...details }),
+        });
+        trace("ingredient_done", { ingredientIndex: index, status: added.status });
         addedIngredients.push({ ingredient, ...added });
         if (added.status !== "ok") break;
       }
 
+      trace("read_visible_text_start");
       const visibleText = await this.visibleText(page);
       const allAdded = addedIngredients.every((item) => item.status === "ok");
       const nameVisible = visibleText.toLowerCase().includes(input.name.toLowerCase());
+      trace("read_visible_text_done", { allAdded, nameVisible });
       const saveClicked = allAdded && nameVisible
-        ? await clickByText(page, /^SAVE CHANGES$/i) || await clickByText(page, /^SAVE$/i)
+        ? (trace("save_click_start"), await clickByText(page, /^SAVE CHANGES$/i) || await clickByText(page, /^SAVE$/i))
         : false;
+      trace("save_click_done", { saveClicked });
       let postSaveText = "";
       let finalDetail: CustomRecipeDetail | undefined;
       if (saveClicked) {
+        trace("post_save_wait_start");
         await page.waitForTimeout(1200);
         await clickOptionalSaveConfirmation(page).catch(() => false);
         await page.waitForTimeout(1000);
+        trace("extract_final_detail_start");
         finalDetail = await extractCustomRecipeDetail(page).catch(() => undefined);
         postSaveText = await this.visibleText(page).catch(() => "");
+        trace("extract_final_detail_done", { finalDetailName: finalDetail?.name, hasPostSaveText: Boolean(postSaveText) });
       }
 
       const editorVerified = Boolean(finalDetail?.name.toLowerCase() === input.name.toLowerCase() || textHasFoodName(postSaveText, input.name));
       const ok = allAdded && nameVisible && saveClicked && editorVerified;
+      trace("result", { ok, allAdded, nameVisible, saveClicked, editorVerified });
       return this.result("create_recipe", ok ? "ok" : "needs_manual_step", {
         recipeName: input.name,
         basics,
@@ -2993,6 +3014,22 @@ function textHasFoodName(text: string, name: string) {
   return text.toLowerCase().includes(name.toLowerCase());
 }
 
+type RecipeTrace = (step: string, details?: Record<string, unknown>) => void;
+
+function logRecipeStep(recipeName: string, startedAt: number, step: string, details: Record<string, unknown> = {}) {
+  try {
+    console.log(JSON.stringify({
+      feature: "create_recipe",
+      recipeName,
+      step,
+      elapsedMs: Date.now() - startedAt,
+      ...details,
+    }));
+  } catch {
+    // Logging must never affect Cronometer writes.
+  }
+}
+
 function parseCustomItemListNames(rawText: string, sectionTitle: string) {
   const lines = rawText.split(/\n+/).map((line) => line.trim()).filter(Boolean);
   const startIndex = Math.max(
@@ -3483,28 +3520,43 @@ function chooseRecipeIngredientCandidate(ingredient: RecipeInput["ingredients"][
   return undefined;
 }
 
-async function addRecipeIngredient(page: Page, ingredient: RecipeInput["ingredients"][number], options: { deadline?: number } = {}) {
+async function addRecipeIngredient(page: Page, ingredient: RecipeInput["ingredients"][number], options: { deadline?: number; trace?: RecipeTrace } = {}) {
+  options.trace?.("ingredient_add_button_click_start");
   const clickedAdd = await clickByText(page, /^ADD INGREDIENTS$/i);
+  options.trace?.("ingredient_add_button_click_done", { clickedAdd });
   if (!clickedAdd) return { status: "add_button_not_found", warning: "ADD INGREDIENTS button was not found." };
 
+  options.trace?.("ingredient_search_input_wait_start");
   const search = await waitForFoodSearchInput(page, 2500);
+  options.trace?.("ingredient_search_input_wait_done", { found: Boolean(search) });
   if (!search) {
     return { status: "search_input_not_found", warning: "Ingredient search input was not found." };
   }
 
   const searchText = ingredient.selectedName ?? ingredient.query;
   await search.fill(searchText);
+  options.trace?.("ingredient_search_submit_start");
   const searched = await clickDialogButton(page, /^SEARCH$/i);
   if (!searched) await clickByText(page, /^SEARCH$/i);
+  options.trace?.("ingredient_search_submit_done", { searched });
+  options.trace?.("ingredient_search_result_wait_start");
   await waitForIngredientSearchResult(page, searchText, Math.min(8000, Math.max(1200, (options.deadline ?? Date.now() + 8000) - Date.now() - 2500)));
+  options.trace?.("ingredient_search_result_wait_done");
 
+  options.trace?.("ingredient_collect_results_start");
   const candidates = rankFoodResults(
     ingredient.query,
     await collectFoodSearchResults(page, 12),
     ingredient.selectedName,
     ingredient.selectedSource,
   );
+  options.trace?.("ingredient_collect_results_done", { candidateCount: candidates.length });
   const selectedCandidate = chooseRecipeIngredientCandidate(ingredient, candidates);
+  options.trace?.("ingredient_candidate_selected", {
+    selected: Boolean(selectedCandidate),
+    selectedName: selectedCandidate?.name,
+    selectedSource: selectedCandidate?.source,
+  });
   if (!selectedCandidate) {
     return {
       status: candidates.length > 0 ? "ambiguous_result" : "no_results",
@@ -3515,32 +3567,45 @@ async function addRecipeIngredient(page: Page, ingredient: RecipeInput["ingredie
     };
   }
 
+  options.trace?.("ingredient_row_wait_start", { selectedName: selectedCandidate.name });
   await waitForRecipeSearchResultRow(page, selectedCandidate.name, ingredient.selectedSource, Math.min(6000, Math.max(700, (options.deadline ?? Date.now() + 6000) - Date.now() - 2500)));
+  options.trace?.("ingredient_row_wait_done");
+  options.trace?.("ingredient_row_select_start");
   const selected = await selectRecipeIngredientSearchResult(page, selectedCandidate.name, ingredient.selectedSource);
+  options.trace?.("ingredient_row_select_done", { selected });
   if (!selected) {
     const selectionDebug = await recipeIngredientSelectionDebug(page, selectedCandidate.name);
     return { status: "result_not_selected", warning: "Could not select the exact searched ingredient row.", selectedCandidate, candidates, selectionDebug };
   }
 
+  options.trace?.("ingredient_editor_wait_start");
   const editorReady = await waitForRecipeIngredientEditor(page, 3500, selectedCandidate.name);
+  options.trace?.("ingredient_editor_wait_done", { editorReady });
   if (!editorReady) {
     return { status: "editor_not_opened", warning: "Selected ingredient result did not open the ingredient amount editor.", selectedCandidate };
   }
 
+  options.trace?.("ingredient_amount_fill_start");
   const amount = await fillLikelyAmount(page, ingredient.amount, selectedCandidate.name);
+  options.trace?.("ingredient_amount_fill_done", { filled: amount?.filled, skipped: amount?.skipped });
   if (amount?.filled === false) {
     return { status: "amount_not_filled", warning: amount.warning ?? "Ingredient amount input was not found.", selectedCandidate, amount };
   }
+  options.trace?.("ingredient_unit_fill_start");
   const unit = await fillLikelyUnit(page, ingredient.unit);
+  options.trace?.("ingredient_unit_fill_done", { filled: unit?.filled, skipped: unit?.skipped, strategy: unit?.strategy });
   const convertedAmount = unit?.filled === false
     ? await convertGramAmountForCurrentServingUnit(page, ingredient.amount, ingredient.unit, selectedCandidate.name)
     : undefined;
+  if (convertedAmount) options.trace?.("ingredient_unit_convert_done", { converted: convertedAmount.converted });
   if (unit?.filled === false && convertedAmount?.converted !== true) {
     return { status: "unit_not_found", warning: unit.warning ?? convertedAmount?.warning ?? "Ingredient unit could not be selected or converted safely.", selectedCandidate, amount, unit, convertedAmount };
   }
 
+  options.trace?.("ingredient_confirm_add_start");
   const added = await clickDialogButton(page, /^(ADD|ADD INGREDIENT|ADD TO RECIPE|ADD SERVING|SAVE|DONE|OK)$/i);
   const addVerified = added ? await waitForRecipeIngredientAdded(page, selectedCandidate.name, 3500) : false;
+  options.trace?.("ingredient_confirm_add_done", { added, addVerified });
   if (!added) return {
     status: "add_button_not_found",
     warning: "Could not find the ingredient add/save button after selecting amount.",
