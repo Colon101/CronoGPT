@@ -157,6 +157,9 @@ let lastLoginFailure: string | undefined;
 let browserQueue: Promise<void> = Promise.resolve();
 let activeBrowserJobs = 0;
 let queuedBrowserJobs = 0;
+let browserJobSeq = 0;
+let activeBrowserJob: { id: number; feature: string; startedAt: number } | undefined;
+const queuedBrowserJobEntries = new Map<number, { feature: string; enqueuedAt: number }>();
 let cachedLocalSession: BrowserSession | undefined;
 let cachedAccountVerification: { normalizedEmail: string; verifiedAt: number; source: string } | undefined;
 
@@ -229,6 +232,17 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       requireFoodConfirmation: this.config.requireFoodConfirmation,
       activeBrowserJobs,
       queuedBrowserJobs,
+      activeBrowserJob: activeBrowserJob
+        ? {
+          ...activeBrowserJob,
+          ageMs: now - activeBrowserJob.startedAt,
+        }
+        : undefined,
+      queuedBrowserJobSample: Array.from(queuedBrowserJobEntries.entries()).slice(0, 8).map(([id, job]) => ({
+        id,
+        feature: job.feature,
+        ageMs: now - job.enqueuedAt,
+      })),
       operationTimeoutMs: this.config.operationTimeoutMs,
       browserRetryCount: this.config.browserRetryCount,
       reuseLocalBrowser: this.config.reuseLocalBrowser,
@@ -1689,7 +1703,22 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       );
     }
 
-    return enqueueBrowserJob(() => this.withPageAttemptWithRetry(feature, handler));
+    return enqueueBrowserJob(
+      () => this.withPageAttemptWithRetry(feature, handler),
+      { feature, maxQueueWaitMs: this.featureQueueWaitTimeoutMs(feature) },
+    ).catch((error) => {
+      const message = error instanceof Error ? error.message : "Browser automation job failed before starting.";
+      return this.result(feature, "error", {
+        activeBrowserJobs,
+        queuedBrowserJobs,
+        activeBrowserJob,
+        queuedBrowserJobSample: Array.from(queuedBrowserJobEntries.entries()).slice(0, 8).map(([id, job]) => ({
+          id,
+          feature: job.feature,
+          ageMs: Date.now() - job.enqueuedAt,
+        })),
+      }, message, "browser");
+    });
   }
 
   private async withPageAttemptWithRetry(feature: string, handler: (page: Page) => Promise<ProviderResult>): Promise<ProviderResult> {
@@ -1747,6 +1776,12 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       return Math.min(timeoutMs, 120000);
     }
     return timeoutMs;
+  }
+
+  private featureQueueWaitTimeoutMs(feature: string) {
+    if (/^(create_recipe|update_custom_recipe|resolve_recipe_ingredients)$/.test(feature)) return 45000;
+    if (/^(list_custom_recipes|list_custom_foods|list_custom_meals)$/.test(feature)) return 20000;
+    return 30000;
   }
 
   private async newSession(): Promise<BrowserSession> {
@@ -2108,21 +2143,54 @@ function serializeTextMatcher(label: string | RegExp) {
   };
 }
 
-async function enqueueBrowserJob<T>(task: () => Promise<T>): Promise<T> {
+async function enqueueBrowserJob<T>(
+  task: () => Promise<T>,
+  options: { feature: string; maxQueueWaitMs: number },
+): Promise<T> {
+  const id = ++browserJobSeq;
+  const enqueuedAt = Date.now();
+  let started = false;
+  let canceled = false;
+  let dequeued = false;
   queuedBrowserJobs += 1;
-  const run = browserQueue
-    .catch(() => undefined)
-    .then(async () => {
-      queuedBrowserJobs -= 1;
-      activeBrowserJobs += 1;
-      try {
-        return await task();
-      } finally {
-        activeBrowserJobs -= 1;
-      }
-    });
-  browserQueue = run.then(() => undefined, () => undefined);
-  return run;
+  queuedBrowserJobEntries.set(id, { feature: options.feature, enqueuedAt });
+
+  const dequeue = () => {
+    if (dequeued) return;
+    dequeued = true;
+    queuedBrowserJobs = Math.max(0, queuedBrowserJobs - 1);
+    queuedBrowserJobEntries.delete(id);
+  };
+
+  const result = new Promise<T>((resolve, reject) => {
+    const queueTimer = setTimeout(() => {
+      if (started) return;
+      canceled = true;
+      dequeue();
+      reject(new Error(`Timed out waiting ${options.maxQueueWaitMs}ms for the Cronometer browser queue before starting ${options.feature}. Try again after the active browser job finishes.`));
+    }, options.maxQueueWaitMs);
+
+    browserQueue = browserQueue
+      .catch(() => undefined)
+      .then(async () => {
+        if (canceled) return;
+        started = true;
+        clearTimeout(queueTimer);
+        dequeue();
+        activeBrowserJobs += 1;
+        activeBrowserJob = { id, feature: options.feature, startedAt: Date.now() };
+        try {
+          resolve(await task());
+        } catch (error) {
+          reject(error);
+        } finally {
+          activeBrowserJobs = Math.max(0, activeBrowserJobs - 1);
+          if (activeBrowserJob?.id === id) activeBrowserJob = undefined;
+        }
+      });
+  });
+
+  return result;
 }
 
 async function blockHeavyBrowserAssets(page: Page) {
