@@ -138,11 +138,17 @@ export async function handleOAuthRequest(req: IncomingMessage, res: ServerRespon
 
   if (req.method === "POST" && url.pathname === "/oauth/register") {
     const body = await readRequestBody(req);
-    const registration = body ? parseJsonBody(body) : {};
+    const registration = body ? parseJsonObject(body) : {};
+    const redirectUris = stringArray(registration.redirect_uris);
+    logOAuth(req, "register", {
+      redirect_count: redirectUris.length,
+      redirect_uris: summarizeUrlList(redirectUris),
+    });
     writeJson(res, {
       client_id: `cronogpt-${base64Url(randomBytes(18))}`,
       client_id_issued_at: Math.floor(Date.now() / 1000),
-      redirect_uris: Array.isArray(registration.redirect_uris) ? registration.redirect_uris : [],
+      client_name: typeof registration.client_name === "string" ? registration.client_name : "ChatGPT",
+      redirect_uris: redirectUris,
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
       token_endpoint_auth_method: "none",
@@ -152,7 +158,9 @@ export async function handleOAuthRequest(req: IncomingMessage, res: ServerRespon
   }
 
   if (req.method === "GET" && url.pathname === "/oauth/authorize") {
-    renderAuthorizeForm(req, res, Object.fromEntries(url.searchParams.entries()));
+    const params = Object.fromEntries(url.searchParams.entries());
+    logOAuth(req, "authorize_form", oauthParamLogDetails(req, params));
+    renderAuthorizeForm(req, res, params);
     return true;
   }
 
@@ -165,7 +173,7 @@ export async function handleOAuthRequest(req: IncomingMessage, res: ServerRespon
   if (req.method === "POST" && url.pathname === "/oauth/token") {
     const body = await readRequestBody(req);
     const params = req.headers["content-type"]?.includes("application/json")
-      ? parseJsonBody(body)
+      ? parseJsonParams(body)
       : parseFormBody(body);
     handleTokenRequest(req, res, params);
     return true;
@@ -196,7 +204,6 @@ function authorizationServerMetadata(req: IncomingMessage) {
     grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
-    client_id_metadata_document_supported: true,
     scopes_supported: SCOPES,
   };
 }
@@ -204,21 +211,25 @@ function authorizationServerMetadata(req: IncomingMessage) {
 function handleAuthorizePost(req: IncomingMessage, res: ServerResponse, params: Record<string, string>) {
   const linkSecret = getLinkSecret();
   if (!linkSecret) {
+    logOAuth(req, "authorize_error", { ...oauthParamLogDetails(req, params), reason: "missing_link_secret" });
     renderAuthorizeForm(req, res, params, "cronogpt link secret is not configured.", 500);
     return;
   }
 
   if (!params.link_secret || !safeEqual(params.link_secret, linkSecret)) {
+    logOAuth(req, "authorize_error", { ...oauthParamLogDetails(req, params), reason: "invalid_link_secret" });
     renderAuthorizeForm(req, res, params, "Invalid cronogpt link code.", 401);
     return;
   }
 
   if (params.response_type !== "code" || !params.client_id || !params.redirect_uri) {
+    logOAuth(req, "authorize_error", { ...oauthParamLogDetails(req, params), reason: "missing_authorize_params" });
     oauthError(res, 400, "invalid_request", "Missing response_type, client_id, or redirect_uri.");
     return;
   }
 
   if (!isAllowedRedirect(params.redirect_uri, req)) {
+    logOAuth(req, "authorize_error", { ...oauthParamLogDetails(req, params), reason: "redirect_not_allowed" });
     oauthError(res, 400, "invalid_request", "Redirect URI is not allowed.");
     return;
   }
@@ -243,58 +254,91 @@ function handleAuthorizePost(req: IncomingMessage, res: ServerResponse, params: 
     redirect.searchParams.set("state", params.state);
   }
 
+  logOAuth(req, "authorize_success", oauthParamLogDetails(req, params));
   res.writeHead(302, { location: redirect.toString() });
   res.end();
 }
 
 function handleTokenRequest(req: IncomingMessage, res: ServerResponse, params: Record<string, string>) {
+  logOAuth(req, "token_request", {
+    grant_type: params.grant_type,
+    client_id: summarizeClientId(params.client_id),
+    redirect_uri: summarizeUrl(params.redirect_uri),
+    has_code: Boolean(params.code),
+    has_code_verifier: Boolean(params.code_verifier),
+    has_refresh_token: Boolean(params.refresh_token),
+  });
+
   if (params.grant_type === "refresh_token") {
     handleRefreshToken(req, res, params);
     return;
   }
 
   if (params.grant_type !== "authorization_code" || !params.code || !params.redirect_uri) {
+    logOAuth(req, "token_error", { grant_type: params.grant_type, reason: "missing_authorization_code_params" });
     oauthError(res, 400, "invalid_request", "Expected authorization_code grant with code and redirect_uri.");
     return;
   }
 
   const code = verifySignedPayload(params.code, "code");
   if (!code) {
+    logOAuth(req, "token_error", { grant_type: params.grant_type, reason: "invalid_code" });
     oauthError(res, 400, "invalid_grant", "Authorization code is invalid or expired.");
     return;
   }
 
   if (code.redirect_uri !== params.redirect_uri || (params.client_id && code.client_id !== params.client_id)) {
+    logOAuth(req, "token_error", {
+      grant_type: params.grant_type,
+      reason: "code_request_mismatch",
+      client_id: summarizeClientId(params.client_id),
+      redirect_uri: summarizeUrl(params.redirect_uri),
+      code_redirect_uri: summarizeUrl(code.redirect_uri),
+    });
     oauthError(res, 400, "invalid_grant", "Authorization code does not match this token request.");
     return;
   }
 
   if (code.code_challenge) {
     if (code.code_challenge_method !== "S256" || !params.code_verifier) {
+      logOAuth(req, "token_error", { grant_type: params.grant_type, reason: "missing_pkce_verifier" });
       oauthError(res, 400, "invalid_grant", "PKCE verifier is required.");
       return;
     }
     if (!safeEqual(pkceChallenge(params.code_verifier), code.code_challenge)) {
+      logOAuth(req, "token_error", { grant_type: params.grant_type, reason: "pkce_mismatch" });
       oauthError(res, 400, "invalid_grant", "PKCE verifier does not match the authorization code.");
       return;
     }
   }
 
+  logOAuth(req, "token_success", {
+    grant_type: params.grant_type,
+    client_id: summarizeClientId(code.client_id),
+    audience: summarizeUrl(code.resource),
+  });
   writeTokenResponse(req, res, code.client_id, code.scope, code.resource);
 }
 
 function handleRefreshToken(req: IncomingMessage, res: ServerResponse, params: Record<string, string>) {
   if (!params.refresh_token) {
+    logOAuth(req, "token_error", { grant_type: params.grant_type, reason: "missing_refresh_token" });
     oauthError(res, 400, "invalid_request", "Missing refresh_token.");
     return;
   }
 
   const refresh = verifySignedPayload(params.refresh_token, "refresh");
   if (!refresh) {
+    logOAuth(req, "token_error", { grant_type: params.grant_type, reason: "invalid_refresh_token" });
     oauthError(res, 400, "invalid_grant", "Refresh token is invalid or expired.");
     return;
   }
 
+  logOAuth(req, "token_success", {
+    grant_type: params.grant_type,
+    client_id: summarizeClientId(refresh.client_id),
+    audience: summarizeUrl(refresh.aud),
+  });
   writeTokenResponse(req, res, refresh.client_id, refresh.scope, refresh.aud, false);
 }
 
@@ -427,7 +471,8 @@ function normalizeScope(scope?: string) {
 function isAllowedRedirect(redirectUri: string, req: IncomingMessage) {
   try {
     const redirect = new URL(redirectUri);
-    if (redirect.protocol === "https:" && redirect.hostname === "chatgpt.com") {
+    const chatgptHosts = new Set(["chatgpt.com", "chat.openai.com"]);
+    if (redirect.protocol === "https:" && chatgptHosts.has(redirect.hostname)) {
       return redirect.pathname.startsWith("/connector/oauth/") || redirect.pathname === "/connector_platform_oauth_redirect";
     }
     return process.env.NODE_ENV !== "production" && isLocalRequest(req) && redirect.hostname === "localhost";
@@ -452,13 +497,18 @@ function parseFormBody(body: string) {
   return Object.fromEntries(new URLSearchParams(body).entries());
 }
 
-function parseJsonBody(body: string) {
+function parseJsonObject(body: string) {
   try {
-    const parsed = JSON.parse(body || "{}") as Record<string, unknown>;
-    return Object.fromEntries(Object.entries(parsed).map(([key, value]) => [key, String(value)]));
+    const parsed = JSON.parse(body || "{}") as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
   } catch {
     return {};
   }
+}
+
+function parseJsonParams(body: string) {
+  const parsed = parseJsonObject(body);
+  return Object.fromEntries(Object.entries(parsed).map(([key, value]) => [key, String(value)]));
 }
 
 function writeJson(res: ServerResponse, data: unknown, status = 200, headers: Record<string, string> = {}) {
@@ -478,6 +528,75 @@ function safeEqual(a: string, b: string) {
   const first = Buffer.from(a);
   const second = Buffer.from(b);
   return first.length === second.length && timingSafeEqual(first, second);
+}
+
+function stringArray(value: unknown) {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function oauthParamLogDetails(req: IncomingMessage, params: Record<string, string>) {
+  return {
+    response_type: params.response_type,
+    client_id: summarizeClientId(params.client_id),
+    redirect_uri: summarizeUrl(params.redirect_uri),
+    redirect_allowed: params.redirect_uri ? isAllowedRedirect(params.redirect_uri, req) : undefined,
+    has_code_challenge: Boolean(params.code_challenge),
+    code_challenge_method: params.code_challenge_method,
+    has_state: Boolean(params.state),
+    resource: summarizeUrl(params.resource),
+    scope: summarizeScope(params.scope),
+  };
+}
+
+function logOAuth(
+  req: IncomingMessage,
+  event: string,
+  details: Record<string, string | number | boolean | undefined>,
+) {
+  if (process.env.CRONOGPT_OAUTH_LOGGING === "0") return;
+
+  const safeDetails = Object.fromEntries(
+    Object.entries(details).filter(([, value]) => value !== undefined && value !== ""),
+  );
+  console.log(JSON.stringify({
+    area: "oauth",
+    event,
+    method: req.method,
+    path: req.url ? new URL(req.url, `http://${req.headers.host ?? "localhost"}`).pathname : undefined,
+    ...safeDetails,
+  }));
+}
+
+function summarizeClientId(value?: string) {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    return `${url.protocol}//${url.host}${url.pathname}`;
+  } catch {
+    // Client IDs created by /oauth/register are opaque strings, not URLs.
+  }
+  if (value.startsWith("cronogpt-")) return "registered-client";
+  return `client:${value.slice(0, 16)}`;
+}
+
+function summarizeUrl(value?: string) {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    return `${url.protocol}//${url.host}${url.pathname}`;
+  } catch {
+    return "invalid-url";
+  }
+}
+
+function summarizeUrlList(values: string[]) {
+  return values.map((value) => summarizeUrl(value)).filter(Boolean).join(",");
+}
+
+function summarizeScope(value?: string) {
+  if (!value) return undefined;
+  const requested = value.split(/\s+/).filter((scope) => SCOPES.includes(scope));
+  return requested.join(" ") || "unsupported-scope";
 }
 
 function base64Url(value: Buffer) {
