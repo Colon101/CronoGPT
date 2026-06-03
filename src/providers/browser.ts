@@ -3884,6 +3884,8 @@ function confidentRecipeIngredientCandidate(query: string, candidates: SearchRes
   if (official && tokenCoverage >= 0.95) return top;
   if (official && tokenCoverage >= 0.75 && nameCoverage >= 0.5 && topScore - nextScore >= 15) return top;
   if (official && topScore - nextScore >= 35 && tokenCoverage >= 0.5) return top;
+  if (tokenCoverage >= 0.95 && nameCoverage >= 0.5 && topScore - nextScore >= 20) return top;
+  if (tokenCoverage >= 0.95 && normalizedTop.startsWith(normalizedQuery) && topScore - nextScore >= 10) return top;
   return undefined;
 }
 
@@ -3931,6 +3933,7 @@ async function addRecipeIngredient(page: Page, ingredient: RecipeInput["ingredie
     selected: Boolean(selectedCandidate),
     selectedName: selectedCandidate?.name,
     selectedSource: selectedCandidate?.source,
+    topCandidates: selectedCandidate ? undefined : candidates.slice(0, 5),
   });
   if (!selectedCandidate) {
     return {
