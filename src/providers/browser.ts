@@ -4109,7 +4109,10 @@ function loginFailureReason(text: string) {
 
 function isLoggedInText(text: string) {
   if (/\bWelcome Back\b|\bLog In\b|\bSign Up\b|Too Many Attempts|captcha|robot|verify|Science-backed nutrition tracking|Sign Up For Free/i.test(text)) return false;
-  return /\bDashboard\b/i.test(text) && /\b(Diary|Trends|Foods)\b/i.test(text);
+  return (/\bDashboard\b/i.test(text) && /\b(Diary|Trends|Foods)\b/i.test(text))
+    || /\bCustom Recipes\b/i.test(text) && /\b(CREATE RECIPE|IMPORT RECIPE|Sorted by|BACK TO RECIPE LIST)\b/i.test(text)
+    || /\bCustom Foods\b/i.test(text) && /\b(CREATE FOOD|Sorted by|BACK TO FOODS LIST)\b/i.test(text)
+    || /\bEnergy Summary\b/i.test(text) && /\b(Nutrient Targets|Diary)\b/i.test(text);
 }
 
 function compactText(text: string, maxLength: number) {
