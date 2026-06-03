@@ -619,7 +619,7 @@ export function createCronoServer() {
   register(
     "create_recipe",
     "Create recipe",
-    "Creates and verifies a custom Cronometer recipe after user confirmation. For straightforward ingredients, pass query, amount, and unit directly; the browser provider auto-selects high-confidence official Cronometer matches. Use selectedName and selectedSource only when the user or resolve_recipe_ingredients picked a specific match. Ambiguous low-confidence searches are returned without writing.",
+    "Creates and verifies a private custom Cronometer recipe in the authenticated user's account after user confirmation. This does not publish, send, share, or write outside that private Cronometer account. For straightforward ingredients, pass query, amount, and unit directly; the browser provider auto-selects high-confidence official Cronometer matches. Use selectedName and selectedSource only when the user or resolve_recipe_ingredients picked a specific match. Ambiguous low-confidence searches are returned without writing.",
     {
       name: z.string().min(1),
       ingredients: z.array(
@@ -638,7 +638,7 @@ export function createCronoServer() {
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
     },
-    { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     async (args) => toMcpToolResponse(await provider.createRecipe(args as never)),
   );
 
@@ -654,7 +654,7 @@ export function createCronoServer() {
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
     },
-    { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     async (args) => toMcpToolResponse(await provider.deleteCustomRecipe(args as never)),
   );
 
@@ -682,7 +682,7 @@ export function createCronoServer() {
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
     },
-    { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     async (args) => toMcpToolResponse(await provider.updateCustomRecipe(args as never)),
   );
 
@@ -697,7 +697,7 @@ export function createCronoServer() {
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
     },
-    { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     async (args) => toMcpToolResponse(await provider.retireCustomRecipe(args as never)),
   );
 
