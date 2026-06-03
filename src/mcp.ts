@@ -49,7 +49,7 @@ const readToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer
 const writeToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read", "cronometer:write"] }];
 
 export function createCronoServer() {
-  const server = new McpServer({ name: "cronogpt", version: "0.1.2" });
+  const server = new McpServer({ name: "cronogpt", version: "0.1.3" });
 
   registerAppResource(
     server,
