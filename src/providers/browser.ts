@@ -1400,11 +1400,17 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     await emailInput.fill(this.config.email);
     await passwordInput.fill(this.config.password);
     await page.getByRole("button", { name: /log in/i }).click();
-    await page.waitForTimeout(3500);
+    await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
 
-    const afterLoginText = await this.visibleText(page);
+    const afterLoginText = await waitForVisibleText(
+      page,
+      (text) => isLoggedInText(text) || Boolean(loginFailureReason(text)),
+      this.config.navigationTimeoutMs,
+    );
     if (!(await this.isLoggedIn(page, afterLoginText))) {
-      const failure = loginFailureReason(afterLoginText) ?? "Cronometer login did not reach the app. Check credentials, CAPTCHA, or two-factor prompts.";
+      const visibleText = compactText(afterLoginText, 1600);
+      const failure = loginFailureReason(afterLoginText)
+        ?? `Cronometer login did not reach the app. Check credentials, CAPTCHA, or two-factor prompts. Visible text: ${visibleText}`;
       this.pauseLoginAttempts(failure);
       throw new Error(failure);
     }
@@ -1416,8 +1422,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   private async isLoggedIn(page: Page, text?: string) {
     const bodyText = text ?? (await this.visibleText(page).catch(() => ""));
-    if (/\bWelcome Back\b|\bLog In\b|\bSign Up\b|Too Many Attempts|captcha|robot|verify|Science-backed nutrition tracking|Sign Up For Free/i.test(bodyText)) return false;
-    return /\bDashboard\b/i.test(bodyText) && /\b(Diary|Trends|Foods)\b/i.test(bodyText);
+    return isLoggedInText(bodyText);
   }
 
   private pauseLoginAttempts(reason: string) {
@@ -4001,10 +4006,18 @@ function loginFailureReason(text: string) {
   if (/captcha|robot|verify|challenge|cloudflare/i.test(text)) {
     return "Cronometer is showing a bot/CAPTCHA verification challenge.";
   }
+  if (/One-Time Code|two.factor|2fa|verification code/i.test(text)) {
+    return "Cronometer is asking for a one-time code or two-factor verification.";
+  }
   if (/invalid|incorrect/i.test(text)) {
     return "Cronometer rejected the configured email or password.";
   }
   return undefined;
+}
+
+function isLoggedInText(text: string) {
+  if (/\bWelcome Back\b|\bLog In\b|\bSign Up\b|Too Many Attempts|captcha|robot|verify|Science-backed nutrition tracking|Sign Up For Free/i.test(text)) return false;
+  return /\bDashboard\b/i.test(text) && /\b(Diary|Trends|Foods)\b/i.test(text);
 }
 
 function compactText(text: string, maxLength: number) {
