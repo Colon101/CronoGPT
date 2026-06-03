@@ -1492,17 +1492,32 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           "browser",
         );
       }
-      session = await withTimeout(this.newSession(), this.config.operationTimeoutMs, `Timed out opening Cronometer browser session after ${this.config.operationTimeoutMs}ms.`);
-      const result = await withTimeout(handler(session.page), this.config.operationTimeoutMs, `Timed out running ${feature} after ${this.config.operationTimeoutMs}ms.`);
+      const operationTimeoutMs = this.featureOperationTimeoutMs(feature);
+      session = await withTimeout(this.newSession(), operationTimeoutMs, `Timed out opening Cronometer browser session after ${operationTimeoutMs}ms.`);
+      const result = await withTimeout(handler(session.page), operationTimeoutMs, `Timed out running ${feature} after ${operationTimeoutMs}ms.`);
       cachedStorageState = await session.context.storageState().catch(() => cachedStorageState);
       return result;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown browser automation error";
+      if (!this.config.remoteWsEndpoint && this.config.reuseLocalBrowser) {
+        await this.closeCachedLocalSession();
+      }
       return this.result(feature, "error", { attempt }, message, "browser");
     } finally {
       if (session?.closeContext !== false) await session?.context.close().catch(() => undefined);
       if (session?.closeBrowser !== false) await session?.browser.close().catch(() => undefined);
     }
+  }
+
+  private featureOperationTimeoutMs(feature: string) {
+    const timeoutMs = this.config.operationTimeoutMs;
+    if (/^(create_recipe|update_custom_recipe|resolve_recipe_ingredients)$/.test(feature)) {
+      return Math.min(timeoutMs, 210000);
+    }
+    if (/^(list_custom_recipes|list_custom_foods|list_custom_meals)$/.test(feature)) {
+      return Math.min(timeoutMs, 120000);
+    }
+    return timeoutMs;
   }
 
   private async newSession(): Promise<BrowserSession> {
