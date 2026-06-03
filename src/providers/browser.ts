@@ -132,6 +132,7 @@ const CRONOMETER_ORIGIN = "https://cronometer.com";
 const BROWSER_VIEWPORT = { width: 1024, height: 768 };
 const DIARY_MEAL_SECTION_RE = /\b(Breakfast|Lunch|Dinner|Snacks|Supplements)\b/i;
 const MAX_DIARY_ARROW_DAYS = 45;
+const ACCOUNT_VERIFICATION_TTL_MS = 10 * 60 * 1000;
 const CRONOMETER_PAGE_HASHES = {
   diary: "#diary",
   customFoods: "#custom-foods",
@@ -157,6 +158,7 @@ let browserQueue: Promise<void> = Promise.resolve();
 let activeBrowserJobs = 0;
 let queuedBrowserJobs = 0;
 let cachedLocalSession: BrowserSession | undefined;
+let cachedAccountVerification: { normalizedEmail: string; verifiedAt: number; source: string } | undefined;
 
 interface StorageStateInfo {
   configured: boolean;
@@ -198,6 +200,13 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     const now = Date.now();
     const loginPaused = now < loginBackoffUntil;
     const storageStateInfo = this.storageStateInfo();
+    const expectedAccountEmail = normalizeEmail(this.config.email);
+    const accountVerificationCached = Boolean(
+      expectedAccountEmail
+        && cachedAccountVerification
+        && cachedAccountVerification.normalizedEmail === expectedAccountEmail
+        && now - cachedAccountVerification.verifiedAt < ACCOUNT_VERIFICATION_TTL_MS,
+    );
     return this.result("cronometer_runtime_status", "ok", {
       provider: this.name,
       mode: this.mode,
@@ -212,6 +221,10 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       storageStateCookieCount: storageStateInfo.cookieCount,
       storageStateOriginCount: storageStateInfo.originCount,
       warmStorageStateCached: Boolean(cachedStorageState),
+      expectedAccountConfigured: Boolean(this.config.email),
+      expectedAccount: redactEmail(this.config.email),
+      accountVerificationCached,
+      accountVerificationSource: cachedAccountVerification?.source,
       writeEnabled: this.config.writeEnabled,
       requireFoodConfirmation: this.config.requireFoodConfirmation,
       activeBrowserJobs,
@@ -1478,18 +1491,91 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private async openApp(page: Page, hash = "") {
-    await page.goto(`${CRONOMETER_ORIGIN}/${hash}`, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs });
+    const targetUrl = `${CRONOMETER_ORIGIN}/${hash}`;
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs });
     await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
     await page.waitForTimeout(1200);
-    if (await this.isLoggedIn(page)) return;
+    if (await this.isLoggedIn(page)) {
+      await this.ensureConfiguredAccount(page, hash);
+      if (hash && !page.url().includes(hash)) {
+        await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs });
+        await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
+        await page.waitForTimeout(900);
+      }
+      return;
+    }
 
     await this.login(page);
-    await page.goto(`${CRONOMETER_ORIGIN}/${hash}`, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs });
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs });
     await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
     await page.waitForTimeout(1200);
     if (!(await this.isLoggedIn(page))) {
       throw new Error("Cronometer login succeeded but the app page did not load.");
     }
+    await this.ensureConfiguredAccount(page, hash);
+    if (hash && !page.url().includes(hash)) {
+      await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs });
+      await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
+      await page.waitForTimeout(900);
+    }
+  }
+
+  private async ensureConfiguredAccount(page: Page, returnHash: string) {
+    const expectedEmail = normalizeEmail(this.config.email);
+    if (!expectedEmail) return;
+
+    const cached = cachedAccountVerification;
+    if (
+      cached?.normalizedEmail === expectedEmail
+      && Date.now() - cached.verifiedAt < ACCOUNT_VERIFICATION_TTL_MS
+    ) {
+      return;
+    }
+
+    const firstCheck = await this.verifyConfiguredAccount(page, expectedEmail, returnHash, "current-session");
+    if (firstCheck.verified) return;
+
+    if (!this.config.password) {
+      throw new Error(`Cronometer session is logged in, but the configured account ${redactEmail(this.config.email)} could not be verified.`);
+    }
+
+    await this.login(page);
+    const secondCheck = await this.verifyConfiguredAccount(page, expectedEmail, returnHash, "fresh-login");
+    if (secondCheck.verified) return;
+
+    const detected = secondCheck.detectedEmails.length
+      ? secondCheck.detectedEmails.map((email) => redactEmail(email)).join(", ")
+      : "no visible email";
+    throw new Error(`Cronometer login did not verify the configured account ${redactEmail(this.config.email)}. Account page showed ${detected}.`);
+  }
+
+  private async verifyConfiguredAccount(page: Page, expectedEmail: string, returnHash: string, source: string) {
+    const currentText = await this.visibleText(page).catch(() => "");
+    if (textHasEmail(currentText, expectedEmail)) {
+      cachedAccountVerification = { normalizedEmail: expectedEmail, verifiedAt: Date.now(), source };
+      return { verified: true, detectedEmails: extractEmails(currentText) };
+    }
+
+    const accountText = await this.readAccountPageText(page, returnHash);
+    const detectedEmails = extractEmails(accountText);
+    if (textHasEmail(accountText, expectedEmail)) {
+      cachedAccountVerification = { normalizedEmail: expectedEmail, verifiedAt: Date.now(), source: `${source}:account-page` };
+      return { verified: true, detectedEmails };
+    }
+    return { verified: false, detectedEmails };
+  }
+
+  private async readAccountPageText(page: Page, returnHash: string) {
+    await page.goto(`${CRONOMETER_ORIGIN}/#account`, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs });
+    await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
+    await page.waitForTimeout(1200);
+    const text = await this.visibleText(page).catch(() => "");
+    if (returnHash && returnHash !== "#account") {
+      await page.goto(`${CRONOMETER_ORIGIN}/${returnHash}`, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
+      await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
+      await page.waitForTimeout(600).catch(() => undefined);
+    }
+    return text;
   }
 
   private async login(page: Page) {
@@ -4470,6 +4556,30 @@ function isLoggedInText(text: string) {
     || /\bCustom Recipes\b/i.test(text) && /\b(CREATE RECIPE|IMPORT RECIPE|Sorted by|BACK TO RECIPE LIST)\b/i.test(text)
     || /\bCustom Foods\b/i.test(text) && /\b(CREATE FOOD|Sorted by|BACK TO FOODS LIST)\b/i.test(text)
     || /\bEnergy Summary\b/i.test(text) && /\b(Nutrient Targets|Diary)\b/i.test(text);
+}
+
+function normalizeEmail(email?: string) {
+  return email?.trim().toLowerCase();
+}
+
+function textHasEmail(text: string, expectedEmail: string) {
+  return text.toLowerCase().includes(expectedEmail);
+}
+
+function extractEmails(text: string) {
+  const matches = text.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi) ?? [];
+  return Array.from(new Set(matches.map((email) => email.toLowerCase())));
+}
+
+function redactEmail(email?: string) {
+  const normalized = normalizeEmail(email);
+  if (!normalized) return undefined;
+  const [local, domain = ""] = normalized.split("@");
+  const localPrefix = local.slice(0, Math.min(2, local.length));
+  const domainParts = domain.split(".");
+  const domainName = domainParts[0] ?? "";
+  const domainSuffix = domainParts.length > 1 ? `.${domainParts.at(-1)}` : "";
+  return `${localPrefix}${local.length > 2 ? "***" : "*"}@${domainName.slice(0, 2)}***${domainSuffix}`;
 }
 
 function compactText(text: string, maxLength: number) {
