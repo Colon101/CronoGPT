@@ -53,6 +53,10 @@ https://your-tunnel.example/mcp
 
 This repo includes `render.yaml` and a Playwright-based `Dockerfile` so hosted browser automation runs as a normal long-lived Render web service.
 
+## OCI setup
+
+This repo also includes a GitHub Actions to OCI VM deployment path. See `docs/oci-deploy.md` for the VM bootstrap, required GitHub secrets, and deploy flow. The short version is: keep production `.env` on the OCI host, add the SSH secrets to GitHub, and every push to `main` will build, SSH to the VM, reset the checkout to `origin/main`, and restart `docker-compose.oci.yml`.
+
 Set these Render environment variables. Values marked secret are declared with `sync: false` in `render.yaml` and are filled in the Render Dashboard:
 
 ```text
