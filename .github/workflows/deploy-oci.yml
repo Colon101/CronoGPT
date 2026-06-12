@@ -1,0 +1,131 @@
+name: Deploy to OCI
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-oci-main
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run build
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: ubuntu-latest
+    environment: oci-production
+    env:
+      OCI_APP_DIR: ${{ secrets.OCI_APP_DIR }}
+      OCI_ENV_FILE_BASE64: ${{ secrets.OCI_ENV_FILE_BASE64 }}
+      OCI_HEALTH_URL: ${{ secrets.OCI_HEALTH_URL }}
+      OCI_REPO_URL: ${{ secrets.OCI_REPO_URL }}
+      OCI_SSH_HOST: ${{ secrets.OCI_SSH_HOST }}
+      OCI_SSH_KNOWN_HOSTS: ${{ secrets.OCI_SSH_KNOWN_HOSTS }}
+      OCI_SSH_PORT: ${{ secrets.OCI_SSH_PORT }}
+      OCI_SSH_PRIVATE_KEY: ${{ secrets.OCI_SSH_PRIVATE_KEY }}
+      OCI_SSH_USER: ${{ secrets.OCI_SSH_USER }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          : "${OCI_SSH_HOST:?Missing required secret OCI_SSH_HOST}"
+          : "${OCI_SSH_PRIVATE_KEY:?Missing required secret OCI_SSH_PRIVATE_KEY}"
+          : "${OCI_SSH_USER:?Missing required secret OCI_SSH_USER}"
+
+          OCI_SSH_PORT="${OCI_SSH_PORT:-22}"
+
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$OCI_SSH_PRIVATE_KEY" > ~/.ssh/oci_deploy_key
+          chmod 600 ~/.ssh/oci_deploy_key
+
+          if [ -n "${OCI_SSH_KNOWN_HOSTS:-}" ]; then
+            printf '%s\n' "$OCI_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -p "$OCI_SSH_PORT" -H "$OCI_SSH_HOST" > ~/.ssh/known_hosts
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy over SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OCI_SSH_PORT="${OCI_SSH_PORT:-22}"
+          remote_app_dir="${OCI_APP_DIR:-/opt/cronogpt}"
+          remote_target="$OCI_SSH_USER@$OCI_SSH_HOST"
+          ssh_base=(
+            ssh
+            -i ~/.ssh/oci_deploy_key
+            -p "$OCI_SSH_PORT"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+          )
+
+          if [ -n "${OCI_ENV_FILE_BASE64:-}" ]; then
+            tmp_env="$(mktemp)"
+            trap 'rm -f "$tmp_env"' EXIT
+            printf '%s' "$OCI_ENV_FILE_BASE64" | base64 --decode > "$tmp_env"
+            chmod 600 "$tmp_env"
+
+            printf -v remote_mkdir 'mkdir -p %q' "$remote_app_dir"
+            "${ssh_base[@]}" "$remote_target" "$remote_mkdir"
+
+            scp \
+              -i ~/.ssh/oci_deploy_key \
+              -P "$OCI_SSH_PORT" \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              "$tmp_env" \
+              "$remote_target:$remote_app_dir/.env.tmp"
+
+            printf -v remote_install 'umask 077; mv %q %q; chmod 600 %q' \
+              "$remote_app_dir/.env.tmp" \
+              "$remote_app_dir/.env" \
+              "$remote_app_dir/.env"
+            "${ssh_base[@]}" "$remote_target" "$remote_install"
+          fi
+
+          remote_env=(
+            "APP_DIR=$remote_app_dir"
+            "BRANCH=main"
+            "COMPOSE_FILE=docker-compose.oci.yml"
+            "REPO_URL=${OCI_REPO_URL:-https://github.com/Colon101/CronoGPT.git}"
+          )
+
+          if [ -n "${OCI_HEALTH_URL:-}" ]; then
+            remote_env+=("HEALTH_URL=$OCI_HEALTH_URL")
+          fi
+
+          printf -v remote_prefix '%q ' "${remote_env[@]}"
+          "${ssh_base[@]}" \
+            "$remote_target" \
+            "$remote_prefix bash -s" < scripts/deploy-oci.sh
