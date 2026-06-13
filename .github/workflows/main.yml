@@ -66,12 +66,10 @@ jobs:
       - name: Validate required secrets
         env:
           ORACLE_SSH_PRIVATE_KEY: ${{ secrets.ORACLE_SSH_PRIVATE_KEY }}
-          CRONOMETER_EMAIL: ${{ secrets.CRONOMETER_EMAIL }}
-          CRONOMETER_PASSWORD: ${{ secrets.CRONOMETER_PASSWORD }}
         run: |
           set -euo pipefail
           missing=()
-          for key in ORACLE_SSH_PRIVATE_KEY CRONOMETER_EMAIL CRONOMETER_PASSWORD; do
+          for key in ORACLE_SSH_PRIVATE_KEY; do
             if [[ -z "${!key:-}" ]]; then
               missing+=("$key")
             fi

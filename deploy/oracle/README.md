@@ -23,6 +23,35 @@ Public URL:
 https://cronogpt.129-159-156-186.sslip.io/mcp
 ```
 
+## Main Branch Deployment Contract
+
+Production is deployed by GitHub Actions from `main`. Future agents should push
+changes to `main` to test the production deployment path. The `Main` workflow
+builds, runs tests, deploys the exact pushed commit to the Oracle VM with
+`npm run oracle:deploy`, then runs `npm run smoke:oracle` against the public
+Oracle URL.
+
+Required GitHub Actions secret:
+
+- `ORACLE_SSH_PRIVATE_KEY`: private key for `ubuntu@129.159.156.186`.
+
+Optional GitHub Actions secrets:
+
+- `CRONOGPT_API_TOKEN`
+- `CRONOGPT_LINK_SECRET`
+- `CRONOMETER_EMAIL`
+- `CRONOMETER_PASSWORD`
+- `CRONOMETER_STORAGE_STATE_BASE64`
+
+The deploy script preserves existing values from
+`/opt/cronogpt/secrets/cronogpt.env` when these optional secrets are not
+provided by GitHub Actions. This keeps routine deployments from requiring
+Cronometer credentials in GitHub.
+
+Vercel is not the production deploy target for this repo. `vercel.json` tells
+Vercel Git integration to skip builds so stale Vercel projects do not create
+misleading deployments.
+
 Current ChatGPT connector:
 
 - App name: `cronogpt`

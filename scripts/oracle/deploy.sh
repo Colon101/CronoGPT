@@ -32,14 +32,17 @@ sync_app_source() {
     | ssh "${SSH_ARGS[@]}" "$SSH_TARGET" "tar -xzf - -C /opt/cronogpt/app"
 }
 
-need_secret() {
+secret_or_remote_required() {
   local key="$1"
   local value="${!key:-}"
   if [[ -z "$value" ]]; then
     value="$(awk -F= -v k="$key" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' .env 2>/dev/null || true)"
   fi
   if [[ -z "$value" ]]; then
-    echo "Missing $key. Export it or keep it in local .env for this deploy." >&2
+    value="$(remote_secret "$key")"
+  fi
+  if [[ -z "$value" ]]; then
+    echo "Missing $key. Export it, keep it in local .env, or ensure it already exists on the Oracle secret file." >&2
     exit 1
   fi
   printf '%s' "$value"
@@ -79,8 +82,8 @@ secret_or_remote_optional() {
 
 API_TOKEN="$(secret_or_remote_or_generate CRONOGPT_API_TOKEN)"
 LINK_SECRET="$(secret_or_remote_or_generate CRONOGPT_LINK_SECRET)"
-CRONOMETER_EMAIL_VALUE="$(need_secret CRONOMETER_EMAIL)"
-CRONOMETER_PASSWORD_VALUE="$(need_secret CRONOMETER_PASSWORD)"
+CRONOMETER_EMAIL_VALUE="$(secret_or_remote_required CRONOMETER_EMAIL)"
+CRONOMETER_PASSWORD_VALUE="$(secret_or_remote_required CRONOMETER_PASSWORD)"
 CRONOMETER_STORAGE_STATE_VALUE="$(secret_or_remote_optional CRONOMETER_STORAGE_STATE_BASE64)"
 
 ssh "${SSH_ARGS[@]}" "$SSH_TARGET" "bash -s" < scripts/oracle/bootstrap-host.sh
