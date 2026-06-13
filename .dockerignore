@@ -7,5 +7,10 @@ exports
 .env.*
 !.env.example
 .cronometer-storage-state.*
+.cronometer-login-backoff.json
+*.log
+*.tmp
+playwright-report
+test-results
 npm-debug.log*
 .DS_Store

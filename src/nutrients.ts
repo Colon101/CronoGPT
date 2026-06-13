@@ -28,8 +28,8 @@ export const CUSTOM_FOOD_NUTRIENT_SCHEMA: CustomFoodNutrientGroup[] = [
   {
     group: "carbohydrates",
     nutrients: [
-      { key: "total_carbs", label: "Total Carbs", unit: "g", aliases: ["carb", "carbs", "carbohydrate", "carbohydrates", "total carbohydrate", "total carbohydrates"] },
-      { key: "fiber", label: "Fiber", unit: "g", aliases: ["dietary fiber"] },
+      { key: "total_carbs", label: "Total Carbs", unit: "g", aliases: ["carb", "carbs", "carbs_g", "carbohydrate", "carbohydrates", "carbohydrates_g", "total carbohydrate", "total carbohydrates", "net_carbs", "net carbs", "net carbohydrate", "net carbohydrates", "available carbs", "available carbohydrates"] },
+      { key: "fiber", label: "Fiber", unit: "g", aliases: ["dietary fiber", "fiber_g"] },
       { key: "insoluble_fiber", label: "Insoluble Fiber", unit: "g" },
       { key: "soluble_fiber", label: "Soluble Fiber", unit: "g" },
       { key: "starch", label: "Starch", unit: "g" },
@@ -48,16 +48,16 @@ export const CUSTOM_FOOD_NUTRIENT_SCHEMA: CustomFoodNutrientGroup[] = [
   {
     group: "lipids",
     nutrients: [
-      { key: "fat", label: "Fat", unit: "g", aliases: ["total fat"] },
+      { key: "fat", label: "Fat", unit: "g", aliases: ["fat_g", "total fat"] },
       { key: "monounsaturated", label: "Monounsaturated", unit: "g", aliases: ["monounsaturated fat", "mufa"] },
       { key: "polyunsaturated", label: "Polyunsaturated", unit: "g", aliases: ["polyunsaturated fat", "pufa"] },
-      { key: "omega_3", label: "Omega-3", unit: "g", aliases: ["omega 3"] },
-      { key: "ala", label: "ALA", unit: "g", aliases: ["alpha linolenic acid"] },
-      { key: "dha", label: "DHA", unit: "g", aliases: ["docosahexaenoic acid"] },
-      { key: "epa", label: "EPA", unit: "g", aliases: ["eicosapentaenoic acid"] },
-      { key: "omega_6", label: "Omega-6", unit: "g", aliases: ["omega 6"] },
-      { key: "aa", label: "AA", unit: "g", aliases: ["arachidonic acid"] },
-      { key: "la", label: "LA", unit: "g", aliases: ["linoleic acid"] },
+      { key: "omega_3", label: "Omega-3", unit: "g", aliases: ["omega 3", "omega-3", "n3", "n-3"] },
+      { key: "ala", label: "ALA", unit: "g", aliases: ["alpha linolenic acid", "alpha-linolenic acid", "omega 3 ala", "omega-3 ala", "omega_3_ala", "18:3 n-3", "18:3n3"] },
+      { key: "dha", label: "DHA", unit: "g", aliases: ["docosahexaenoic acid", "docosahexaenoate", "omega 3 dha", "omega-3 dha", "omega_3_dha", "22:6 n-3", "22:6n3"] },
+      { key: "epa", label: "EPA", unit: "g", aliases: ["eicosapentaenoic acid", "eicosapentaenoate", "omega 3 epa", "omega-3 epa", "omega_3_epa", "20:5 n-3", "20:5n3"] },
+      { key: "omega_6", label: "Omega-6", unit: "g", aliases: ["omega 6", "omega-6", "n6", "n-6"] },
+      { key: "aa", label: "AA", unit: "g", aliases: ["arachidonic acid", "omega 6 aa", "omega-6 aa", "omega_6_aa", "20:4 n-6", "20:4n6"] },
+      { key: "la", label: "LA", unit: "g", aliases: ["linoleic acid", "omega 6 la", "omega-6 la", "omega_6_la", "18:2 n-6", "18:2n6"] },
       { key: "saturated", label: "Saturated", unit: "g", aliases: ["saturated fat"] },
       { key: "trans_fats", label: "Trans-Fats", unit: "g", aliases: ["trans fat", "trans fats"] },
       { key: "cholesterol", label: "Cholesterol", unit: "mg" },
@@ -67,7 +67,7 @@ export const CUSTOM_FOOD_NUTRIENT_SCHEMA: CustomFoodNutrientGroup[] = [
   {
     group: "protein_and_amino_acids",
     nutrients: [
-      { key: "protein", label: "Protein", unit: "g" },
+      { key: "protein", label: "Protein", unit: "g", aliases: ["protein_g"] },
       { key: "alanine", label: "Alanine", unit: "g" },
       { key: "arginine", label: "Arginine", unit: "g" },
       { key: "aspartic_acid", label: "Aspartic acid", unit: "g", aliases: ["aspartate"] },

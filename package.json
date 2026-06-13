@@ -7,8 +7,16 @@
     "build": "tsc",
     "dev": "tsx src/server.ts",
     "start": "node dist/server.js",
+    "test": "npm run test:food-logic && npm run test:runtime-safety",
+    "test:food-logic": "npm run build && node scripts/test-food-logic.mjs",
+    "test:runtime-safety": "node scripts/test-runtime-safety.mjs",
+    "cronometer:cooldown": "node scripts/cronometer-login-cooldown.mjs",
     "storage:cronometer": "node scripts/generate-cronometer-storage-state.mjs",
     "smoke:production": "node scripts/smoke-production.mjs",
+    "smoke:oracle": "ORACLE_DOMAIN=cronogpt.129-159-156-186.sslip.io node scripts/smoke-production.mjs",
+    "smoke:live-custom-food": "npm run build && node scripts/smoke-live-custom-food.mjs",
+    "oracle:deploy": "bash scripts/oracle/deploy.sh",
+    "oracle:wipe-local-env": "bash scripts/oracle/wipe-local-env-preserve-cronometer.sh",
     "inspect": "npx @modelcontextprotocol/inspector@latest --server-url http://localhost:${PORT:-8787}/mcp --transport http"
   },
   "dependencies": {

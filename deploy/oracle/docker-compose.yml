@@ -1,0 +1,39 @@
+services:
+  app:
+    build:
+      context: /opt/cronogpt/app
+      dockerfile: Dockerfile
+    image: cronogpt:oracle
+    restart: unless-stopped
+    env_file:
+      - /opt/cronogpt/config/oracle.env
+      - /opt/cronogpt/secrets/cronogpt.env
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 8787
+      CRONOGPT_BUILD_TIMESTAMP: ${CRONOGPT_BUILD_TIMESTAMP:-unknown}
+    expose:
+      - "8787"
+    shm_size: "1gb"
+    volumes:
+      - /opt/cronogpt/state:/opt/cronogpt/state
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    env_file:
+      - /opt/cronogpt/config/oracle.env
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /opt/cronogpt/app/deploy/oracle/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

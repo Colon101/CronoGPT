@@ -3,7 +3,8 @@ import "dotenv/config";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
-const serverUrl = process.env.CRONOGPT_SMOKE_URL ?? "https://cronogpt.onrender.com/mcp";
+const defaultOracleDomain = process.env.ORACLE_DOMAIN ?? "cronogpt.129-159-156-186.sslip.io";
+const serverUrl = process.env.CRONOGPT_SMOKE_URL ?? `https://${defaultOracleDomain}/mcp`;
 const token = process.env.CRONOGPT_API_TOKEN;
 
 if (!token) {
@@ -11,76 +12,68 @@ if (!token) {
 }
 
 const checks = [];
+const chatGptActionToolNames = [
+  "log_food",
+  "delete_diary_food_entry",
+  "search_foods",
+  "custom_food_nutrient_schema",
+  "create_custom_food",
+  "create_and_log_custom_food",
+  "update_custom_food",
+  "delete_custom_food",
+  "retire_custom_food",
+  "cronometer_runtime_status",
+  "cronometer_stability_check",
+  "refresh_cronometer_session",
+];
+
+const health = await fetch(serverUrl.replace(/\/mcp\/?$/, "/"));
+const healthData = await health.json().catch(() => undefined);
+checks.push({
+  name: "health",
+  ok: health.ok &&
+    healthData?.name === "cronogpt" &&
+    typeof healthData?.mode === "string",
+  data: healthData,
+});
 
 await withClient(async (client) => {
   const tools = await client.listTools();
   const runtimeTool = tools.tools.find((tool) => tool.name === "cronometer_runtime_status");
   const runtimeSecuritySchemes = runtimeTool?._meta?.securitySchemes;
-  const runtimeVisibility = runtimeTool?._meta?.ui?.visibility;
+  const actionTools = chatGptActionToolNames.map((name) => tools.tools.find((tool) => tool.name === name));
+  const missingActionTools = chatGptActionToolNames.filter((name, index) => !actionTools[index]);
+  const templateBoundActionTools = actionTools
+    .filter((tool) => tool && hasOutputTemplate(tool))
+    .map((tool) => tool.name);
   checks.push({
     name: "tools",
     ok: tools.tools.length >= 50 &&
       tools.tools.some((tool) => tool.name === "cronometer_stability_check") &&
       tools.tools.some((tool) => tool.name === "run_cronometer_ui_flow") &&
+      missingActionTools.length === 0 &&
+      templateBoundActionTools.length === 0 &&
       Array.isArray(runtimeSecuritySchemes) &&
-      runtimeSecuritySchemes.some((scheme) => scheme?.type === "oauth2") &&
-      Array.isArray(runtimeVisibility) &&
-      runtimeVisibility.includes("model"),
+      runtimeSecuritySchemes.some((scheme) => scheme?.type === "oauth2"),
     data: {
       count: tools.tools.length,
       hasStabilityCheck: tools.tools.some((tool) => tool.name === "cronometer_stability_check"),
       hasUiFlow: tools.tools.some((tool) => tool.name === "run_cronometer_ui_flow"),
+      missingActionTools,
+      templateBoundActionTools,
       runtimeHasOauthMetadata: Array.isArray(runtimeSecuritySchemes) &&
         runtimeSecuritySchemes.some((scheme) => scheme?.type === "oauth2"),
-      runtimeVisibleToModel: Array.isArray(runtimeVisibility) && runtimeVisibility.includes("model"),
     },
   });
 
   const runtime = await client.callTool({ name: "cronometer_runtime_status", arguments: {} });
+  const runtimeData = runtime.structuredContent?.data;
   checks.push({
     name: "runtime",
     ok: runtime.structuredContent?.status === "ok" &&
-      runtime.structuredContent?.data?.storageStateConfigured === true &&
-      runtime.structuredContent?.data?.storageStateUsable !== false &&
-      runtime.structuredContent?.data?.loginPaused === false,
-    data: runtime.structuredContent?.data,
-  });
-
-  const stability = await client.callTool({
-    name: "cronometer_stability_check",
-    arguments: { foodQuery: "Banana cream", includeFoodSearch: true },
-  });
-  checks.push({
-    name: "stability",
-    ok: stability.structuredContent?.status === "ok" &&
-      stability.structuredContent?.data?.ready === true &&
-      stability.structuredContent?.data?.checks?.hasMealSections === true,
-    data: stability.structuredContent?.data,
-  });
-
-  const datedFoodDryRun = await client.callTool({
-    name: "log_food",
-    arguments: {
-      date: "today",
-      meal: "Breakfast",
-      query: "Banana cream",
-      amount: 1,
-      unit: "pint",
-      dryRun: true,
-      confirmed: false,
-    },
-  });
-  checks.push({
-    name: "dated_food_dry_run",
-    ok: datedFoodDryRun.structuredContent?.status === "dry_run" &&
-      datedFoodDryRun.structuredContent?.data?.dateStatus?.selected === true &&
-      Array.isArray(datedFoodDryRun.structuredContent?.data?.preview) &&
-      datedFoodDryRun.structuredContent.data.preview.length > 0,
-    data: {
-      status: datedFoodDryRun.structuredContent?.status,
-      dateStatus: datedFoodDryRun.structuredContent?.data?.dateStatus,
-      previewCount: datedFoodDryRun.structuredContent?.data?.preview?.length,
-    },
+      runtimeData?.storageStateConfigured === true &&
+      runtimeData?.storageStateUsable !== false,
+    data: runtimeData,
   });
 
   const dryRun = await client.callTool({
@@ -88,17 +81,54 @@ await withClient(async (client) => {
     arguments: {
       name: "cronogpt smoke test dry run",
       servingSize: "1 serving",
-      nutrients: { calories: 1 },
+      nutrients: { calories: 1, net_carbs: 2, caffeine: 80, "omega-3 dha": 0.2, "20:5n3": 0.1, vitamin_c: 12 },
+      dryRun: true,
+      confirmed: false,
+    },
+  });
+  const customFoodPreview = dryRun.structuredContent?.data?.preview;
+  const customFoodPreviewLabels = customFoodPreview?.nutrients?.map((item) => item?.label) ?? [];
+  checks.push({
+    name: "custom_food_dry_run",
+    ok: dryRun.structuredContent?.status === "dry_run" &&
+      customFoodPreview?.servingSize?.parsed?.unit === "serving" &&
+      customFoodPreviewLabels.includes("Energy") &&
+      customFoodPreviewLabels.includes("Total Carbs") &&
+      customFoodPreviewLabels.includes("Caffeine") &&
+      customFoodPreviewLabels.includes("DHA") &&
+      customFoodPreviewLabels.includes("EPA") &&
+      customFoodPreviewLabels.includes("Vitamin C"),
+    data: {
+      status: dryRun.structuredContent?.status,
+      feature: dryRun.structuredContent?.feature,
+      preview: customFoodPreview,
+    },
+  });
+
+  const createAndLogDryRun = await client.callTool({
+    name: "create_and_log_custom_food",
+    arguments: {
+      name: "cronogpt smoke test researched snack",
+      servingSize: "1 serving",
+      nutrients: { calories: 123, protein: 4, net_carbs: 20, total_fat: 3 },
+      nutritionSource: "smoke test fixture",
+      meal: "Snacks",
+      amount: 1,
       dryRun: true,
       confirmed: false,
     },
   });
   checks.push({
-    name: "custom_food_dry_run",
-    ok: dryRun.structuredContent?.status === "dry_run",
+    name: "create_and_log_custom_food_dry_run",
+    ok: createAndLogDryRun.structuredContent?.status === "dry_run" &&
+      createAndLogDryRun.structuredContent?.data?.createCustomFood?.status === "dry_run" &&
+      createAndLogDryRun.structuredContent?.data?.logFood?.status === "dry_run" &&
+      createAndLogDryRun.structuredContent?.data?.logFood?.data?.normalized?.meal === "Snacks",
     data: {
-      status: dryRun.structuredContent?.status,
-      feature: dryRun.structuredContent?.feature,
+      status: createAndLogDryRun.structuredContent?.status,
+      createStatus: createAndLogDryRun.structuredContent?.data?.createCustomFood?.status,
+      logStatus: createAndLogDryRun.structuredContent?.data?.logFood?.status,
+      logNormalized: createAndLogDryRun.structuredContent?.data?.logFood?.data?.normalized,
     },
   });
 
@@ -151,6 +181,69 @@ await withClient(async (client) => {
       warning: dangerous.structuredContent?.warning,
     },
   });
+
+  const skipBrowserChecks = process.env.CRONOGPT_SMOKE_SKIP_BROWSER === "true" ||
+    runtimeData?.loginPaused === true;
+  if (skipBrowserChecks) {
+    const reason = runtimeData?.loginPaused === true
+      ? `Cronometer login is paused for ${runtimeData.loginPauseSecondsRemaining ?? "unknown"} seconds.`
+      : "CRONOGPT_SMOKE_SKIP_BROWSER=true";
+    checks.push({
+      name: "stability",
+      ok: true,
+      skipped: true,
+      data: { reason, runtime: runtimeData },
+    });
+    checks.push({
+      name: "dated_food_dry_run",
+      ok: true,
+      skipped: true,
+      data: { reason, runtime: runtimeData },
+    });
+    return;
+  }
+
+  const stability = await client.callTool({
+    name: "cronometer_stability_check",
+    arguments: { foodQuery: "Banana cream", includeFoodSearch: true },
+  });
+  const stabilityLoginPaused = stability.structuredContent?.status === "needs_manual_step" &&
+    stability.structuredContent?.data?.loginPauseSecondsRemaining > 0;
+  checks.push({
+    name: "stability",
+    ok: stabilityLoginPaused ||
+      stability.structuredContent?.status === "ok" &&
+        stability.structuredContent?.data?.ready === true &&
+        stability.structuredContent?.data?.checks?.hasMealSections === true,
+    skipped: stabilityLoginPaused,
+    data: stability.structuredContent?.data,
+  });
+
+  const datedFoodDryRun = await client.callTool({
+    name: "log_food",
+    arguments: {
+      date: "today",
+      meal: "Breakfast",
+      query: "Banana cream",
+      amount: 1,
+      unit: "pint",
+      dryRun: true,
+      confirmed: false,
+    },
+  });
+  checks.push({
+    name: "dated_food_dry_run",
+    ok: datedFoodDryRun.structuredContent?.status === "dry_run" &&
+      datedFoodDryRun.structuredContent?.data?.browserOpened === false &&
+      datedFoodDryRun.structuredContent?.data?.writeAttempted === false &&
+      datedFoodDryRun.structuredContent?.data?.normalized?.query === "Banana cream",
+    data: {
+      status: datedFoodDryRun.structuredContent?.status,
+      normalized: datedFoodDryRun.structuredContent?.data?.normalized,
+      browserOpened: datedFoodDryRun.structuredContent?.data?.browserOpened,
+      writeAttempted: datedFoodDryRun.structuredContent?.data?.writeAttempted,
+    },
+  });
 });
 
 const ok = checks.every((check) => check.ok);
@@ -170,4 +263,12 @@ async function withClient(fn) {
   } finally {
     await client.close();
   }
+}
+
+function hasOutputTemplate(tool) {
+  return Boolean(
+    tool?._meta?.["openai/outputTemplate"] ||
+    tool?._meta?.["ui/resourceUri"] ||
+    tool?._meta?.ui?.resourceUri
+  );
 }

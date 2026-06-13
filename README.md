@@ -49,14 +49,36 @@ To connect from ChatGPT, expose the server over HTTPS with a tunnel, then create
 https://your-tunnel.example/mcp
 ```
 
-## Render setup
+## Oracle Always Free setup
 
-This repo includes `render.yaml` and a Playwright-based `Dockerfile` so hosted browser automation runs as a normal long-lived Render web service.
-
-Set these Render environment variables. Values marked secret are declared with `sync: false` in `render.yaml` and are filled in the Render Dashboard:
+The active hosted app is a single private Oracle Always Free A1 VM running Docker Compose plus Caddy. The current endpoint is:
 
 ```text
-APP_PUBLIC_ORIGIN=https://cronogpt.onrender.com
+https://cronogpt.129-159-156-186.sslip.io/mcp
+```
+
+The old Render connector is no longer the active app. The Render blueprint was removed so future deploys do not drift back to `https://cronogpt.onrender.com/mcp`.
+
+See `deploy/oracle/README.md`. The short path is:
+
+```bash
+# Run once on the Oracle Ubuntu VM.
+bash scripts/oracle/bootstrap-host.sh
+
+# Run from this repo.
+export ORACLE_HOST=129.159.156.186
+export ORACLE_DOMAIN=cronogpt.129-159-156-186.sslip.io
+export ORACLE_USER=ubuntu
+export ORACLE_SSH_KEY=/home/kfir/.ssh/cronogpt_oracle_ed25519
+npm run oracle:deploy
+```
+
+The deploy script writes non-secret config to `/opt/cronogpt/config/oracle.env` and secrets to `/opt/cronogpt/secrets/cronogpt.env` with mode `0600`. It generates fresh `CRONOGPT_API_TOKEN` and `CRONOGPT_LINK_SECRET` when they are not exported locally.
+
+Hosted browser config:
+
+```text
+APP_PUBLIC_ORIGIN=https://cronogpt.129-159-156-186.sslip.io
 CRONOGPT_API_TOKEN=generate-a-long-random-token
 CRONOGPT_LINK_SECRET=optional-separate-chatgpt-link-code
 CRONOMETER_BACKEND=browser
@@ -70,31 +92,57 @@ CRONOMETER_ENABLE_WRITES=true
 CRONOMETER_REQUIRE_FOOD_CONFIRMATION=false
 CRONOMETER_NAVIGATION_TIMEOUT_MS=60000
 CRONOMETER_LOGIN_BACKOFF_MS=900000
-CRONOMETER_OPERATION_TIMEOUT_MS=600000
+CRONOMETER_LOGIN_BACKOFF_FILE=/opt/cronogpt/state/cronometer-login-backoff.json
+CRONOMETER_OPERATION_TIMEOUT_MS=180000
 CRONOMETER_BROWSER_RETRY_COUNT=1
+CRONOGPT_FULL_TOOL_SURFACE=false
 ```
 
-The Render Docker image includes local Chromium through the Playwright base image. Keep `CRONOMETER_REUSE_LOCAL_BROWSER=false` on Render free so Chromium is closed after each queued tool call and memory stays below the free tier limit. `REMOTE_CHROME_WS_ENDPOINT` is optional if you want to use Browserless or another remote Chrome provider instead. `CRONOMETER_STORAGE_STATE_BASE64` lets the hosted browser reuse a valid Cronometer session instead of logging in from scratch on every tool call. `CRONOMETER_LOGIN_BACKOFF_MS` pauses new login attempts after a rate-limit or bot challenge.
+The Oracle Docker image includes local Chromium through the Playwright base image. Keep `CRONOMETER_REUSE_LOCAL_BROWSER=false` so Chromium is closed after each queued tool call. `REMOTE_CHROME_WS_ENDPOINT` is optional if you want Browserless or another remote Chrome provider instead. `CRONOMETER_STORAGE_STATE_BASE64` lets the hosted browser reuse a valid Cronometer session instead of logging in from scratch on every tool call. `CRONOMETER_LOGIN_BACKOFF_MS` pauses new login attempts after a rate-limit or bot challenge, and `CRONOMETER_LOGIN_BACKOFF_FILE` persists that cooldown across server restarts.
 
 Food logs write directly when `CRONOMETER_ENABLE_WRITES=true` unless the tool call sets `dryRun=true`. Set `CRONOMETER_REQUIRE_FOOD_CONFIRMATION=true` to restore the older second-step confirmation behavior. Other write tools require `confirmed=true` and will write as long as `dryRun` is not `true`. Dry-run write previews return without opening Cronometer, so recipe/custom-food validation does not burn browser login attempts. Set `CRONOMETER_ENABLE_WRITES=false` for read-only dry-run mode.
 
-Browser-backed tools are serialized inside the hosted process to reduce Chromium contention. `CRONOMETER_OPERATION_TIMEOUT_MS` bounds individual browser attempts, and `CRONOMETER_BROWSER_RETRY_COUNT` retries transient automation failures without retrying login/CAPTCHA/credential failures.
+Browser-backed tools are serialized inside the hosted process to reduce Chromium contention. Confirmed `log_food` writes are accepted as background jobs and deduped by idempotency key, so slow Cronometer UI work can finish after the caller returns. `CRONOMETER_OPERATION_TIMEOUT_MS` bounds individual browser attempts, and `CRONOMETER_BROWSER_RETRY_COUNT` retries transient automation failures without retrying login/CAPTCHA/credential failures.
+
+If Cronometer returns `Too Many Attempts`, stop live browser checks and seed the shared cooldown before retrying later:
+
+```bash
+npm run cronometer:cooldown -- set 900 "Too Many Attempts"
+npm run cronometer:cooldown -- status
+```
+
+If you omit the `set` duration, the script uses `CRONOMETER_LOGIN_BACKOFF_MS` as milliseconds.
+
+Clear it only after the cooldown is really over:
+
+```bash
+npm run cronometer:cooldown -- clear
+```
 
 Before a long ChatGPT workflow, call `cronometer_stability_check`. It verifies hosted login, Diary readability, and a small food search in one queued browser job without writing data.
 
 Run the no-write production smoke test after deploys:
 
 ```bash
-npm run smoke:production
+npm test
+npm run test:food-logic
+npm run test:runtime-safety
+npm run smoke:oracle
 ```
 
-To create a durable Cronometer session for Render, run this locally after confirming `.env` has the Cronometer credentials:
+To prove the real custom-food write path, run the gated live smoke. It creates one uniquely named custom food, verifies it exists, deletes it, and verifies it is gone:
+
+```bash
+CRONOMETER_ENABLE_WRITES=true CRONOGPT_LIVE_WRITE_CONFIRM=create-and-delete-custom-food npm run smoke:live-custom-food
+```
+
+To create a durable Cronometer session for Oracle, run this locally after confirming `.env` has the Cronometer credentials:
 
 ```bash
 npm run storage:cronometer
 ```
 
-The generator writes `.cronometer-storage-state.json` and `.cronometer-storage-state.base64` with mode `0600`; both are ignored by git. Add the base64 file contents to Render as `CRONOMETER_STORAGE_STATE_BASE64`. Set `HEADLESS=false` if Cronometer requires an interactive verification step. The MCP tool `refresh_cronometer_session` can warm and verify the hosted session without writing diary data.
+The generator writes `.cronometer-storage-state.json` and `.cronometer-storage-state.base64` with mode `0600`; both are ignored by git. Add the base64 file contents to the Oracle secret file as `CRONOMETER_STORAGE_STATE_BASE64`, then redeploy. Set `HEADLESS=false` if Cronometer requires an interactive verification step. The MCP tool `refresh_cronometer_session` can warm and verify the hosted session without writing diary data.
 
 For more reliable read data, add Terra:
 
@@ -107,16 +155,16 @@ TERRA_USER_ID=...
 ChatGPT connector URL after deployment:
 
 ```text
-https://cronogpt.onrender.com/mcp
+https://cronogpt.129-159-156-186.sslip.io/mcp
 ```
 
 The deployed `/mcp` endpoint supports ChatGPT OAuth discovery. In ChatGPT, create the app with authentication set to OAuth and use:
 
 ```text
-https://cronogpt.onrender.com/mcp
+https://cronogpt.129-159-156-186.sslip.io/mcp
 ```
 
-When ChatGPT opens the cronogpt linking page, enter `CRONOGPT_LINK_SECRET`. If that env var is empty, enter `CRONOGPT_API_TOKEN`.
+When ChatGPT opens the cronogpt linking page, enter `CRONOGPT_LINK_SECRET`. If that env var is empty, enter `CRONOGPT_API_TOKEN`. On 2026-06-09, Chrome verified this connector through ChatGPT's website with App ID `asdk_app_6a2811e26a8481918d4596e042f50718`.
 
 Direct MCP clients can still use:
 
@@ -124,13 +172,39 @@ Direct MCP clients can still use:
 Authorization: Bearer your-cronogpt-api-token
 ```
 
+After Oracle passes smoke and one live canary, wipe local env clutter while preserving only Cronometer login:
+
+```bash
+npm run oracle:wipe-local-env
+```
+
+## Stable tool surface
+
+By default, only these tools are model-visible:
+
+- `log_food`
+- `delete_diary_food_entry`
+- `search_foods`
+- `custom_food_nutrient_schema`
+- `list_custom_foods`
+- `find_duplicate_custom_foods`
+- `create_custom_food`
+- `update_custom_food`
+- `cronometer_runtime_status`
+- `cronometer_stability_check`
+- `refresh_cronometer_session`
+
+The rest remain app-callable for rollback and direct testing. Set `CRONOGPT_FULL_TOOL_SURFACE=true` only when deliberately exposing the legacy broad surface.
+
+`log_food` is transactional. `dryRun=true` does not open Chromium. Confirmed real writes return `accepted`, run in the browser queue, write once, then read back the target diary entry. Poll `cronometer_runtime_status` for the final background result before retrying. Final states include `written`, `already_exists`, `busy`, `not_written_login_paused`, `not_written_ambiguous`, `not_written_not_found`, and `possibly_written_verify_failed`.
+
 ## Backends
 
 Set `CRONOMETER_BACKEND` in `.env`:
 
 - `mock`: local dry-run data, safe default.
 - `terra`: API-backed read framework using `TERRA_API_KEY`, `TERRA_DEV_ID`, and `TERRA_USER_ID`.
-- `browser`: hosted browser automation through Render-local Chromium or `REMOTE_CHROME_WS_ENDPOINT`. This cannot reuse the Codex `@chrome` plugin from ChatGPT.
+- `browser`: hosted browser automation through Oracle-local Chromium or `REMOTE_CHROME_WS_ENDPOINT`. This cannot reuse the Codex `@chrome` plugin from ChatGPT.
 
 The existing lowercase `email` and `password` keys are supported only for local browser-framework detection. Prefer `CRONOMETER_EMAIL` and `CRONOMETER_PASSWORD`.
 

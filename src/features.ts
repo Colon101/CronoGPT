@@ -139,6 +139,14 @@ export const FEATURE_DEFINITIONS: FeatureDefinition[] = [
     notes: "Write action. Food logs write directly when server writes are enabled; use dryRun=true for previews or ambiguity.",
   },
   {
+    id: "delete_diary_food_entry",
+    group: "logging",
+    title: "Delete diary food entry",
+    preferredBackend: "browser",
+    supportedModes: ["mock"],
+    notes: "Destructive cleanup for one exact visible food entry in one diary meal; refuses broad or multi-match deletes.",
+  },
+  {
     id: "log_exercise",
     group: "logging",
     title: "Log exercise",

@@ -4,7 +4,7 @@
 
 There is a supported API path for reading Cronometer data, but it is not a normal first-party Cronometer user API. Terra advertises a Cronometer web API integration that can receive synced nutrition, workouts, and health metrics through webhooks and historical HTTP requests. Cronometer's official self-serve export path is CSV export from Account Settings.
 
-For ChatGPT control, build an Apps SDK MCP server and expose tools. ChatGPT calls your server; your server talks to Terra, reads exported CSVs, or runs hosted browser automation through a remote Chrome WebSocket endpoint. ChatGPT cannot directly reuse Codex's `@chrome` plugin.
+For ChatGPT control, build an Apps SDK MCP server and expose tools. ChatGPT calls your server; your server talks to Terra, reads exported CSVs, or runs hosted browser automation on the Oracle-hosted Chromium worker. ChatGPT cannot directly reuse Codex's `@chrome` plugin.
 
 ## Architecture
 
@@ -15,11 +15,11 @@ flowchart LR
   MCP --> Widget["Optional ChatGPT widget"]
   MCP --> Terra["Terra API for synced reads"]
   MCP --> CSV["Cronometer CSV exports"]
-  MCP --> Browser["Remote Chrome browser automation"]
+  MCP --> Browser["Oracle-hosted Chromium automation"]
   Browser --> Cronometer["Cronometer web app"]
 ```
 
-On Render, the browser box can run local Chromium in the Playwright Docker image. A remote Chrome service such as Browserless remains an option if you want a separate persistent browser.
+On Oracle Always Free, the browser box runs local Chromium in the Playwright Docker image. A remote Chrome service such as Browserless remains an option if you want a separate persistent browser.
 
 ## Feature matrix
 
@@ -79,10 +79,17 @@ On Render, the browser box can run local Chromium in the Playwright Docker image
 1. Start with `CRONOMETER_BACKEND=mock` and verify the MCP server in MCP Inspector.
 2. Add Terra credentials and implement/verify `get_daily_summary`, `list_food_entries`, `list_exercises`, and `list_biometrics`.
 3. Add a CSV importer for official exported files if Terra is not enough.
-4. Deploy on Render with local Chromium, or set `REMOTE_CHROME_WS_ENDPOINT` to a remote Chrome provider and verify browser-backed dry runs.
+4. Deploy on Oracle Always Free with local Chromium, or set `REMOTE_CHROME_WS_ENDPOINT` to a remote Chrome provider and verify browser-backed dry runs.
 5. Implement browser-backed writes behind explicit confirmations and dry-run previews.
 6. Add OAuth before connecting this to a real ChatGPT account beyond local testing.
-7. Expose the server over HTTPS on Render, create the ChatGPT connector, refresh metadata, and test each tool.
+7. Expose the server over HTTPS on Oracle, create the ChatGPT connector, refresh metadata, and test each tool.
+
+## Future recipe workflow notes
+
+- First priority is reliable food and custom-food adding: exact source-aware food selection, no stale search results, and full nutrient entry for custom foods.
+- For the recipe workflow shown in Cronometer's diary context menu, prefer a browser tool that selects existing diary rows and uses `Create Recipe From Selected Items...` instead of rebuilding every ingredient row from search.
+- Use a staging category/name such as `recipe creator` for temporary entries created only to assemble a recipe, then verify the final Custom Recipe exists before cleaning up temporary diary rows.
+- Hosting is currently Oracle Always Free. The browser workflow still needs multi-minute, stateful Chromium sessions, so keep Browserless-style providers as a fallback only if Oracle reliability degrades.
 
 ## Useful public references
 

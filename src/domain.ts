@@ -3,6 +3,14 @@ export type BackendMode = "mock" | "terra" | "browser";
 export type ProviderStatus =
   | "ok"
   | "dry_run"
+  | "accepted"
+  | "written"
+  | "already_exists"
+  | "busy"
+  | "not_written_login_paused"
+  | "not_written_ambiguous"
+  | "not_written_not_found"
+  | "possibly_written_verify_failed"
   | "not_configured"
   | "unsupported"
   | "needs_manual_step"
@@ -29,9 +37,24 @@ export interface FoodLogInput {
   meal?: string;
   query: string;
   selectedName?: string;
+  selectedSource?: string;
   amount?: number;
   unit?: string;
   timestamp?: string;
+  matchPolicy?: "high_confidence" | "selected_only" | "best_effort";
+  searchScope?: "auto" | "all" | "custom" | "favorites";
+  dryRun?: boolean;
+  confirmed?: boolean;
+  idempotencyKey?: string;
+}
+
+export interface DiaryFoodDeleteInput {
+  date?: string;
+  meal?: string;
+  name: string;
+  amount?: number;
+  unit?: string;
+  confirmName?: string;
   dryRun?: boolean;
   confirmed?: boolean;
 }
@@ -137,6 +160,15 @@ export interface CustomFoodInput {
   duplicatePolicy?: "fail" | "update_existing" | "create_new";
   dryRun?: boolean;
   confirmed?: boolean;
+}
+
+export interface CustomFoodAndLogInput extends CustomFoodInput {
+  date?: string;
+  meal?: string;
+  amount?: number;
+  unit?: string;
+  timestamp?: string;
+  nutritionSource?: string;
 }
 
 export interface CustomFoodSelectorInput {
@@ -277,12 +309,14 @@ export interface CronometerProvider {
   searchFoods(input: SearchFoodsInput): Promise<ProviderResult>;
   resolveRecipeIngredients(input: ResolveRecipeIngredientsInput): Promise<ProviderResult>;
   logFood(input: FoodLogInput): Promise<ProviderResult>;
+  deleteDiaryFoodEntry(input: DiaryFoodDeleteInput): Promise<ProviderResult>;
   logExercise(input: ExerciseLogInput): Promise<ProviderResult>;
   logBiometric(input: BiometricLogInput): Promise<ProviderResult>;
   logNote(input: NoteLogInput): Promise<ProviderResult>;
   listCustomFoods(input: CustomFoodListInput): Promise<ProviderResult>;
   findDuplicateCustomFoods(input: CustomFoodDuplicateInput): Promise<ProviderResult>;
   createCustomFood(input: CustomFoodInput): Promise<ProviderResult>;
+  createAndLogCustomFood(input: CustomFoodAndLogInput): Promise<ProviderResult>;
   updateCustomFood(input: CustomFoodUpdateInput): Promise<ProviderResult>;
   deleteCustomFood(input: CustomFoodDeleteInput): Promise<ProviderResult>;
   retireCustomFood(input: CustomFoodRetireInput): Promise<ProviderResult>;

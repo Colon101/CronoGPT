@@ -3,12 +3,14 @@ import type {
   Capability,
   CronometerProvider,
   CustomFoodDeleteInput,
+  CustomFoodAndLogInput,
   CustomFoodDuplicateInput,
   CustomFoodInput,
   CustomFoodListInput,
   CustomFoodRetireInput,
   CustomFoodUpdateInput,
   DateRangeInput,
+  DiaryFoodDeleteInput,
   ExerciseLogInput,
   ExportDataInput,
   FastInput,
@@ -109,6 +111,10 @@ export class BaseCronometerProvider implements CronometerProvider {
     return this.unsupported("log_food", input);
   }
 
+  async deleteDiaryFoodEntry(input: DiaryFoodDeleteInput): Promise<ProviderResult> {
+    return this.unsupported("delete_diary_food_entry", input);
+  }
+
   async logExercise(input: ExerciseLogInput): Promise<ProviderResult> {
     return this.unsupported("log_exercise", input);
   }
@@ -131,6 +137,10 @@ export class BaseCronometerProvider implements CronometerProvider {
 
   async createCustomFood(input: CustomFoodInput): Promise<ProviderResult> {
     return this.unsupported("create_custom_food", input);
+  }
+
+  async createAndLogCustomFood(input: CustomFoodAndLogInput): Promise<ProviderResult> {
+    return this.unsupported("create_and_log_custom_food", input);
   }
 
   async updateCustomFood(input: CustomFoodUpdateInput): Promise<ProviderResult> {

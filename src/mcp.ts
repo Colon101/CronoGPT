@@ -47,6 +47,20 @@ const commonOutputSchema = {
 export const MCP_PATH = "/mcp";
 const readToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read"] }];
 const writeToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read", "cronometer:write"] }];
+const stableModelVisibleTools = new Set([
+  "log_food",
+  "delete_diary_food_entry",
+  "search_foods",
+  "custom_food_nutrient_schema",
+  "create_custom_food",
+  "create_and_log_custom_food",
+  "update_custom_food",
+  "delete_custom_food",
+  "retire_custom_food",
+  "cronometer_runtime_status",
+  "cronometer_stability_check",
+  "refresh_cronometer_session",
+]);
 
 export function createCronoServer() {
   const server = new McpServer({ name: "cronogpt", version: "0.1.4" });
@@ -89,7 +103,8 @@ export function createCronoServer() {
     const securitySchemes = annotations.readOnlyHint === true && annotations.destructiveHint !== true
       ? readToolSecuritySchemes
       : writeToolSecuritySchemes;
-    const toolConfig = {
+    const modelVisible = process.env.CRONOGPT_FULL_TOOL_SURFACE === "true" || stableModelVisibleTools.has(name);
+    const baseToolConfig = {
       title,
       description,
       inputSchema,
@@ -98,19 +113,30 @@ export function createCronoServer() {
       annotations,
       _meta: {
         securitySchemes,
-        ui: { resourceUri: widgetUri, visibility: ["model", "app"] },
-        "openai/outputTemplate": widgetUri,
-        "openai/widgetAccessible": true,
         "openai/toolInvocation/invoking": "Running Cronometer tool...",
         "openai/toolInvocation/invoked": "Cronometer tool complete.",
       },
     };
 
+    const toolHandler = async (args: unknown) => handler((args ?? {}) as Record<string, unknown>);
+    if (modelVisible) {
+      server.registerTool(name, baseToolConfig, toolHandler);
+      return;
+    }
+
     registerAppTool(
       server,
       name,
-      toolConfig as Parameters<typeof registerAppTool>[2],
-      async (args: unknown) => handler((args ?? {}) as Record<string, unknown>),
+      {
+        ...baseToolConfig,
+        _meta: {
+          ...baseToolConfig._meta,
+          ui: { resourceUri: widgetUri, visibility: ["app"] },
+          "openai/outputTemplate": widgetUri,
+          "openai/widgetAccessible": true,
+        },
+      } as Parameters<typeof registerAppTool>[2],
+      toolHandler,
     );
   };
 
@@ -281,7 +307,7 @@ export function createCronoServer() {
       data: {
         nutrients: CUSTOM_FOOD_NUTRIENT_SCHEMA,
         summary: customFoodNutrientSchemaSummary(),
-        writeFormat: "create_custom_food.nutrients accepts any schema key, any listed alias, or an exact Cronometer display label as a numeric value in the label's Cronometer unit.",
+        writeFormat: "create_custom_food.nutrients accepts any schema key, any listed alias, or an exact Cronometer display label as a numeric value in the label's Cronometer unit. For Israeli-style labels where carbohydrates are listed excluding fiber/polyols, pass that value as total_carbs or net_carbs; cronogpt maps it to Cronometer's Total Carbs field and records fiber/sugar_alcohol separately when provided.",
       },
     }),
   );
@@ -470,19 +496,42 @@ export function createCronoServer() {
   register(
     "log_food",
     "Log food",
-    "Adds a food to the Cronometer diary. For explicit food-log requests, writes directly when server writes are enabled. Use dryRun=true only for previews or ambiguity.",
+    "Adds a food to the Cronometer diary. For explicit food-log requests, confirmed real writes are accepted as background browser jobs; poll cronometer_runtime_status until completion before retrying. Use selectedName/selectedSource from search_foods for exact choices, or dryRun=true for previews.",
     {
       date: z.string().optional(),
       meal: z.string().optional(),
       query: z.string().min(1),
       selectedName: z.string().optional(),
+      selectedSource: z.string().optional().describe("Optional Cronometer result source from search_foods, such as CRDB, NCCDB, USDA, Custom Food, Custom Recipe, or Brand."),
       amount: z.number().positive().optional(),
       unit: z.string().optional(),
       timestamp: z.string().optional(),
+      matchPolicy: z.enum(["high_confidence", "selected_only", "best_effort"]).optional().describe("Defaults to high_confidence. selected_only requires selectedName. best_effort logs the top-ranked result when writes are enabled."),
+      searchScope: z.enum(["auto", "all", "custom", "favorites"]).optional().describe("Optional food-search tab preference. Use custom for private custom foods/recipes, all for official database lookups, or auto by default."),
       dryRun: z.boolean().optional(),
+      confirmed: z.boolean().optional(),
+      idempotencyKey: z.string().optional().describe("Optional caller-supplied idempotency key. If omitted, cronogpt derives one from date, meal, food, amount, and unit."),
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     async (args) => toMcpToolResponse(await provider.logFood(args as never)),
+  );
+
+  register(
+    "delete_diary_food_entry",
+    "Delete diary food entry",
+    "Deletes one matching food entry from a Cronometer diary meal. Requires dryRun=false, confirmed=true, and confirmName exactly matching the food name. Refuses broad or multi-match deletes.",
+    {
+      date: z.string().optional(),
+      meal: z.string().optional().describe("Meal section, for example Breakfast, Lunch, Dinner, Snacks, or Supplements."),
+      name: z.string().min(1).describe("Exact visible diary food name to delete."),
+      amount: z.number().positive().optional().describe("Optional amount used to narrow the matching diary row."),
+      unit: z.string().optional().describe("Optional unit used to narrow the matching diary row."),
+      confirmName: z.string().optional().describe("Must exactly match name when executing the delete."),
+      dryRun: z.boolean().optional(),
+      confirmed: z.boolean().optional(),
+    },
+    { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    async (args) => toMcpToolResponse(await provider.deleteDiaryFoodEntry(args as never)),
   );
 
   register(
@@ -537,11 +586,11 @@ export function createCronoServer() {
   register(
     "create_custom_food",
     "Create custom food",
-    "Creates or updates a custom Cronometer food after validation and confirmation. nutrients accepts keys from custom_food_nutrient_schema, aliases such as calories/carbs/valine/glycine/vitamin_c, or exact Cronometer display labels.",
+    "Creates or updates a custom Cronometer food after validation and confirmation. This tool performs its own same-name duplicate handling; do not call list_custom_foods or find_duplicate_custom_foods first. nutrients accepts keys from custom_food_nutrient_schema, aliases such as calories/carbs/net_carbs/caffeine/valine/glycine/vitamin_c, or exact Cronometer display labels. For Israeli labels, treat listed carbohydrates as net/available carbs: pass them as total_carbs or net_carbs and pass fiber/sugar_alcohol separately if listed.",
     {
       name: z.string().min(1),
       servingSize: z.string().optional(),
-      nutrients: z.record(z.number()).optional().describe("Numeric nutrient values. Keys may be canonical schema keys, aliases, or exact Cronometer labels; call custom_food_nutrient_schema for supported macronutrients, micronutrients, amino acids, fatty acids, vitamins, and minerals."),
+      nutrients: z.record(z.number()).optional().describe("Numeric nutrient values. Keys may be canonical schema keys, aliases, or exact Cronometer labels; call custom_food_nutrient_schema for supported macronutrients, micronutrients, amino acids, fatty acids, vitamins, and minerals. Include caffeine in mg when relevant. For Israeli labels, use total_carbs/net_carbs for available carbohydrates and record fiber/sugar_alcohol separately when provided."),
       barcode: z.string().optional(),
       duplicatePolicy: z.enum(["fail", "update_existing", "create_new"]).optional().describe("Defaults to update_existing for exactly one same-named food, fails on multiple matches, and creates only when no match exists. Use create_new only when a duplicate is intentional."),
       dryRun: z.boolean().optional(),
@@ -549,6 +598,29 @@ export function createCronoServer() {
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     async (args) => toMcpToolResponse(await provider.createCustomFood(args as never)),
+  );
+
+  register(
+    "create_and_log_custom_food",
+    "Create and log custom food",
+    "End-to-end workflow for packaged foods missing from Cronometer: after ChatGPT researches nutrition facts on the web and calculates the serving macros, call this tool directly. It performs same-name duplicate handling internally, creates or updates the Cronometer custom food, then logs that exact custom food to the diary meal, defaulting to Snacks. Do not call list_custom_foods or find_duplicate_custom_foods first. Use dryRun=true only when nutrition facts are uncertain. Requires confirmed=true for real writes.",
+    {
+      name: z.string().min(1).describe("Exact custom food name to create/update and then log."),
+      servingSize: z.string().optional().describe("Serving size for the custom food, for example '100 g', '1 serving', '250 ml', or '1 oz'."),
+      nutrients: z.record(z.number()).optional().describe("Researched numeric nutrient values using custom_food_nutrient_schema keys, aliases, or exact Cronometer labels. Include calories, protein, total_carbs/net_carbs, fat, fiber, sugars, sodium, caffeine, vitamins, etc. when available."),
+      nutritionSource: z.string().optional().describe("Short citation or URL/title summary of where ChatGPT found the nutrition facts. Stored in the tool result for audit; not written as a secret."),
+      barcode: z.string().optional(),
+      duplicatePolicy: z.enum(["fail", "update_existing", "create_new"]).optional().describe("Defaults to update_existing so an existing same-named custom food is updated rather than duplicated."),
+      date: z.string().optional(),
+      meal: z.string().optional().describe("Diary meal to log to. Defaults to Snacks."),
+      amount: z.number().positive().optional().describe("Amount to log in the diary. Defaults to 1."),
+      unit: z.string().optional().describe("Diary unit to log. Omit to use Cronometer's default serving if appropriate."),
+      timestamp: z.string().optional(),
+      dryRun: z.boolean().optional(),
+      confirmed: z.boolean().optional(),
+    },
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    async (args) => toMcpToolResponse(await provider.createAndLogCustomFood(args as never)),
   );
 
   register(
@@ -1162,6 +1234,10 @@ export async function handleMcpHttpRequest(req: IncomingMessage, res: ServerResp
         mode: provider.mode,
         mcp: MCP_PATH,
         authConfigured: Boolean(getAuthToken()),
+        publicOrigin: process.env.APP_PUBLIC_ORIGIN,
+        gitCommit: process.env.CRONOGPT_GIT_COMMIT,
+        buildTimestamp: process.env.CRONOGPT_BUILD_TIMESTAMP,
+        stableToolSurface: process.env.CRONOGPT_FULL_TOOL_SURFACE !== "true",
       }));
     return;
   }

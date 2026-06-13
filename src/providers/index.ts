@@ -41,11 +41,14 @@ export function createProviderFromEnv(): CronometerProvider {
       requireFoodConfirmation: env("CRONOMETER_REQUIRE_FOOD_CONFIRMATION") === "true",
       navigationTimeoutMs: Number(env("CRONOMETER_NAVIGATION_TIMEOUT_MS") ?? 20000),
       loginBackoffMs: Number(env("CRONOMETER_LOGIN_BACKOFF_MS") ?? 15 * 60 * 1000),
+      loginBackoffFile: env("CRONOMETER_LOGIN_BACKOFF_FILE") ?? ".cronometer-login-backoff.json",
       operationTimeoutMs: Number(env("CRONOMETER_OPERATION_TIMEOUT_MS") ?? 600000),
       browserRetryCount: Number(env("CRONOMETER_BROWSER_RETRY_COUNT") ?? 1),
       timeZone: env("CRONOMETER_TIME_ZONE") ?? "Asia/Jerusalem",
+      browserProfileDir: env("CRONOMETER_BROWSER_PROFILE_DIR"),
       reuseRemoteContext: env("CRONOMETER_REUSE_REMOTE_CONTEXT") === "true",
       reuseLocalBrowser: env("CRONOMETER_REUSE_LOCAL_BROWSER") === "true",
+      strictAccountVerification: env("CRONOMETER_STRICT_ACCOUNT_VERIFICATION") === "true",
     });
   }
 

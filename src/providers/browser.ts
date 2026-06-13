@@ -1,8 +1,11 @@
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 import type {
   BiometricLogInput,
   Capability,
   CustomFoodDeleteInput,
+  CustomFoodAndLogInput,
   CustomFoodDuplicateInput,
   CustomFoodInput,
   CustomFoodListInput,
@@ -11,6 +14,7 @@ import type {
   CustomFoodUpdateInput,
   CustomRecipeSelectorInput,
   DateRangeInput,
+  DiaryFoodDeleteInput,
   ExerciseLogInput,
   ExportDataInput,
   FastInput,
@@ -32,6 +36,16 @@ import type {
 import { BaseCronometerProvider } from "./base.js";
 import { capabilitiesForMode } from "../features.js";
 import { customFoodNutrientLabelForKey } from "../nutrients.js";
+import {
+  foodLogBrowserPreflightData,
+  normalizeFoodLogDate,
+  normalizeFoodLogInput,
+  normalizeFoodLogMeal,
+  normalizeFoodLogUnit,
+  retryGuidanceForFoodLog,
+  verifyFoodLogInDiaryText,
+  type NormalizedFoodLog,
+} from "../food-log-transaction.js";
 
 export interface BrowserConfig {
   email?: string;
@@ -44,14 +58,17 @@ export interface BrowserConfig {
   requireFoodConfirmation: boolean;
   navigationTimeoutMs: number;
   loginBackoffMs: number;
+  loginBackoffFile?: string;
   operationTimeoutMs: number;
   browserRetryCount: number;
   timeZone: string;
+  browserProfileDir?: string;
   reuseRemoteContext?: boolean;
   reuseLocalBrowser?: boolean;
+  strictAccountVerification?: boolean;
 }
 
-interface SearchResult {
+export interface SearchResult {
   name: string;
   source?: string;
   raw: string;
@@ -66,6 +83,19 @@ interface DiaryDateStatus {
   strategy: "current" | "today" | "arrow" | "invalid" | "out_of_range" | "failed";
   steps?: number;
   warning?: string;
+}
+
+interface NormalizedDiaryFoodDelete {
+  original: DiaryFoodDeleteInput;
+  date: string;
+  meal: string;
+  name: string;
+  amount?: number;
+  unit?: string;
+}
+
+interface DiaryFoodEntryMatch {
+  entryText: string;
 }
 
 interface FoodSearchOutcome {
@@ -104,11 +134,23 @@ interface CustomRecipeDetail {
 }
 
 interface BrowserSession {
-  browser: Browser;
+  browser?: Browser;
   context: BrowserContext;
   page: Page;
   closeContext?: boolean;
   closeBrowser?: boolean;
+}
+
+interface BackgroundBrowserJob {
+  id: string;
+  key: string;
+  feature: string;
+  status: "running" | "completed" | "failed";
+  startedAt: number;
+  updatedAt: number;
+  input: unknown;
+  result?: ProviderResult;
+  error?: string;
 }
 
 interface ParsedStorageState {
@@ -158,8 +200,12 @@ let browserQueue: Promise<void> = Promise.resolve();
 let activeBrowserJobs = 0;
 let queuedBrowserJobs = 0;
 let browserJobSeq = 0;
-let activeBrowserJob: { id: number; feature: string; startedAt: number } | undefined;
+let browserQueueEpoch = 0;
+let activeBrowserJob: { id: number; feature: string; startedAt: number; staleJobMs?: number } | undefined;
 const queuedBrowserJobEntries = new Map<number, { feature: string; enqueuedAt: number }>();
+let backgroundBrowserJobSeq = 0;
+const backgroundBrowserJobs = new Map<string, BackgroundBrowserJob>();
+const backgroundBrowserJobKeys = new Map<string, string>();
 let cachedLocalSession: BrowserSession | undefined;
 let cachedAccountVerification: { normalizedEmail: string; verifiedAt: number; source: string } | undefined;
 
@@ -201,7 +247,9 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   async runtimeStatus(): Promise<ProviderResult> {
     const now = Date.now();
-    const loginPaused = now < loginBackoffUntil;
+    const queue = releaseAndSnapshotBrowserQueue(this.config.operationTimeoutMs + this.featureQueueWaitTimeoutMs("log_food"));
+    const loginBackoff = this.currentLoginBackoff();
+    const loginPaused = now < loginBackoff.until;
     const storageStateInfo = this.storageStateInfo();
     const expectedAccountEmail = normalizeEmail(this.config.email);
     const accountVerificationCached = Boolean(
@@ -228,32 +276,31 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       expectedAccount: redactEmail(this.config.email),
       accountVerificationCached,
       accountVerificationSource: cachedAccountVerification?.source,
+      strictAccountVerification: Boolean(this.config.strictAccountVerification),
       writeEnabled: this.config.writeEnabled,
       requireFoodConfirmation: this.config.requireFoodConfirmation,
-      activeBrowserJobs,
-      queuedBrowserJobs,
-      activeBrowserJob: activeBrowserJob
-        ? {
-          ...activeBrowserJob,
-          ageMs: now - activeBrowserJob.startedAt,
-        }
-        : undefined,
-      queuedBrowserJobSample: Array.from(queuedBrowserJobEntries.entries()).slice(0, 8).map(([id, job]) => ({
-        id,
-        feature: job.feature,
-        ageMs: now - job.enqueuedAt,
-      })),
+      activeBrowserJobs: queue.activeBrowserJobs,
+      queuedBrowserJobs: queue.queuedBrowserJobs,
+      activeBrowserJob: queue.activeBrowserJob,
+      queuedBrowserJobSample: queue.queuedBrowserJobSample,
+      staleActiveJob: queue.staleActiveJob,
+      backgroundBrowserJobs: summarizeBackgroundBrowserJobs(now),
       operationTimeoutMs: this.config.operationTimeoutMs,
       browserRetryCount: this.config.browserRetryCount,
+      browserProfileDirConfigured: Boolean(this.config.browserProfileDir),
       reuseLocalBrowser: this.config.reuseLocalBrowser,
       loginPaused,
-      loginPauseSecondsRemaining: loginPaused ? Math.ceil((loginBackoffUntil - now) / 1000) : 0,
-      lastLoginFailure,
+      loginPauseSecondsRemaining: loginPaused ? Math.ceil((loginBackoff.until - now) / 1000) : 0,
+      loginBackoffSource: loginBackoff.source,
+      loginBackoffFileConfigured: Boolean(this.config.loginBackoffFile),
+      lastLoginFailure: loginBackoff.reason,
       guidance: [
         "Use dryRun=true for validation and previews; dry-run write tools do not open Cronometer.",
-        "Call refresh_cronometer_session before a long browser workflow to warm and verify the current hosted session.",
+        "Use refresh_cronometer_session only as an optional read-only warmup; do not block a confirmed create_and_log_custom_food workflow on it.",
+        "Confirmed log_food writes run as background jobs; poll cronometer_runtime_status until the job is completed before retrying.",
+        "Confirmed create_and_log_custom_food writes run as background jobs; poll cronometer_runtime_status until the job is completed before retrying.",
         "Use resolve_recipe_ingredients with a low limitPerIngredient and a larger maxSeconds value for large recipes.",
-        "If loginPaused is true, wait or provide durable storage state/remote browser before retrying browser actions.",
+        "If loginPaused is true and storageStateUsable is false, wait or provide durable storage state/remote browser before retrying browser actions. Usable storage state may still allow non-login browser actions during cooldown.",
         "For the most reliable hosted writes, configure a persistent remote browser or CRONOMETER_STORAGE_STATE_BASE64.",
       ],
     });
@@ -404,9 +451,11 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     return this.withPage("search_foods", async (page) => {
       const outcome = await this.searchFoodUi(page, input.query, input.limit ?? 10);
       const results = rankFoodResults(input.query, outcome.results);
+      const selection = chooseFoodLogResult({ query: input.query }, results);
       return this.result("search_foods", "ok", {
         query: input.query,
         results,
+        selection,
       });
     });
   }
@@ -479,80 +528,452 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   async logFood(input: FoodLogInput & { confirmed?: boolean }) {
-    return this.withPage("log_food", async (page) => {
-      const { results: preview, dateStatus } = await this.searchFoodUi(page, input.query, 5, input.date);
-      if (input.date && !dateStatus.selected) {
-        return this.result(
-          "log_food",
-          "needs_manual_step",
-          { input: safeInput(input), dateStatus },
-          dateStatus.warning ?? "Could not apply the requested diary date. No write was attempted.",
-        );
-      }
-      const shouldWrite =
-        this.config.writeEnabled &&
-        input.dryRun !== true &&
-        input.confirmed !== false &&
-        (!this.config.requireFoodConfirmation || input.confirmed === true);
+    const normalized = normalizeFoodLogInput(input, this.config.timeZone);
+    const preflightData = foodLogBrowserPreflightData(normalized);
 
-      if (!shouldWrite) {
-        const reason = !this.config.writeEnabled
-          ? "Cronometer writes are disabled on the server."
-          : input.dryRun === true
-            ? "Dry-run preview requested."
-            : input.confirmed === false
-              ? "The request explicitly declined confirmation."
-              : "Food log confirmation is required by CRONOMETER_REQUIRE_FOOD_CONFIRMATION.";
-        return this.result("log_food", "dry_run", {
+    if (input.dryRun === true) {
+      return this.result("log_food", "dry_run", {
+        ...preflightData,
+        input: safeInput(input),
+        browserOpened: false,
+        writeAttempted: false,
+        verification: {
+          status: "not_attempted",
+          reason: "Dry-run requested; no browser was opened.",
+        },
+        retry: retryGuidanceForFoodLog("dry_run"),
+      });
+    }
+
+    const loginBackoff = this.currentLoginBackoff();
+    if (Date.now() < loginBackoff.until && !this.storageStateInfo().usable) {
+      const waitSeconds = Math.ceil((loginBackoff.until - Date.now()) / 1000);
+      return this.loginPausedResult("log_food", waitSeconds, loginBackoff.reason, {
+        ...preflightData,
+        input: safeInput(input),
+        browserOpened: false,
+        writeAttempted: false,
+      });
+    }
+
+    const willAttemptWrite =
+      this.config.writeEnabled &&
+      input.confirmed !== false &&
+      (!this.config.requireFoodConfirmation || input.confirmed === true);
+    if (willAttemptWrite) {
+      const backgroundKey = backgroundBrowserJobKey("log_food", {
+        idempotencyKey: normalized.idempotencyKey,
+      });
+      return this.startBackgroundBrowserJob(
+        "log_food",
+        backgroundKey,
+        {
+          ...preflightData,
+          input: safeInput(input),
+        },
+        () => this.withPage("log_food", (page) => this.logFoodOnPage(page, input, normalized, preflightData)),
+      );
+    }
+
+    return this.withPage("log_food", (page) => this.logFoodOnPage(page, input, normalized, preflightData));
+  }
+
+  private async logFoodOnPage(
+    page: Page,
+    input: FoodLogInput & { confirmed?: boolean },
+    normalized: NormalizedFoodLog,
+    preflightData: ReturnType<typeof foodLogBrowserPreflightData>,
+  ): Promise<ProviderResult> {
+    const requested = normalizedToFoodInput(normalized, input);
+    const initialDateStatus = await this.openDiary(page, normalized.date);
+    const beforeDiaryText = await this.visibleText(page).catch(() => "");
+    const beforeVerification = verifyFoodLogInDiaryText(beforeDiaryText, normalized);
+    if (!initialDateStatus.selected) {
+      return this.result(
+        "log_food",
+        "error",
+        {
+          ...preflightData,
+          input: safeInput(input),
+          browserOpened: true,
+          writeAttempted: false,
+          dateStatus: initialDateStatus,
+          verification: beforeVerification,
+          retry: retryGuidanceForFoodLog("error"),
+        },
+        initialDateStatus.warning ?? "Could not apply the requested diary date. No write was attempted.",
+      );
+    }
+
+    if (beforeVerification.status === "verified") {
+      return this.result("log_food", "already_exists", {
+        ...preflightData,
+        input: safeInput(input),
+        browserOpened: true,
+        writeAttempted: false,
+        dateStatus: initialDateStatus,
+        verification: beforeVerification,
+        retry: retryGuidanceForFoodLog("already_exists"),
+      });
+    }
+
+    const foodSearch = await this.searchFoodForLog(page, normalized, requested, input);
+    const { preview, dateStatus, queryUsed } = foodSearch;
+    if (!dateStatus.selected) {
+      return this.result(
+        "log_food",
+        "error",
+        {
+          ...preflightData,
+          input: safeInput(input),
+          browserOpened: true,
+          writeAttempted: false,
+          dateStatus,
+          queryUsed,
+          retry: retryGuidanceForFoodLog("error"),
+        },
+        dateStatus.warning ?? "Could not apply the requested diary date. No write was attempted.",
+      );
+    }
+
+    if (preview.length === 0) {
+      return this.result("log_food", "not_written_not_found", {
+        ...preflightData,
+        input: safeInput(input),
+        dateStatus,
+        preview,
+        browserOpened: true,
+        writeAttempted: false,
+        queryUsed,
+        retry: retryGuidanceForFoodLog("not_written_not_found"),
+      }, "No matching Cronometer food result was found.");
+    }
+
+    const selection = chooseFoodLogResult({ ...requested, query: queryUsed }, preview);
+    const shouldWrite =
+      this.config.writeEnabled &&
+      input.dryRun !== true &&
+      input.confirmed !== false &&
+      (!this.config.requireFoodConfirmation || input.confirmed === true);
+
+    if (!shouldWrite) {
+      const reason = writeGateReasonForFoodLog(input, this.config.writeEnabled, this.config.requireFoodConfirmation);
+      return this.result("log_food", "dry_run", {
+        ...preflightData,
+        input: safeInput(input),
+        dateStatus,
+        preview,
+        selection,
+        browserOpened: true,
+        writeAttempted: false,
+        queryUsed,
+        reason,
+        nextStep: selection.result
+          ? "Review the selectedName/selectedSource, then call again without dryRun=true to write the explicit food log."
+          : selection.nextStep,
+      }, selection.result ? undefined : selection.warning);
+    }
+
+    if (!selection.result) {
+      return this.result(
+        "log_food",
+        "not_written_ambiguous",
+        {
+          ...preflightData,
           input: safeInput(input),
           dateStatus,
           preview,
-          reason,
-          nextStep: this.config.writeEnabled
-            ? "Call again without dryRun=true to write the explicit food log."
-            : "Set CRONOMETER_ENABLE_WRITES=true to allow Cronometer diary writes.",
+          selection,
+          browserOpened: true,
+          writeAttempted: false,
+          queryUsed,
+          retry: retryGuidanceForFoodLog("not_written_ambiguous"),
+          nextStep: selection.nextStep,
+        },
+        selection.warning,
+      );
+    }
+
+    const selectedName = selection.result.name;
+    const selectedSource = selection.result.source;
+    const clicked = await clickFoodSearchResult(page, selectedName, selectedSource);
+    if (!clicked) {
+      return this.result(
+        "log_food",
+        "not_written_ambiguous",
+        {
+          ...preflightData,
+          input: safeInput(input),
+          selectedName,
+          selectedSource,
+          preview,
+          selection,
+          browserOpened: true,
+          writeAttempted: false,
+          queryUsed,
+          retry: retryGuidanceForFoodLog("not_written_ambiguous"),
+        },
+        "Found food candidates but could not select one with stable UI selectors.",
+      );
+    }
+
+    await page.waitForTimeout(1000);
+    await fillFoodTime(page, input.timestamp);
+    const unitFill = await fillFoodUnit(page, normalized.unit);
+    if (!unitFill.filled) {
+      return this.result(
+        "log_food",
+        "needs_manual_step",
+        {
+          ...preflightData,
+          input: safeInput(input),
+          selectedName,
+          selectedSource,
+          selection,
+          unitFill,
+          browserOpened: true,
+          writeAttempted: false,
+          queryUsed,
+          retry: retryGuidanceForFoodLog("needs_manual_step"),
+        },
+        unitFill.warning ?? `Could not select requested unit ${normalized.unit}. No food was written.`,
+      );
+    }
+    const amountFill = await fillFoodAmount(page, normalized.amount);
+    if (!amountFill.filled) {
+      return this.result(
+        "log_food",
+        "needs_manual_step",
+        {
+          ...preflightData,
+          input: safeInput(input),
+          selectedName,
+          selectedSource,
+          selection,
+          unitFill,
+          amountFill,
+          browserOpened: true,
+          writeAttempted: false,
+          queryUsed,
+          retry: retryGuidanceForFoodLog("needs_manual_step"),
+        },
+        amountFill.warning ?? `Could not fill requested amount ${normalized.amount}. No food was written.`,
+      );
+    }
+    await chooseMeal(page, input.meal);
+
+    const saved = await clickDialogButton(page, /^(ADD|ADD TO DIARY|ADD TO DIARY|SAVE|DONE)$/i);
+    if (!saved) {
+      return this.result(
+        "log_food",
+        "possibly_written_verify_failed",
+        {
+          ...preflightData,
+          input: safeInput(input),
+          selectedName,
+          selectedSource,
+          browserOpened: true,
+          writeAttempted: true,
+          queryUsed,
+          retry: retryGuidanceForFoodLog("possibly_written_verify_failed"),
+        },
+        "Selected the food but could not find a stable add/save button. Nothing was intentionally saved.",
+      );
+    }
+
+    await page.waitForTimeout(1500);
+    const afterText = await this.waitForDiaryText(page).catch(() => "");
+    const verification = verifyFoodLogInDiaryText(afterText || await this.visibleText(page).catch(() => ""), {
+      ...normalized,
+      selectedName,
+      selectedSource,
+    });
+    const status = verification.status === "verified" ? "written" : "possibly_written_verify_failed";
+    return this.result("log_food", status, {
+      ...preflightData,
+      logged: { ...safeInput(input), selectedName, selectedSource },
+      dateStatus,
+      selection,
+      unitFill,
+      amountFill,
+      browserOpened: true,
+      writeAttempted: true,
+      queryUsed,
+      verification,
+      retry: retryGuidanceForFoodLog(status),
+      visibleText: verification.status === "verified" ? undefined : compactText(await this.visibleText(page).catch(() => ""), 6000),
+    }, verification.status === "verified" ? undefined : "Food may have been written, but read-back verification did not find the exact entry. Do not blindly retry.");
+  }
+
+  async deleteDiaryFoodEntry(input: DiaryFoodDeleteInput & { confirmed?: boolean }) {
+    const target = normalizeDiaryFoodDeleteInput(input, this.config.timeZone);
+    const confirmedDelete = input.dryRun === false && input.confirmed === true;
+    if (confirmedDelete) {
+      const backgroundKey = backgroundBrowserJobKey("delete_diary_food_entry", {
+        date: target.date,
+        meal: target.meal,
+        name: target.name,
+        amount: target.amount,
+        unit: target.unit,
+        confirmName: input.confirmName,
+      });
+      return this.startBackgroundBrowserJob(
+        "delete_diary_food_entry",
+        backgroundKey,
+        safeInput(input),
+        () => this.runDeleteDiaryFoodEntry(input),
+      );
+    }
+    return this.runDeleteDiaryFoodEntry(input);
+  }
+
+  private async runDeleteDiaryFoodEntry(input: DiaryFoodDeleteInput & { confirmed?: boolean }) {
+    const target = normalizeDiaryFoodDeleteInput(input, this.config.timeZone);
+    if (!target.name) {
+      return this.result("delete_diary_food_entry", "error", {
+        input: safeInput(input),
+        browserOpened: false,
+        writeAttempted: false,
+      }, "Missing diary food name.");
+    }
+
+    return this.withPage("delete_diary_food_entry", async (page) => {
+      const dateStatus = await this.openDiary(page, target.date);
+      const beforeText = await this.waitForDiaryText(page).catch(async () => await this.visibleText(page).catch(() => ""));
+      const matches = findDiaryFoodEntryMatches(beforeText, target);
+      const preview = {
+        target: safeInput(target),
+        matchCount: matches.length,
+        matches: matches.map((match) => ({ entryText: compactText(match.entryText, 500) })),
+      };
+
+      if (!dateStatus.selected) {
+        return this.result(
+          "delete_diary_food_entry",
+          "error",
+          {
+            input: safeInput(input),
+            dateStatus,
+            preview,
+            browserOpened: true,
+            writeAttempted: false,
+          },
+          dateStatus.warning ?? "Could not apply the requested diary date. No delete was attempted.",
+        );
+      }
+
+      if (matches.length === 0) {
+        return this.result("delete_diary_food_entry", "ok", {
+          input: safeInput(input),
+          dateStatus,
+          preview,
+          deleted: false,
+          alreadyAbsent: true,
+          browserOpened: true,
+          writeAttempted: false,
         });
       }
 
-      if (preview.length === 0) {
-        return this.result("log_food", "needs_manual_step", { input: safeInput(input) }, "No matching Cronometer food result was found.");
+      if (input.dryRun !== false || !input.confirmed) {
+        return this.result("delete_diary_food_entry", "dry_run", {
+          input: safeInput(input),
+          dateStatus,
+          preview,
+          browserOpened: true,
+          writeAttempted: false,
+          nextStep: "Review the exact match, then call delete_diary_food_entry with dryRun=false, confirmed=true, and confirmName equal to the diary food name.",
+        });
       }
 
-      const selectedResult = pickFoodResult(input.query, preview, input.selectedName);
-      const selectedName = selectedResult?.name ?? input.selectedName ?? input.query;
-      const clicked = await clickFoodSearchResult(page, selectedName);
-      if (!clicked) {
-        return this.result(
-          "log_food",
-          "needs_manual_step",
-          { input: safeInput(input), selectedName, preview },
-          "Found food candidates but could not select one with stable UI selectors.",
-        );
+      if (input.confirmName?.trim() !== target.name) {
+        return this.result("delete_diary_food_entry", "needs_manual_step", {
+          input: safeInput(input),
+          dateStatus,
+          preview,
+          browserOpened: true,
+          writeAttempted: false,
+          nextStep: `Set confirmName exactly to ${target.name}.`,
+        }, "Diary food delete requires confirmName to match the target food name exactly.");
       }
 
-      await page.waitForTimeout(1000);
-      await fillFoodAmount(page, input.amount);
-      await fillFoodTime(page, input.timestamp);
-      await fillFoodUnit(page, input.unit);
-      await chooseMeal(page, input.meal);
-
-      const saved = await clickDialogButton(page, /^(ADD|ADD TO DIARY|ADD TO DIARY|SAVE|DONE)$/i);
-      if (!saved) {
-        return this.result(
-          "log_food",
-          "needs_manual_step",
-          { input: safeInput(input), selectedName },
-          "Selected the food but could not find a stable add/save button. Nothing was intentionally saved.",
-        );
+      if (matches.length > 1) {
+        return this.result("delete_diary_food_entry", "needs_manual_step", {
+          input: safeInput(input),
+          dateStatus,
+          preview,
+          browserOpened: true,
+          writeAttempted: false,
+          nextStep: "Narrow the delete request with amount and unit, or delete manually from Cronometer.",
+        }, "Multiple matching diary entries were found in the requested meal. No delete was attempted.");
       }
 
-      await page.waitForTimeout(1500);
-      return this.result("log_food", "ok", {
-        logged: { ...safeInput(input), selectedName },
+      const clicked = await clickDiaryFoodEntryRow(page, target, matches[0]);
+      if (!clicked.clicked) {
+        return this.result("delete_diary_food_entry", "needs_manual_step", {
+          input: safeInput(input),
+          dateStatus,
+          preview,
+          click: clicked,
+          browserOpened: true,
+          writeAttempted: false,
+        }, clicked.warning ?? "Could not select the matching diary row with stable UI selectors.");
+      }
+
+      const deleteTrigger = await triggerSelectedDiaryEntryDelete(page);
+      const confirmation = await confirmSelectedDiaryEntryDelete(page);
+      if (!confirmation.confirmed) {
+        return this.result("delete_diary_food_entry", "needs_manual_step", {
+          input: safeInput(input),
+          dateStatus,
+          preview,
+          click: clicked,
+          deleteTrigger,
+          deleteConfirmation: confirmation,
+          browserOpened: true,
+          writeAttempted: false,
+        }, confirmation.warning ?? "Cronometer did not show the expected selected-entry delete confirmation.");
+      }
+
+      await page.waitForTimeout(2500);
+      const afterText = await this.waitForDiaryText(page).catch(async () => await this.visibleText(page).catch(() => ""));
+      const remainingMatches = findDiaryFoodEntryMatches(afterText, target);
+      return this.result("delete_diary_food_entry", remainingMatches.length === 0 ? "ok" : "needs_manual_step", {
+        input: safeInput(input),
         dateStatus,
-        visibleText: compactText(await this.visibleText(page), 6000),
-      });
+        preview,
+        click: clicked,
+        deleteTrigger,
+        deleteConfirmation: confirmation,
+        deleted: remainingMatches.length === 0,
+        remainingMatchCount: remainingMatches.length,
+        browserOpened: true,
+        writeAttempted: true,
+        afterText: remainingMatches.length === 0 ? undefined : compactText(afterText, 4000),
+      }, remainingMatches.length === 0 ? undefined : "Delete was attempted, but the matching diary entry still appears after read-back.");
     });
+  }
+
+  private async searchFoodForLog(
+    page: Page,
+    normalized: NormalizedFoodLog,
+    requested: FoodLogInput,
+    original: FoodLogInput,
+  ) {
+    let lastOutcome: FoodSearchOutcome | undefined;
+    let lastQuery = normalized.searchQueries[0] ?? normalized.query;
+    for (const query of normalized.searchQueries) {
+      lastQuery = query;
+      const outcome = await this.searchFoodUi(page, query, 5, normalized.date, {
+        searchScope: original.searchScope,
+        selectedSource: original.selectedSource,
+      });
+      lastOutcome = outcome;
+      if (outcome.results.length > 0 || !outcome.dateStatus.selected) {
+        return { preview: outcome.results, dateStatus: outcome.dateStatus, queryUsed: query };
+      }
+    }
+    const fallbackDateStatus = lastOutcome?.dateStatus ?? await this.openDiary(page, normalized.date);
+    return { preview: lastOutcome?.results ?? [], dateStatus: fallbackDateStatus, queryUsed: lastQuery };
   }
 
   async logExercise(input: ExerciseLogInput & { confirmed?: boolean }) {
@@ -605,6 +1026,26 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   async createCustomFood(input: CustomFoodInput & { confirmed?: boolean }) {
+    const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
+    if (confirmedWrite) {
+      const backgroundKey = backgroundBrowserJobKey("create_custom_food", {
+        name: input.name,
+        servingSize: input.servingSize,
+        nutrients: input.nutrients,
+        barcode: input.barcode,
+        duplicatePolicy: input.duplicatePolicy ?? "update_existing",
+      });
+      return this.startBackgroundBrowserJob(
+        "create_custom_food",
+        backgroundKey,
+        safeInput(input),
+        () => this.runCreateCustomFood(input),
+      );
+    }
+    return this.runCreateCustomFood(input);
+  }
+
+  private async runCreateCustomFood(input: CustomFoodInput & { confirmed?: boolean }) {
     const startedAt = Date.now();
     const trace: CustomFoodTraceEntry[] = [];
     const traceStep = (step: string, details?: Record<string, unknown>) => logCustomFoodStep(input.name, startedAt, step, details, trace);
@@ -614,6 +1055,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       return this.result("create_custom_food", "dry_run", {
         input: safeInput(input),
         duplicatePolicy,
+        preview: customFoodWritePreview(input),
         reason: writeGateReason(input, this.config.writeEnabled),
         nextStep: this.config.writeEnabled
           ? "Call again with confirmed=true. duplicatePolicy defaults to update_existing for exactly one same-named food, fails on multiple matches, and creates only when no match exists."
@@ -621,99 +1063,239 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       });
     }
 
-    return this.withPage("create_custom_food", async (page) => {
-      traceStep("open_custom_foods:start");
-      await this.openApp(page, "#custom-foods");
-      traceStep("open_custom_foods:done", { url: page.url() });
-      const existing = await resolveCustomFoodTargets(page, { name: input.name }, { maxDetails: 12, timeoutMs: this.config.navigationTimeoutMs });
-      traceStep("duplicates_resolved", { existingCount: existing.targets.length, visibleNameCount: existing.names.length, duplicatePolicy });
-      if (existing.targets.length > 0 && duplicatePolicy === "fail") {
-        return this.result("create_custom_food", "needs_manual_step", {
-          input: safeInput(input),
-          duplicatePolicy,
-          existingFoods: existing.targets,
-          duplicateGroups: duplicateGroups(existing.targets.map((food) => food.name)),
-          trace,
-          nextStep: "Use update_custom_food with foodId/name to edit an existing food, or call create_custom_food with duplicatePolicy=create_new if a duplicate is intentional.",
-        }, "A custom food with this name already exists. Refusing to create a duplicate by default.");
-      }
+    return this.withPage("create_custom_food", (page) =>
+      this.createCustomFoodOnPage(page, input, duplicatePolicy, trace, traceStep)
+    );
+  }
 
-      const shouldUpdateExisting = existing.targets.length === 1 && duplicatePolicy === "update_existing";
-      if (existing.targets.length > 1 && duplicatePolicy === "update_existing") {
-        return this.result("create_custom_food", "needs_manual_step", {
-          input: safeInput(input),
-          duplicatePolicy,
-          existingFoods: existing.targets,
-          trace,
-          nextStep: "More than one matching custom food exists. Call update_custom_food with a specific foodId.",
-        }, "Cannot update existing because multiple matching custom foods were found.");
-      }
+  private async createCustomFoodOnPage(
+    page: Page,
+    input: CustomFoodInput & { confirmed?: boolean },
+    duplicatePolicy: NonNullable<CustomFoodInput["duplicatePolicy"]>,
+    trace: CustomFoodTraceEntry[],
+    traceStep: (step: string, details?: Record<string, unknown>) => void,
+  ): Promise<ProviderResult> {
+    traceStep("open_custom_foods:start");
+    await this.openApp(page, "#custom-foods");
+    traceStep("open_custom_foods:done", { url: page.url() });
+    const existing = duplicatePolicy === "create_new"
+      ? { names: [], targets: [] as CustomFoodDetail[] }
+      : await resolveCustomFoodTargets(page, { name: input.name }, {
+          maxDetails: 12,
+          timeoutMs: this.config.navigationTimeoutMs,
+          lightweightExactName: true,
+        });
+    traceStep(duplicatePolicy === "create_new" ? "duplicates_skipped" : "duplicates_resolved", {
+      existingCount: existing.targets.length,
+      visibleNameCount: existing.names.length,
+      duplicatePolicy,
+    });
+    if (existing.targets.length > 0 && duplicatePolicy === "fail") {
+      return this.result("create_custom_food", "needs_manual_step", {
+        input: safeInput(input),
+        duplicatePolicy,
+        existingFoods: existing.targets,
+        duplicateGroups: duplicateGroups(existing.targets.map((food) => food.name)),
+        trace,
+        nextStep: "Use update_custom_food with foodId/name to edit an existing food, or call create_custom_food with duplicatePolicy=create_new if a duplicate is intentional.",
+      }, "A custom food with this name already exists. Refusing to create a duplicate by default.");
+    }
 
-      const openedExisting = shouldUpdateExisting ? await openCustomFoodTarget(page, existing.targets[0]) : false;
-      const openedCreateForm = openedExisting || await clickByText(page, /^CREATE FOOD$/i);
-      traceStep("editor_opened", { openedExisting, openedCreateForm });
-      if (!openedCreateForm) {
-        const visibleText = compactText(await this.visibleText(page), 10000);
-        return this.result("create_custom_food", "needs_manual_step", { input: safeInput(input), trace, visibleText }, "Could not find an existing custom food or CREATE FOOD.");
-      }
+    const shouldUpdateExisting = existing.targets.length === 1 && duplicatePolicy === "update_existing";
+    if (existing.targets.length > 1 && duplicatePolicy === "update_existing") {
+      return this.result("create_custom_food", "needs_manual_step", {
+        input: safeInput(input),
+        duplicatePolicy,
+        existingFoods: existing.targets,
+        trace,
+        nextStep: "More than one matching custom food exists. Call update_custom_food with a specific foodId.",
+      }, "Cannot update existing because multiple matching custom foods were found.");
+    }
 
-      await page.waitForTimeout(1200);
-      const nameFilled = await fillCustomFoodName(page, input.name);
-      const serving = await fillCustomFoodServing(page, input.servingSize);
-      traceStep("basics_filled", { nameFilled, servingWarning: serving.warning });
-      const nutrients = await fillCustomFoodNutrients(page, input.nutrients ?? {});
-      traceStep("nutrients_filled", summarizeFillResults(nutrients));
+    const openedExisting = shouldUpdateExisting ? await openCustomFoodTarget(page, existing.targets[0]) : false;
+    const openedCreateForm = openedExisting || await clickByText(page, /^CREATE FOOD$/i);
+    traceStep("editor_opened", { openedExisting, openedCreateForm });
+    if (!openedCreateForm) {
+      const visibleText = compactText(await this.visibleText(page), 10000);
+      return this.result("create_custom_food", "needs_manual_step", { input: safeInput(input), trace, visibleText }, "Could not find an existing custom food or CREATE FOOD.");
+    }
 
-      const saved = await clickByText(page, /^SAVE CHANGES$/i);
-      traceStep("save_clicked", { saved });
-      if (!saved) {
-        return this.result(
-          "create_custom_food",
-          "needs_manual_step",
-          {
-            input: safeInput(input),
-            nameFilled,
-            serving,
-            nutrients,
-            trace,
-            visibleText: compactText(await this.visibleText(page), 12000),
-          },
-          "Filled the custom food form but could not find Save Changes.",
-        );
-      }
+    await page.waitForTimeout(1200);
+    const nameFilled = await fillCustomFoodName(page, input.name);
+    const serving = await fillCustomFoodServing(page, input.servingSize);
+    traceStep("basics_filled", { nameFilled, servingWarning: serving.warning });
+    const nutrients = await fillCustomFoodNutrients(page, input.nutrients ?? {});
+    traceStep("nutrients_filled", summarizeFillResults(nutrients));
 
-      await page.waitForTimeout(900);
-      const confirmationClicked = await clickOptionalSaveConfirmation(page);
-      if (confirmationClicked) await page.waitForTimeout(1300);
-      const afterSaveText = compactText(await this.visibleText(page).catch(() => ""), 12000);
-      await page.waitForTimeout(900);
-      await this.openApp(page, "#custom-foods");
-      const listText = await this.visibleText(page);
-      const listed = textHasFoodName(listText, input.name);
-      traceStep("listed_checked", { listed, confirmationClicked });
+    const saved = await clickByText(page, /^SAVE CHANGES$/i);
+    traceStep("save_clicked", { saved });
+    if (!saved) {
       return this.result(
         "create_custom_food",
-        listed ? "ok" : "needs_manual_step",
+        "needs_manual_step",
         {
-          created: listed,
-          updated: openedExisting,
-          action: openedExisting ? "updated_existing" : "created_new",
-          duplicatePolicy,
-          foodName: input.name,
+          input: safeInput(input),
           nameFilled,
           serving,
           nutrients,
-          confirmationClicked,
-          afterSaveText,
           trace,
-          visibleText: compactText(listText, 12000),
+          visibleText: compactText(await this.visibleText(page), 12000),
         },
-        listed ? undefined : "Clicked Save Changes, but the custom food was not found in the Custom Foods list afterward.",
+        "Filled the custom food form but could not find Save Changes.",
       );
+    }
+
+    await page.waitForTimeout(900);
+    const confirmationClicked = await clickOptionalSaveConfirmation(page);
+    if (confirmationClicked) await page.waitForTimeout(1300);
+    const afterSaveText = compactText(await this.visibleText(page).catch(() => ""), 12000);
+    await page.waitForTimeout(900);
+    await this.openApp(page, "#custom-foods");
+    const listText = await this.visibleText(page);
+    const listed = textHasFoodName(listText, input.name);
+    traceStep("listed_checked", { listed, confirmationClicked });
+    return this.result(
+      "create_custom_food",
+      listed ? "ok" : "needs_manual_step",
+      {
+        created: listed,
+        updated: openedExisting,
+        action: openedExisting ? "updated_existing" : "created_new",
+        duplicatePolicy,
+        foodName: input.name,
+        nameFilled,
+        serving,
+        nutrients,
+        confirmationClicked,
+        afterSaveText,
+        trace,
+        visibleText: compactText(listText, 12000),
+      },
+      listed ? undefined : "Clicked Save Changes, but the custom food was not found in the Custom Foods list afterward.",
+    );
+  }
+
+  async createAndLogCustomFood(input: CustomFoodAndLogInput & { confirmed?: boolean }) {
+    const logInput: FoodLogInput = {
+      date: input.date,
+      meal: input.meal ?? "Snacks",
+      query: input.name,
+      selectedName: input.name,
+      selectedSource: "Custom Food",
+      amount: input.amount ?? 1,
+      unit: input.unit,
+      timestamp: input.timestamp,
+      matchPolicy: "selected_only",
+      searchScope: "custom",
+      dryRun: input.dryRun,
+      confirmed: input.confirmed,
+    };
+    const customFoodInput: CustomFoodInput & { confirmed?: boolean } = {
+      name: input.name,
+      servingSize: input.servingSize,
+      nutrients: input.nutrients,
+      barcode: input.barcode,
+      duplicatePolicy: input.duplicatePolicy ?? "update_existing",
+      dryRun: input.dryRun,
+      confirmed: input.confirmed,
+    };
+
+    if (input.dryRun === true || !shouldRunConfirmedWrite(input, this.config.writeEnabled)) {
+      const createPreview = await this.createCustomFood({ ...customFoodInput, dryRun: true, confirmed: false });
+      const logPreview = await this.logFood({ ...logInput, dryRun: true, confirmed: false });
+      return this.result("create_and_log_custom_food", "dry_run", {
+        input: safeInput(input),
+        nutritionSource: input.nutritionSource,
+        createCustomFood: createPreview,
+        logFood: logPreview,
+        nextStep: this.config.writeEnabled
+          ? "After verifying the researched nutrition facts and serving size, call again with confirmed=true and dryRun=false or omitted."
+          : "Set CRONOMETER_ENABLE_WRITES=true to allow Cronometer writes.",
+      });
+    }
+
+    const backgroundKey = backgroundBrowserJobKey("create_and_log_custom_food", {
+      name: input.name,
+      servingSize: input.servingSize,
+      nutrients: input.nutrients,
+      barcode: input.barcode,
+      duplicatePolicy: customFoodInput.duplicatePolicy,
+      date: logInput.date,
+      meal: logInput.meal,
+      amount: logInput.amount,
+      unit: logInput.unit,
+      timestamp: logInput.timestamp,
+    });
+
+    return this.startBackgroundBrowserJob(
+      "create_and_log_custom_food",
+      backgroundKey,
+      safeInput(input),
+      () => this.runCreateAndLogCustomFood(input, logInput, customFoodInput),
+    );
+  }
+
+  private async runCreateAndLogCustomFood(
+    input: CustomFoodAndLogInput & { confirmed?: boolean },
+    logInput: FoodLogInput,
+    customFoodInput: CustomFoodInput & { confirmed?: boolean },
+  ): Promise<ProviderResult> {
+    const normalizedLog = normalizeFoodLogInput(logInput, this.config.timeZone);
+    const logPreflightData = foodLogBrowserPreflightData(normalizedLog);
+    const startedAt = Date.now();
+    const trace: CustomFoodTraceEntry[] = [];
+    const traceStep = (step: string, details?: Record<string, unknown>) => logCustomFoodStep(input.name, startedAt, step, details, trace);
+    return this.withPage("create_and_log_custom_food", async (page) => {
+      const created = await this.createCustomFoodOnPage(page, customFoodInput, customFoodInput.duplicatePolicy ?? "update_existing", trace, traceStep);
+      if (!["ok", "already_exists"].includes(created.status)) {
+        return this.result("create_and_log_custom_food", created.status, {
+          input: safeInput(input),
+          nutritionSource: input.nutritionSource,
+          createCustomFood: created,
+          logFood: {
+            skipped: true,
+            reason: "Custom food creation/update did not complete cleanly, so no diary log was attempted.",
+          },
+          elapsedMs: Date.now() - startedAt,
+        }, created.warning ?? "Custom food creation/update did not complete cleanly. No diary log was attempted.", created.source);
+      }
+
+      const logged = await this.logFoodOnPage(page, logInput, normalizedLog, logPreflightData);
+      const status = logged.status === "written" || logged.status === "already_exists" ? logged.status : logged.status;
+      return this.result("create_and_log_custom_food", status, {
+        input: safeInput(input),
+        nutritionSource: input.nutritionSource,
+        createCustomFood: created,
+        logFood: logged,
+        completed: ["written", "already_exists"].includes(logged.status),
+        customFoodName: input.name,
+        meal: logInput.meal,
+        date: logInput.date,
+        elapsedMs: Date.now() - startedAt,
+      }, logged.warning, logged.source);
     });
   }
 
   async updateCustomFood(input: CustomFoodUpdateInput & { confirmed?: boolean }) {
+    if (shouldRunConfirmedWrite(input, this.config.writeEnabled)) {
+      const backgroundKey = backgroundBrowserJobKey("update_custom_food", {
+        foodId: input.foodId,
+        name: input.name,
+        newName: input.newName,
+        servingSize: input.servingSize,
+        nutrients: input.nutrients,
+      });
+      return this.startBackgroundBrowserJob(
+        "update_custom_food",
+        backgroundKey,
+        safeInput(input),
+        () => this.runUpdateCustomFood(input),
+      );
+    }
+    return this.runUpdateCustomFood(input);
+  }
+
+  private async runUpdateCustomFood(input: CustomFoodUpdateInput & { confirmed?: boolean }) {
     const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
     return this.withPage("update_custom_food", async (page) => {
       await this.openApp(page, "#custom-foods");
@@ -740,6 +1322,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           input: safeInput(input),
           before,
           after,
+          preview: customFoodWritePreview(input),
           reason: writeGateReason(input, this.config.writeEnabled),
           nextStep: "Review the before/after diff, then call with confirmed=true to update this exact custom food.",
         });
@@ -766,6 +1349,8 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       }
 
       await page.waitForTimeout(1200);
+      const confirmationClicked = await clickOptionalSaveConfirmation(page);
+      if (confirmationClicked) await page.waitForTimeout(1300);
       const afterSaveText = compactText(await this.visibleText(page).catch(() => ""), 12000);
       const finalDetail = await extractCustomFoodDetail(page);
       return this.result("update_custom_food", "ok", {
@@ -776,12 +1361,31 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         nameFilled,
         serving,
         nutrients,
+        confirmationClicked,
         afterSaveText,
       });
     });
   }
 
   async deleteCustomFood(input: CustomFoodDeleteInput & { confirmed?: boolean }) {
+    if (shouldRunConfirmedWrite(input, this.config.writeEnabled)) {
+      const backgroundKey = backgroundBrowserJobKey("delete_custom_food", {
+        foodId: input.foodId,
+        name: input.name,
+        confirmName: input.confirmName,
+        ifUsed: input.ifUsed ?? "stop",
+      });
+      return this.startBackgroundBrowserJob(
+        "delete_custom_food",
+        backgroundKey,
+        safeInput(input),
+        () => this.runDeleteCustomFood(input),
+      );
+    }
+    return this.runDeleteCustomFood(input);
+  }
+
+  private async runDeleteCustomFood(input: CustomFoodDeleteInput & { confirmed?: boolean }) {
     const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
     const ifUsed = input.ifUsed ?? "stop";
     return this.withPage("delete_custom_food", async (page) => {
@@ -876,6 +1480,23 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   async retireCustomFood(input: CustomFoodRetireInput & { confirmed?: boolean }) {
+    if (shouldRunConfirmedWrite(input, this.config.writeEnabled)) {
+      const backgroundKey = backgroundBrowserJobKey("retire_custom_food", {
+        foodId: input.foodId,
+        name: input.name,
+        retiredName: input.retiredName,
+      });
+      return this.startBackgroundBrowserJob(
+        "retire_custom_food",
+        backgroundKey,
+        safeInput(input),
+        () => this.runRetireCustomFood(input),
+      );
+    }
+    return this.runRetireCustomFood(input);
+  }
+
+  private async runRetireCustomFood(input: CustomFoodRetireInput & { confirmed?: boolean }) {
     const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
     return this.withPage("retire_custom_food", async (page) => {
       await this.openApp(page, "#custom-foods");
@@ -1424,11 +2045,17 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     });
   }
 
-  private async searchFoodUi(page: Page, query: string, limit: number, date?: string): Promise<FoodSearchOutcome> {
+  private async searchFoodUi(
+    page: Page,
+    query: string,
+    limit: number,
+    date?: string,
+    options: { searchScope?: FoodLogInput["searchScope"]; selectedSource?: string } = {},
+  ): Promise<FoodSearchOutcome> {
     const dateStatus = await this.openFoodSearchDialog(page, date);
     if (date && !dateStatus.selected) return { results: [], dateStatus };
 
-    const attempts: Array<string | undefined> = [undefined, "Custom", "Favorites", "All"];
+    const attempts = foodSearchTabAttempts(options.searchScope, options.selectedSource);
     let fallbackTab: string | undefined;
     let fallbackResults: SearchResult[] = [];
 
@@ -1463,11 +2090,11 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   private async openFoodSearchDialog(page: Page, date?: string) {
     const dateStatus = await this.openDiary(page, date);
-    const alreadyOpen = await activeDialog(page).isVisible().catch(() => false);
+    const alreadyOpen = await foodDialogIsOpen(page);
     if (!alreadyOpen) {
       await clickByText(page, /^FOOD$/i);
-      await page.waitForTimeout(1000);
     }
+    await waitForFoodDialogReady(page, Math.min(this.config.navigationTimeoutMs, 12000));
     return dateStatus;
   }
 
@@ -1534,13 +2161,13 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   private async openApp(page: Page, hash = "") {
     const targetUrl = `${CRONOMETER_ORIGIN}/${hash}`;
-    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs });
+    await gotoAllowingAbort(page, targetUrl, this.config.navigationTimeoutMs);
     await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
     await page.waitForTimeout(1200);
     if (await this.isLoggedIn(page)) {
       await this.ensureConfiguredAccount(page, hash);
       if (hash && !page.url().includes(hash)) {
-        await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs });
+        await gotoAllowingAbort(page, targetUrl, this.config.navigationTimeoutMs);
         await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
         await page.waitForTimeout(900);
       }
@@ -1548,7 +2175,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     }
 
     await this.login(page);
-    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs });
+    await gotoAllowingAbort(page, targetUrl, this.config.navigationTimeoutMs);
     await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
     await page.waitForTimeout(1200);
     if (!(await this.isLoggedIn(page))) {
@@ -1556,7 +2183,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     }
     await this.ensureConfiguredAccount(page, hash);
     if (hash && !page.url().includes(hash)) {
-      await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs });
+      await gotoAllowingAbort(page, targetUrl, this.config.navigationTimeoutMs);
       await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
       await page.waitForTimeout(900);
     }
@@ -1574,21 +2201,32 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       return;
     }
 
-    const firstCheck = await this.verifyConfiguredAccount(page, expectedEmail, returnHash, "current-session");
-    if (firstCheck.verified) return;
-
-    if (!this.config.password) {
-      throw new Error(`Cronometer session is logged in, but the configured account ${redactEmail(this.config.email)} could not be verified.`);
+    const currentText = await this.visibleText(page).catch(() => "");
+    if (textHasEmail(currentText, expectedEmail)) {
+      cachedAccountVerification = { normalizedEmail: expectedEmail, verifiedAt: Date.now(), source: "current-session" };
+      return;
+    }
+    const visibleEmails = extractEmails(currentText);
+    if (visibleEmails.length > 0) {
+      const detected = visibleEmails.map((email) => redactEmail(email)).join(", ");
+      throw new Error(`Cronometer session is logged in, but not as the configured account ${redactEmail(this.config.email)}. Current page showed ${detected}.`);
     }
 
-    await this.login(page);
-    const secondCheck = await this.verifyConfiguredAccount(page, expectedEmail, returnHash, "fresh-login", true);
-    if (secondCheck.verified) return;
+    if (!this.config.strictAccountVerification) {
+      cachedAccountVerification = { normalizedEmail: expectedEmail, verifiedAt: Date.now(), source: "current-session:no-visible-email" };
+      return;
+    }
 
-    const detected = secondCheck.detectedEmails.length
-      ? secondCheck.detectedEmails.map((email) => redactEmail(email)).join(", ")
-      : "no visible email";
-    throw new Error(`Cronometer login did not verify the configured account ${redactEmail(this.config.email)}. Account page showed ${detected}.`);
+    const accountCheck = await withTimeout(
+      this.verifyConfiguredAccount(page, expectedEmail, returnHash, "account-page"),
+      Math.min(this.config.navigationTimeoutMs, 20000),
+      "Timed out verifying the logged-in Cronometer account.",
+    );
+    if (accountCheck.verified) return;
+    if (accountCheck.detectedEmails.length === 0) return;
+
+    const detected = accountCheck.detectedEmails.map((email) => redactEmail(email)).join(", ");
+    throw new Error(`Cronometer session is logged in, but not as the configured account ${redactEmail(this.config.email)}. Account page showed ${detected}.`);
   }
 
   private async verifyConfiguredAccount(page: Page, expectedEmail: string, returnHash: string, source: string, trustFreshLoginWithoutVisibleEmail = false) {
@@ -1612,31 +2250,35 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private async readAccountPageText(page: Page, returnHash: string) {
-    await page.goto(`${CRONOMETER_ORIGIN}/#account`, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs });
-    await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
+    const timeout = Math.min(this.config.navigationTimeoutMs, 15000);
+    await gotoAllowingAbort(page, `${CRONOMETER_ORIGIN}/#account`, timeout);
+    await page.waitForLoadState("domcontentloaded", { timeout }).catch(() => undefined);
     await page.waitForTimeout(1200);
     const text = await this.visibleText(page).catch(() => "");
     if (returnHash && returnHash !== "#account") {
-      await page.goto(`${CRONOMETER_ORIGIN}/${returnHash}`, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
-      await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
+      await gotoAllowingAbort(page, `${CRONOMETER_ORIGIN}/${returnHash}`, timeout).catch(() => undefined);
+      await page.waitForLoadState("domcontentloaded", { timeout }).catch(() => undefined);
       await page.waitForTimeout(600).catch(() => undefined);
     }
     return text;
   }
 
   private async login(page: Page) {
-    if (Date.now() < loginBackoffUntil) {
-      const waitSeconds = Math.ceil((loginBackoffUntil - Date.now()) / 1000);
-      throw new Error(`Cronometer login is paused for ${waitSeconds}s to avoid more rate-limit attempts. Last failure: ${lastLoginFailure ?? "unknown"}`);
+    const backoff = this.currentLoginBackoff();
+    if (Date.now() < backoff.until) {
+      const waitSeconds = Math.ceil((backoff.until - Date.now()) / 1000);
+      throw new Error(`Cronometer login is paused for ${waitSeconds}s to avoid more rate-limit attempts. Last failure: ${backoff.reason ?? "unknown"}`);
     }
 
-    await page.context().clearCookies().catch(() => undefined);
-    await page.goto(`${CRONOMETER_ORIGIN}/login/`, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs });
-    await page.evaluate(() => {
-      localStorage.clear();
-      sessionStorage.clear();
-    }).catch(() => undefined);
-    await page.goto(`${CRONOMETER_ORIGIN}/login/`, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs });
+    if (!this.config.browserProfileDir) {
+      await page.context().clearCookies().catch(() => undefined);
+      await gotoAllowingAbort(page, `${CRONOMETER_ORIGIN}/login/`, this.config.navigationTimeoutMs);
+      await page.evaluate(() => {
+        localStorage.clear();
+        sessionStorage.clear();
+      }).catch(() => undefined);
+    }
+    await gotoAllowingAbort(page, `${CRONOMETER_ORIGIN}/login/`, this.config.navigationTimeoutMs);
     await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
     await page.waitForTimeout(600);
 
@@ -1652,14 +2294,14 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       throw new Error("Missing CRONOMETER_EMAIL/CRONOMETER_PASSWORD.");
     }
 
-    const emailInput = await waitForFirstVisibleLocator(page, [
+    let emailInput = await waitForFirstVisibleLocator(page, [
       page.getByLabel(/email/i),
       page.locator("#username"),
       page.locator('input[name="username"]'),
       page.locator('input[type="email"]'),
       page.getByPlaceholder(/email/i),
     ], this.config.navigationTimeoutMs);
-    const passwordInput = await waitForFirstVisibleLocator(page, [
+    let passwordInput = await waitForFirstVisibleLocator(page, [
       page.getByLabel(/^password$/i),
       page.locator("#password"),
       page.locator('input[name="password"]'),
@@ -1667,7 +2309,29 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       page.getByPlaceholder(/password/i),
     ], this.config.navigationTimeoutMs);
     if (!emailInput || !passwordInput) {
+      const clickedLogin = await clickByText(page, /^Log In$/i);
+      if (clickedLogin) {
+        await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
+        await page.waitForTimeout(1200);
+        emailInput = await waitForFirstVisibleLocator(page, [
+          page.getByLabel(/email/i),
+          page.locator("#username"),
+          page.locator('input[name="username"]'),
+          page.locator('input[type="email"]'),
+          page.getByPlaceholder(/email/i),
+        ], this.config.navigationTimeoutMs);
+        passwordInput = await waitForFirstVisibleLocator(page, [
+          page.getByLabel(/^password$/i),
+          page.locator("#password"),
+          page.locator('input[name="password"]'),
+          page.locator('input[type="password"]'),
+          page.getByPlaceholder(/password/i),
+        ], this.config.navigationTimeoutMs);
+      }
+    }
+    if (!emailInput || !passwordInput) {
       const loginText = compactText(await this.visibleText(page).catch(() => ""), 2000);
+      if (await this.isLoggedIn(page, loginText)) return;
       throw new Error(`Cronometer login form did not render expected fields. Visible text: ${loginText}`);
     }
 
@@ -1691,6 +2355,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
     loginBackoffUntil = 0;
     lastLoginFailure = undefined;
+    clearPersistentLoginBackoff(this.config.loginBackoffFile);
     cachedStorageState = await page.context().storageState().catch(() => cachedStorageState);
   }
 
@@ -1702,6 +2367,20 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   private pauseLoginAttempts(reason: string) {
     lastLoginFailure = reason;
     loginBackoffUntil = Date.now() + this.config.loginBackoffMs;
+    writePersistentLoginBackoff(this.config.loginBackoffFile, loginBackoffUntil, reason);
+  }
+
+  private currentLoginBackoff() {
+    const persisted = readPersistentLoginBackoff(this.config.loginBackoffFile);
+    if (persisted && persisted.until > loginBackoffUntil) {
+      loginBackoffUntil = persisted.until;
+      lastLoginFailure = persisted.reason;
+      return persisted;
+    }
+    if (Date.now() >= loginBackoffUntil) {
+      return { until: 0, reason: undefined, source: persisted?.source ?? "none" };
+    }
+    return { until: loginBackoffUntil, reason: lastLoginFailure, source: "memory" as const };
   }
 
   private async visibleText(page: Page) {
@@ -1714,6 +2393,74 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       (text) => /\bDiary\b/i.test(text) && hasDiaryMealSections(text),
       Math.min(this.config.navigationTimeoutMs, 12000),
     );
+  }
+
+  private startBackgroundBrowserJob(
+    feature: string,
+    key: string,
+    input: unknown,
+    runner: () => Promise<ProviderResult>,
+  ): ProviderResult {
+    pruneBackgroundBrowserJobs();
+
+    const existingId = backgroundBrowserJobKeys.get(key);
+    const existing = existingId ? backgroundBrowserJobs.get(existingId) : undefined;
+    if (existing?.status === "running") {
+      return this.backgroundBrowserJobAcceptedResult(feature, existing, true);
+    }
+    if (existing?.status === "completed" && existing.result && existing.result.status !== "busy") {
+      return this.result(feature, existing.result.status, {
+        ...resultDataObject(existing.result),
+        backgroundJob: summarizeBackgroundBrowserJob(existing, Date.now()),
+        returnedFromBackgroundJob: true,
+      }, existing.result.warning, existing.result.source);
+    }
+    if (existing?.status === "failed") {
+      return this.result(feature, "error", {
+        backgroundJob: summarizeBackgroundBrowserJob(existing, Date.now()),
+      }, existing.error ?? "Background Cronometer browser job failed.", "browser");
+    }
+
+    const now = Date.now();
+    const id = `bg_${now.toString(36)}_${++backgroundBrowserJobSeq}`;
+    const job: BackgroundBrowserJob = {
+      id,
+      key,
+      feature,
+      status: "running",
+      startedAt: now,
+      updatedAt: now,
+      input,
+    };
+    backgroundBrowserJobs.set(id, job);
+    backgroundBrowserJobKeys.set(key, id);
+
+    void Promise.resolve()
+      .then(runner)
+      .then((result) => {
+        job.status = result.status === "error" ? "failed" : "completed";
+        job.result = result;
+        job.error = result.status === "error" ? result.warning : undefined;
+        job.updatedAt = Date.now();
+      })
+      .catch((error) => {
+        job.status = "failed";
+        job.error = error instanceof Error ? error.message : String(error);
+        job.updatedAt = Date.now();
+      });
+
+    return this.backgroundBrowserJobAcceptedResult(feature, job, false);
+  }
+
+  private backgroundBrowserJobAcceptedResult(feature: string, job: BackgroundBrowserJob, alreadyRunning: boolean): ProviderResult {
+    return this.result(feature, "accepted", {
+      input: job.input,
+      browserOpened: false,
+      writeAttempted: true,
+      backgroundJob: summarizeBackgroundBrowserJob(job, Date.now()),
+      alreadyRunning,
+      nextStep: "Call cronometer_runtime_status until this backgroundJob.id is completed or failed. Do not retry the write while it is running.",
+    });
   }
 
   private async withPage(feature: string, handler: (page: Page) => Promise<ProviderResult>): Promise<ProviderResult> {
@@ -1731,11 +2478,22 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       );
     }
 
+    const operationTimeoutMs = this.featureOperationTimeoutMs(feature);
+    const queueWaitMs = this.featureQueueWaitTimeoutMs(feature);
+
     return enqueueBrowserJob(
       () => this.withPageAttemptWithRetry(feature, handler),
-      { feature, maxQueueWaitMs: this.featureQueueWaitTimeoutMs(feature) },
+      {
+        feature,
+        maxQueueWaitMs: queueWaitMs,
+        staleJobMs: operationTimeoutMs + 30000,
+      },
     ).catch((error) => {
       const message = error instanceof Error ? error.message : "Browser automation job failed before starting.";
+      const queue = releaseAndSnapshotBrowserQueue(operationTimeoutMs + queueWaitMs);
+      if (/Timed out waiting .* browser queue/i.test(message)) {
+        return this.browserBusyResult(feature, queue, operationTimeoutMs, message);
+      }
       return this.result(feature, "error", {
         activeBrowserJobs,
         queuedBrowserJobs,
@@ -1750,7 +2508,9 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private async withPageAttemptWithRetry(feature: string, handler: (page: Page) => Promise<ProviderResult>): Promise<ProviderResult> {
-    const attempts = Math.max(1, Math.min(this.config.browserRetryCount + 1, 3));
+    const attempts = this.isShortBrowserProbe(feature)
+      ? 1
+      : Math.max(1, Math.min(this.config.browserRetryCount + 1, 3));
     let lastResult: ProviderResult | undefined;
 
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -1768,19 +2528,31 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   private async withPageAttempt(feature: string, handler: (page: Page) => Promise<ProviderResult>, attempt: number): Promise<ProviderResult> {
     let session: BrowserSession | undefined;
     try {
-      if (Date.now() < loginBackoffUntil && !this.storageState()) {
-        const waitSeconds = Math.ceil((loginBackoffUntil - Date.now()) / 1000);
-        return this.result(
-          feature,
-          "error",
-          undefined,
-          `Cronometer login is paused for ${waitSeconds}s to avoid more rate-limit attempts. Last failure: ${lastLoginFailure ?? "unknown"}`,
-          "browser",
-        );
+      const loginBackoff = this.currentLoginBackoff();
+      if (Date.now() < loginBackoff.until && !this.storageStateInfo().usable) {
+        const waitSeconds = Math.ceil((loginBackoff.until - Date.now()) / 1000);
+        return this.loginPausedResult(feature, waitSeconds, loginBackoff.reason, { attempt });
       }
       const operationTimeoutMs = this.featureOperationTimeoutMs(feature);
-      session = await withTimeout(this.newSession(), operationTimeoutMs, `Timed out opening Cronometer browser session after ${operationTimeoutMs}ms.`);
-      const result = await withTimeout(handler(session.page), operationTimeoutMs, `Timed out running ${feature} after ${operationTimeoutMs}ms.`);
+      let newSessionTimedOut = false;
+      const newSessionPromise = this.newSession().then((openedSession) => {
+        if (newSessionTimedOut) void closeBrowserSession(openedSession);
+        return openedSession;
+      });
+      session = await withTimeoutCleanup(
+        newSessionPromise,
+        operationTimeoutMs,
+        `Timed out opening Cronometer browser session after ${operationTimeoutMs}ms.`,
+        () => {
+          newSessionTimedOut = true;
+        },
+      );
+      const result = await withTimeoutCleanup(
+        handler(session.page),
+        operationTimeoutMs,
+        `Timed out running ${feature} after ${operationTimeoutMs}ms.`,
+        () => closeBrowserSession(session),
+      );
       cachedStorageState = await session.context.storageState().catch(() => cachedStorageState);
       return result;
     } catch (error) {
@@ -1788,34 +2560,124 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       if (!this.config.remoteWsEndpoint && this.config.reuseLocalBrowser) {
         await this.closeCachedLocalSession();
       }
+      const loginBackoff = this.currentLoginBackoff();
+      if (isLoginCooldownError(message) || Date.now() < loginBackoff.until) {
+        const waitSeconds = Math.max(1, Math.ceil((loginBackoff.until - Date.now()) / 1000));
+        return this.loginPausedResult(feature, waitSeconds, loginBackoff.reason ?? message, { attempt });
+      }
+      if (this.isShortBrowserProbe(feature) && isProbeTimeoutError(message)) {
+        return this.result(feature, "needs_manual_step", {
+          attempt,
+          browserOpened: true,
+          writeAttempted: false,
+          retry: "Do not retry this browser preflight repeatedly. Proceed with the direct create/log workflow when nutrition data is already known, or retry once later.",
+        }, message, "browser");
+      }
       return this.result(feature, "error", { attempt }, message, "browser");
     } finally {
-      if (session?.closeContext !== false) await session?.context.close().catch(() => undefined);
-      if (session?.closeBrowser !== false) await session?.browser.close().catch(() => undefined);
+      await closeBrowserSession(session);
     }
+  }
+
+  private loginPausedResult(feature: string, waitSeconds: number, reason: string | undefined, data: Record<string, unknown> = {}) {
+    const status = feature === "log_food" ? "not_written_login_paused" : "needs_manual_step";
+    return this.result(
+      feature,
+      status,
+      {
+        ...data,
+        browserOpened: false,
+        writeAttempted: false,
+        loginPauseSecondsRemaining: waitSeconds,
+        lastLoginFailure: reason,
+        retry: "Do not retry until the login cooldown expires or storage state is refreshed.",
+      },
+      `Cronometer login is paused for ${waitSeconds}s. No browser action was attempted.`,
+      "browser",
+    );
+  }
+
+  private browserBusyResult(feature: string, queue: ReturnType<typeof releaseAndSnapshotBrowserQueue>, operationTimeoutMs: number, warning?: string) {
+    const activeAgeMs = queue.activeBrowserJob?.ageMs ?? 0;
+    const retryAfterSeconds = queue.activeBrowserJob
+      ? Math.max(5, Math.ceil(Math.max(5000, operationTimeoutMs - activeAgeMs) / 1000))
+      : 5;
+    return this.result(
+      feature,
+      "busy",
+      {
+        browserOpened: false,
+        writeAttempted: false,
+        queue,
+        retryAfterSeconds,
+        retry: "Retry this Cronometer browser tool after the active job finishes. Do not start another browser tool in parallel.",
+      },
+      warning ?? "Cronometer browser queue is busy. No browser action was attempted.",
+      "browser",
+    );
   }
 
   private featureOperationTimeoutMs(feature: string) {
     const timeoutMs = this.config.operationTimeoutMs;
+    if (/^search_foods$/.test(feature)) {
+      return Math.min(timeoutMs, 30000);
+    }
+    if (/^(refresh_cronometer_session|cronometer_stability_check|list_custom_foods|find_duplicate_custom_foods|list_custom_meals|list_custom_recipes|list_private_recipe_names)$/.test(feature)) {
+      return Math.min(timeoutMs, 60000);
+    }
+    if (/^read_cronometer_page$/.test(feature)) {
+      return Math.min(timeoutMs, 60000);
+    }
     if (/^(create_recipe|update_custom_recipe|resolve_recipe_ingredients)$/.test(feature)) {
       return Math.min(timeoutMs, 210000);
-    }
-    if (/^(list_custom_recipes|list_custom_foods|list_custom_meals)$/.test(feature)) {
-      return Math.min(timeoutMs, 120000);
     }
     return timeoutMs;
   }
 
   private featureQueueWaitTimeoutMs(feature: string) {
+    if (/^(log_food|delete_diary_food_entry|create_custom_food|create_and_log_custom_food|update_custom_food|delete_custom_food|retire_custom_food)$/.test(feature)) {
+      return Math.max(10000, Math.min(this.config.operationTimeoutMs, 180000));
+    }
+    if (/^(refresh_cronometer_session|cronometer_stability_check|search_foods|read_cronometer_page|list_custom_foods|find_duplicate_custom_foods|list_custom_meals|list_custom_recipes|list_private_recipe_names)$/.test(feature)) return 5000;
     if (/^(create_recipe|update_custom_recipe|resolve_recipe_ingredients)$/.test(feature)) return 45000;
     if (/^(list_custom_recipes|list_custom_foods|list_custom_meals)$/.test(feature)) return 20000;
-    return 30000;
+    return 10000;
+  }
+
+  private isShortBrowserProbe(feature: string) {
+    return /^(refresh_cronometer_session|cronometer_stability_check|search_foods|read_cronometer_page|list_custom_foods|find_duplicate_custom_foods|list_custom_meals|list_custom_recipes|list_private_recipe_names)$/.test(feature);
   }
 
   private async newSession(): Promise<BrowserSession> {
     if (!this.config.remoteWsEndpoint && this.config.reuseLocalBrowser) {
       const cached = await this.usableCachedLocalSession();
       if (cached) return cached;
+    }
+
+    if (!this.config.remoteWsEndpoint && this.config.browserProfileDir) {
+      await this.closeCachedLocalSession();
+      const context = await chromium.launchPersistentContext(this.config.browserProfileDir, {
+        executablePath: resolveChromiumExecutablePath(this.config.chromiumExecutablePath),
+        args: this.localChromiumArgs(),
+        viewport: BROWSER_VIEWPORT,
+        locale: "en-US",
+        headless: true,
+        timeout: this.config.navigationTimeoutMs,
+      });
+      await this.seedPersistentProfile(context);
+      const page = context.pages().find((candidate) => candidate.url().includes("cronometer.com")) ?? context.pages()[0] ?? await context.newPage();
+      await blockHeavyBrowserAssets(page);
+      page.setDefaultTimeout(this.config.navigationTimeoutMs);
+      page.setDefaultNavigationTimeout(this.config.navigationTimeoutMs);
+      const session = {
+        browser: context.browser() ?? undefined,
+        context,
+        page,
+        closeContext: this.config.reuseLocalBrowser ? false : true,
+        closeBrowser: false,
+      };
+      if (this.config.reuseLocalBrowser) cachedLocalSession = session;
+      return session;
     }
 
     const browser = this.config.remoteWsEndpoint
@@ -1863,7 +2725,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   private async usableCachedLocalSession(): Promise<BrowserSession | undefined> {
     if (!cachedLocalSession) return undefined;
-    if (!cachedLocalSession.browser.isConnected() || cachedLocalSession.page.isClosed()) {
+    if ((cachedLocalSession.browser && !cachedLocalSession.browser.isConnected()) || cachedLocalSession.page.isClosed()) {
       await this.closeCachedLocalSession();
       return undefined;
     }
@@ -1874,11 +2736,33 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     const cached = cachedLocalSession;
     cachedLocalSession = undefined;
     await cached?.context.close().catch(() => undefined);
-    await cached?.browser.close().catch(() => undefined);
+    await cached?.browser?.close().catch(() => undefined);
   }
 
   private hasRunnableBrowser() {
     return Boolean(this.config.remoteWsEndpoint || this.config.localChromium);
+  }
+
+  private async seedPersistentProfile(context: BrowserContext) {
+    const state = this.storageStateInfo().state;
+    if (!state || state.cookies.length === 0) return;
+
+    const existingCookies = await context.cookies(CRONOMETER_ORIGIN).catch(() => []);
+    const storedCronometerCookies = state.cookies.filter((cookie) => cookie.domain.includes("cronometer.com"));
+    if (existingCookies.length >= storedCronometerCookies.length && storedCronometerCookies.length > 0) return;
+
+    await context.addCookies(state.cookies).catch(() => undefined);
+    const cronometerOrigins = state.origins.filter((origin) => origin.origin.startsWith(CRONOMETER_ORIGIN));
+    if (cronometerOrigins.length === 0) return;
+
+    const page = context.pages()[0] ?? await context.newPage();
+    for (const origin of cronometerOrigins) {
+      if (origin.localStorage.length === 0) continue;
+      await page.goto(origin.origin, { waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
+      await page.evaluate((entries) => {
+        for (const entry of entries) localStorage.setItem(entry.name, entry.value);
+      }, origin.localStorage).catch(() => undefined);
+    }
   }
 
   private storageState(): ParsedStorageState | undefined {
@@ -1930,8 +2814,15 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   private async launchLocalChromium() {
     return chromium.launch({
-      executablePath: this.config.chromiumExecutablePath,
-      args: [
+      executablePath: resolveChromiumExecutablePath(this.config.chromiumExecutablePath),
+      args: this.localChromiumArgs(),
+      headless: true,
+      timeout: this.config.navigationTimeoutMs,
+    });
+  }
+
+  private localChromiumArgs() {
+    return [
         "--disable-background-networking",
         "--disable-client-side-phishing-detection",
         "--disable-component-update",
@@ -1955,10 +2846,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         "--renderer-process-limit=1",
         "--use-mock-keychain",
         "--blink-settings=imagesEnabled=false",
-      ],
-      headless: true,
-      timeout: this.config.navigationTimeoutMs,
-    });
+      ];
   }
 }
 
@@ -1982,6 +2870,15 @@ async function clickByText(page: Page, label: string | RegExp) {
     return true;
   }
   return false;
+}
+
+async function gotoAllowingAbort(page: Page, url: string, timeout: number) {
+  try {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/net::ERR_ABORTED|navigation.*interrupted/i.test(message)) throw error;
+  }
 }
 
 async function clickOptionalSaveConfirmation(page: Page) {
@@ -2173,8 +3070,10 @@ function serializeTextMatcher(label: string | RegExp) {
 
 async function enqueueBrowserJob<T>(
   task: () => Promise<T>,
-  options: { feature: string; maxQueueWaitMs: number },
+  options: { feature: string; maxQueueWaitMs: number; staleJobMs?: number },
 ): Promise<T> {
+  releaseAndSnapshotBrowserQueue(options.staleJobMs);
+  const epoch = browserQueueEpoch;
   const id = ++browserJobSeq;
   const enqueuedAt = Date.now();
   let started = false;
@@ -2201,24 +3100,190 @@ async function enqueueBrowserJob<T>(
     browserQueue = browserQueue
       .catch(() => undefined)
       .then(async () => {
-        if (canceled) return;
+        if (canceled || epoch !== browserQueueEpoch) return;
         started = true;
         clearTimeout(queueTimer);
         dequeue();
         activeBrowserJobs += 1;
-        activeBrowserJob = { id, feature: options.feature, startedAt: Date.now() };
+        activeBrowserJob = { id, feature: options.feature, startedAt: Date.now(), staleJobMs: options.staleJobMs };
         try {
           resolve(await task());
         } catch (error) {
           reject(error);
         } finally {
-          activeBrowserJobs = Math.max(0, activeBrowserJobs - 1);
-          if (activeBrowserJob?.id === id) activeBrowserJob = undefined;
+          if (epoch === browserQueueEpoch) {
+            activeBrowserJobs = Math.max(0, activeBrowserJobs - 1);
+            if (activeBrowserJob?.id === id) activeBrowserJob = undefined;
+          }
         }
       });
   });
 
   return result;
+}
+
+export function releaseAndSnapshotBrowserQueue(staleJobMs = 240000) {
+  const now = Date.now();
+  const activeStaleJobMs = activeBrowserJob?.staleJobMs ?? staleJobMs;
+  const staleActiveJob = activeBrowserJob && now - activeBrowserJob.startedAt > activeStaleJobMs
+    ? { ...activeBrowserJob, ageMs: now - activeBrowserJob.startedAt, staleJobMs: activeStaleJobMs }
+    : undefined;
+
+  if (staleActiveJob) {
+    activeBrowserJob = undefined;
+    activeBrowserJobs = 0;
+    browserQueue = Promise.resolve();
+    browserQueueEpoch += 1;
+  }
+
+  return {
+    activeBrowserJobs,
+    queuedBrowserJobs,
+    activeBrowserJob: activeBrowserJob
+      ? {
+        ...activeBrowserJob,
+        ageMs: now - activeBrowserJob.startedAt,
+      }
+      : undefined,
+    queuedBrowserJobSample: Array.from(queuedBrowserJobEntries.entries()).slice(0, 8).map(([id, job]) => ({
+      id,
+      feature: job.feature,
+      ageMs: now - job.enqueuedAt,
+    })),
+    staleActiveJob,
+  };
+}
+
+export function __resetBrowserQueueForTests() {
+  browserQueue = Promise.resolve();
+  activeBrowserJobs = 0;
+  queuedBrowserJobs = 0;
+  browserQueueEpoch = 0;
+  activeBrowserJob = undefined;
+  queuedBrowserJobEntries.clear();
+}
+
+export function __runBrowserQueueJobForTests<T>(
+  feature: string,
+  task: () => Promise<T>,
+  options: { maxQueueWaitMs?: number; staleJobMs?: number } = {},
+) {
+  return enqueueBrowserJob(task, {
+    feature,
+    maxQueueWaitMs: options.maxQueueWaitMs ?? 1000,
+    staleJobMs: options.staleJobMs,
+  });
+}
+
+export function __setActiveBrowserJobForTests(feature: string, startedAt: number) {
+  activeBrowserJobs = 1;
+  activeBrowserJob = { id: ++browserJobSeq, feature, startedAt };
+}
+
+function backgroundBrowserJobKey(feature: string, input: unknown) {
+  const digest = createHash("sha256").update(stableJson(input)).digest("hex").slice(0, 24);
+  return `${feature}:${digest}`;
+}
+
+function stableJson(value: unknown): string {
+  if (value === undefined) return "\"__undefined__\"";
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, item]) => item !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right));
+  return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(",")}}`;
+}
+
+function pruneBackgroundBrowserJobs(now = Date.now()) {
+  const maxAgeMs = 6 * 60 * 60 * 1000;
+  const completed = Array.from(backgroundBrowserJobs.values())
+    .filter((job) => job.status !== "running")
+    .sort((left, right) => right.updatedAt - left.updatedAt);
+  const keepCompleted = new Set(completed.slice(0, 20).map((job) => job.id));
+
+  for (const job of backgroundBrowserJobs.values()) {
+    if (job.status === "running") continue;
+    if (keepCompleted.has(job.id) && now - job.updatedAt <= maxAgeMs) continue;
+    backgroundBrowserJobs.delete(job.id);
+    if (backgroundBrowserJobKeys.get(job.key) === job.id) backgroundBrowserJobKeys.delete(job.key);
+  }
+}
+
+function summarizeBackgroundBrowserJobs(now = Date.now()) {
+  pruneBackgroundBrowserJobs(now);
+  const jobs = Array.from(backgroundBrowserJobs.values());
+  const running = jobs
+    .filter((job) => job.status === "running")
+    .sort((left, right) => left.startedAt - right.startedAt)
+    .map((job) => summarizeBackgroundBrowserJob(job, now));
+  const recent = jobs
+    .filter((job) => job.status !== "running")
+    .sort((left, right) => right.updatedAt - left.updatedAt)
+    .slice(0, 10)
+    .map((job) => summarizeBackgroundBrowserJob(job, now));
+  return {
+    runningCount: running.length,
+    recentCount: recent.length,
+    running,
+    recent,
+  };
+}
+
+function summarizeBackgroundBrowserJob(job: BackgroundBrowserJob, now = Date.now()) {
+  return {
+    id: job.id,
+    feature: job.feature,
+    status: job.status,
+    startedAt: job.startedAt,
+    updatedAt: job.updatedAt,
+    ageMs: now - job.startedAt,
+    finishedAgoMs: job.status === "running" ? undefined : now - job.updatedAt,
+    result: job.result ? summarizeProviderResultForBackground(job.result) : undefined,
+    error: job.error,
+  };
+}
+
+function summarizeProviderResultForBackground(result: ProviderResult) {
+  const data = resultDataObject(result);
+  return {
+    feature: result.feature,
+    status: result.status,
+    warning: result.warning,
+    source: result.source,
+    data: compactBackgroundResultData(data),
+  };
+}
+
+function resultDataObject(result: ProviderResult): Record<string, unknown> {
+  return result.data && typeof result.data === "object" && !Array.isArray(result.data)
+    ? result.data as Record<string, unknown>
+    : {};
+}
+
+function compactBackgroundResultData(data: Record<string, unknown>) {
+  const compacted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(data)) {
+    if (/^(visibleText|rawText|afterSaveText)$/i.test(key)) continue;
+    if (key === "createCustomFood" || key === "logFood") {
+      compacted[key] = compactNestedProviderResult(value);
+      continue;
+    }
+    compacted[key] = value;
+  }
+  return compacted;
+}
+
+function compactNestedProviderResult(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const result = value as ProviderResult;
+  return {
+    feature: result.feature,
+    status: result.status,
+    warning: result.warning,
+    source: result.source,
+    data: resultDataObject(result).visibleText ? compactBackgroundResultData(resultDataObject(result)) : result.data,
+  };
 }
 
 async function blockHeavyBrowserAssets(page: Page) {
@@ -2248,6 +3313,34 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, message: string):
   }
 }
 
+async function withTimeoutCleanup<T>(
+  promise: Promise<T>,
+  ms: number,
+  message: string,
+  onTimeout: () => void | Promise<void>,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  promise.catch(() => undefined);
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timeout = setTimeout(() => {
+          void Promise.resolve(onTimeout()).catch(() => undefined);
+          reject(new Error(message));
+        }, ms);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+async function closeBrowserSession(session: BrowserSession | undefined) {
+  if (session?.closeContext !== false) await session?.context.close().catch(() => undefined);
+  if (session?.closeBrowser !== false) await session?.browser?.close().catch(() => undefined);
+}
+
 function isTransientAutomationError(message: string) {
   if (/Too Many Attempts|captcha|robot|verify|invalid|incorrect|two.factor|2fa|login is paused/i.test(message)) return false;
   if (/Timed out (running|opening)/i.test(message)) return false;
@@ -2263,6 +3356,208 @@ function writeGateReason(input: { dryRun?: boolean; confirmed?: boolean }, write
   if (input.dryRun === true) return "Dry-run preview requested.";
   if (input.confirmed !== true) return "User confirmation is required before this write tool opens Cronometer.";
   return "Write gate did not pass.";
+}
+
+function writeGateReasonForFoodLog(input: { dryRun?: boolean; confirmed?: boolean }, writeEnabled: boolean, requireFoodConfirmation: boolean) {
+  if (!writeEnabled) return "Cronometer writes are disabled on the server.";
+  if (input.dryRun === true) return "Dry-run preview requested.";
+  if (input.confirmed === false) return "The request explicitly declined confirmation.";
+  if (requireFoodConfirmation && input.confirmed !== true) return "Food log confirmation is required by CRONOMETER_REQUIRE_FOOD_CONFIRMATION.";
+  return "Food log write gate did not pass.";
+}
+
+function normalizedToFoodInput(normalized: NormalizedFoodLog, original: FoodLogInput): FoodLogInput {
+  return {
+    ...original,
+    query: normalized.query,
+    meal: normalized.meal,
+    date: normalized.date,
+    amount: normalized.amount,
+    unit: normalized.unit,
+    selectedName: normalized.selectedName,
+    selectedSource: normalized.selectedSource,
+    idempotencyKey: normalized.idempotencyKey,
+  };
+}
+
+function normalizeDiaryFoodDeleteInput(input: DiaryFoodDeleteInput, timeZone: string): NormalizedDiaryFoodDelete {
+  return {
+    original: input,
+    date: normalizeFoodLogDate(input.date, timeZone),
+    meal: normalizeFoodLogMeal(input.meal),
+    name: input.name?.replace(/\s+/g, " ").trim() ?? "",
+    amount: input.amount,
+    unit: normalizeFoodLogUnit(input.unit),
+  };
+}
+
+function diaryDeleteTargetAsFoodLog(target: NormalizedDiaryFoodDelete): NormalizedFoodLog {
+  return {
+    original: {
+      query: target.name,
+      date: target.date,
+      meal: target.meal,
+      amount: target.amount,
+      unit: target.unit,
+      selectedName: target.name,
+    },
+    query: target.name,
+    searchQueries: [target.name],
+    meal: target.meal,
+    date: target.date,
+    amount: target.amount,
+    unit: target.unit,
+    selectedName: target.name,
+    idempotencyKey: "",
+  };
+}
+
+function findDiaryFoodEntryMatches(text: string, target: NormalizedDiaryFoodDelete): DiaryFoodEntryMatch[] {
+  const sectionText = diaryMealSectionText(text, target.meal);
+  if (!sectionText) return [];
+  const normalizedTargetName = normalizeFoodName(target.name);
+  const lines = sectionText
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  const matches: DiaryFoodEntryMatch[] = [];
+  const normalizedFoodLog = diaryDeleteTargetAsFoodLog(target);
+
+  for (let index = 0; index < lines.length; index += 1) {
+    if (normalizeFoodName(lines[index]) !== normalizedTargetName) continue;
+    const entryText = lines.slice(index, index + 8).join("\n");
+    const verification = verifyFoodLogInDiaryText(`${target.meal}\n${entryText}`, normalizedFoodLog);
+    if (verification.status === "verified") matches.push({ entryText });
+  }
+
+  return matches;
+}
+
+function diaryMealSectionText(text: string, meal: string) {
+  const lines = text.split(/\r?\n/);
+  const start = lines.findIndex((line) => line.trim().toLowerCase() === meal.toLowerCase());
+  if (start < 0) return "";
+  const knownMeals = new Set(["breakfast", "lunch", "dinner", "snacks", "supplements", "health"]);
+  let end = lines.length;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    const normalized = lines[index].trim().toLowerCase();
+    if (knownMeals.has(normalized)) {
+      end = index;
+      break;
+    }
+  }
+  return lines.slice(start, end).join("\n");
+}
+
+async function clickDiaryFoodEntryRow(page: Page, target: NormalizedDiaryFoodDelete, match: DiaryFoodEntryMatch) {
+  const normalizedTargetName = normalizeFoodName(target.name);
+  const rows = page.locator("tr:visible,[role='row']:visible");
+  const count = await rows.count().catch(() => 0);
+  for (let index = 0; index < count; index += 1) {
+    const row = rows.nth(index);
+    const rowText = await row.innerText().catch(() => "");
+    if (!rowText || !rowText.includes(target.name)) continue;
+    if (!findDiaryFoodEntryMatches(`${target.meal}\n${rowText}`, target).length) continue;
+    await row.scrollIntoViewIfNeeded().catch(() => undefined);
+    const box = await row.boundingBox().catch(() => undefined);
+    if (box) {
+      await page.mouse.click(box.x + Math.min(30, Math.max(8, box.width / 2)), box.y + box.height / 2);
+    } else {
+      await row.click().catch(async () => row.click({ force: true }));
+    }
+    await page.waitForTimeout(500);
+    return { clicked: true as const, strategy: "row" as const, rowText: compactText(rowText, 500) };
+  }
+
+  const exactFood = page.getByText(target.name, { exact: true });
+  const exactCount = await exactFood.count().catch(() => 0);
+  if (exactCount === 1 || (exactCount > 0 && normalizeFoodName(match.entryText).includes(normalizedTargetName))) {
+    const first = exactFood.first();
+    if (await first.isVisible().catch(() => false)) {
+      await first.click().catch(async () => first.click({ force: true }));
+      await page.waitForTimeout(500);
+      return { clicked: true as const, strategy: "exact-text" as const, rowText: compactText(match.entryText, 500) };
+    }
+  }
+
+  return {
+    clicked: false as const,
+    warning: exactCount > 1
+      ? "Multiple visible rows share that food name; refused to use a broad text click."
+      : "Could not find a visible matching diary row.",
+  };
+}
+
+async function confirmSelectedDiaryEntryDelete(page: Page) {
+  const text = await page.locator("body").innerText({ timeout: 2000 }).catch(() => "");
+  const expected = /Delete Items\?\s*Delete the selected entries\?/i.test(text);
+  if (!expected) {
+    return {
+      confirmed: false as const,
+      dialogText: compactText(text.match(/Delete[\s\S]{0,400}/i)?.[0] ?? text, 700),
+      warning: "Expected Cronometer's selected-entry delete confirmation did not appear.",
+    };
+  }
+
+  const ok = page.getByText(/^OK$/).last();
+  if (!(await ok.isVisible().catch(() => false))) {
+    return {
+      confirmed: false as const,
+      dialogText: compactText(text.match(/Delete[\s\S]{0,400}/i)?.[0] ?? text, 700),
+      warning: "Delete confirmation appeared, but the OK button was not visible.",
+    };
+  }
+  await ok.click().catch(async () => ok.click({ force: true }));
+  return {
+    confirmed: true as const,
+    dialogText: "Delete Items? Delete the selected entries?",
+  };
+}
+
+async function triggerSelectedDiaryEntryDelete(page: Page) {
+  const attempts = [];
+  for (const key of ["Delete", "Backspace"]) {
+    await page.keyboard.press(key).catch(() => undefined);
+    await page.waitForTimeout(600);
+    if (await deleteConfirmationVisible(page)) {
+      return { triggered: true as const, strategy: `keyboard:${key}`, attempts };
+    }
+    attempts.push(`keyboard:${key}`);
+  }
+
+  const textClicked = await clickByText(page, /^(DELETE|Delete|delete|REMOVE|Remove|remove|delete_outline|delete_forever|trash)$/i);
+  if (textClicked) {
+    await page.waitForTimeout(700);
+    if (await deleteConfirmationVisible(page)) {
+      return { triggered: true as const, strategy: "visible-text", attempts };
+    }
+    attempts.push("visible-text");
+  }
+
+  const iconClicked = await clickFirstVisible(page.locator([
+    "[aria-label*='delete' i]:visible",
+    "[aria-label*='remove' i]:visible",
+    "[title*='delete' i]:visible",
+    "[title*='remove' i]:visible",
+    "button:visible:has-text('delete')",
+    "[role='button']:visible:has-text('delete')",
+    ".material-icons:visible:has-text('delete')",
+  ].join(",")));
+  if (iconClicked) {
+    await page.waitForTimeout(700);
+    if (await deleteConfirmationVisible(page)) {
+      return { triggered: true as const, strategy: "icon-selector", attempts };
+    }
+    attempts.push("icon-selector");
+  }
+
+  return { triggered: false as const, attempts, warning: "Could not trigger Cronometer's selected diary-entry delete confirmation." };
+}
+
+async function deleteConfirmationVisible(page: Page) {
+  const text = await page.locator("body").innerText({ timeout: 1200 }).catch(() => "");
+  return /Delete Items\?\s*Delete the selected entries\?/i.test(text) ||
+    /\bDelete\b[\s\S]{0,80}\bselected entr/i.test(text);
 }
 
 async function clickDiaryDateArrow(page: Page, direction: "previous" | "next") {
@@ -2370,6 +3665,55 @@ function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+type LoginBackoffSnapshot = { until: number; reason?: string; source: "memory" | "file" | "none" };
+
+function readPersistentLoginBackoff(filePath?: string): LoginBackoffSnapshot | undefined {
+  if (!filePath || !existsSync(filePath)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(filePath, "utf8")) as { until?: unknown; reason?: unknown };
+    const until = typeof parsed.until === "number" ? parsed.until : 0;
+    const reason = typeof parsed.reason === "string" ? parsed.reason : undefined;
+    if (Date.now() >= until) {
+      clearPersistentLoginBackoff(filePath);
+      return { until: 0, reason, source: "none" };
+    }
+    return { until, reason, source: "file" };
+  } catch {
+    return { until: 0, reason: "Ignored unreadable Cronometer login cooldown file.", source: "none" };
+  }
+}
+
+function writePersistentLoginBackoff(filePath: string | undefined, until: number, reason: string) {
+  if (!filePath) return;
+  try {
+    writeFileSync(filePath, JSON.stringify({ until, reason, updatedAt: Date.now() }, null, 2), { mode: 0o600 });
+  } catch {
+    // Cooldown persistence should never make a browser operation fail harder.
+  }
+}
+
+function clearPersistentLoginBackoff(filePath?: string) {
+  if (!filePath || !existsSync(filePath)) return;
+  try {
+    unlinkSync(filePath);
+  } catch {
+    // Ignore cleanup errors; the in-memory state is still authoritative.
+  }
+}
+
+function resolveChromiumExecutablePath(configuredPath?: string) {
+  if (configuredPath) return configuredPath;
+  for (const candidate of [
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+  ]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
 async function runUiStep(page: Page, step: UiFlowStep) {
   if (step.action === "read") {
     return { status: "ok" as const };
@@ -2422,6 +3766,28 @@ function isDangerousClickText(value: string) {
 
 function activeDialog(page: Page) {
   return page.locator(".pretty-dialog, [role='dialog'], .gwt-DialogBox, .popupContent").last();
+}
+
+async function foodDialogIsOpen(page: Page) {
+  const dialog = activeDialog(page);
+  if (!(await dialog.isVisible().catch(() => false))) return false;
+  const text = await dialog.innerText({ timeout: 1000 }).catch(() => "");
+  return /\b(Add Food to Diary|Description\s+Source|SEARCH)\b/i.test(text);
+}
+
+async function waitForFoodDialogReady(page: Page, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  let sawFoodDialog = false;
+
+  while (Date.now() < deadline) {
+    const dialog = activeDialog(page);
+    const text = await dialog.innerText({ timeout: 1000 }).catch(() => "");
+    sawFoodDialog ||= /\b(Add Food to Diary|Description\s+Source|SEARCH)\b/i.test(text);
+    if (sawFoodDialog && !/Loading(?:\.\.\.)?/i.test(text)) return true;
+    await page.waitForTimeout(250);
+  }
+
+  return sawFoodDialog;
 }
 
 async function clickDialogButton(page: Page, label: string | RegExp) {
@@ -2493,29 +3859,113 @@ async function clickFoodDialogFilter(page: Page, label: string) {
       if (!(await item.isVisible().catch(() => false))) continue;
       await item.click().catch(() => undefined);
       await page.waitForTimeout(500);
+      await waitForFoodDialogReady(page, 5000).catch(() => false);
       return true;
     }
   }
-  return false;
+
+  const box = await foodDialogFilterClickBox(page, label);
+  if (!box) return false;
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await page.waitForTimeout(500);
+  await waitForFoodDialogReady(page, 5000).catch(() => false);
+  return true;
+}
+
+async function foodDialogFilterClickBox(page: Page, label: string) {
+  return page.evaluate((label) => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
+    const expected = normalize(label).toLowerCase();
+    const isVisible = (element: Element) => {
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
+    const dialogs = Array.from(document.querySelectorAll(".pretty-dialog, [role='dialog'], .gwt-DialogBox, .popupContent"))
+      .filter(isVisible);
+    const root = dialogs.at(-1) ?? document.body;
+    const candidates = Array.from(root.querySelectorAll("button,[role='tab'],.gwt-TabBarItem,.gwt-ToggleButton,td,div,span"))
+      .filter((element): element is HTMLElement => element instanceof HTMLElement && isVisible(element))
+      .map((element) => {
+        const text = normalize(element.innerText || element.textContent || element.getAttribute("aria-label"));
+        const rect = element.getBoundingClientRect();
+        const tabLike = element.matches("button,[role='tab'],.gwt-TabBarItem,.gwt-ToggleButton")
+          || Boolean(element.closest("[role='tablist'],.gwt-TabBar,.tab-bar,.tabs"));
+        return {
+          text,
+          x: rect.x,
+          y: rect.y,
+          width: rect.width,
+          height: rect.height,
+          tabLike,
+          area: rect.width * rect.height,
+        };
+      })
+      .filter((candidate) => candidate.text.toLowerCase() === expected)
+      .sort((a, b) => Number(b.tabLike) - Number(a.tabLike) || a.area - b.area || a.y - b.y);
+    return candidates[0];
+  }, label).catch(() => undefined);
 }
 
 async function searchCurrentFoodDialog(page: Page, query: string, limit: number) {
+  await waitForFoodDialogReady(page, 8000);
   const searchBox = await foodSearchBox(page);
   if (!searchBox) {
     throw new Error("Food search input was not found after opening the Cronometer food dialog.");
   }
 
+  const previousResults = await collectFoodSearchResults(page, Math.min(limit, 5)).catch(() => []);
+  const previousKey = foodResultsKey(previousResults);
+  const previousInputValue = await searchBox.inputValue().catch(() => "");
   await searchBox.click();
   await page.keyboard.press("Control+A").catch(() => undefined);
   await page.keyboard.type(query, { delay: 10 });
   await searchBox.fill(query).catch(() => undefined);
+  await searchBox.evaluate((element, value) => {
+    if (!(element instanceof HTMLInputElement)) return;
+    element.value = value;
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+  }, query).catch(() => undefined);
+  await searchBox.press("Enter").catch(() => undefined);
   const searched = await clickDialogButton(page, /^SEARCH$/i);
   if (!searched) {
     await clickByText(page, /^SEARCH$/i);
   }
-  await page.waitForTimeout(1800);
+  await waitForFoodSearchSettle(page, previousKey, Math.min(limit, 5), 2600);
 
-  return collectFoodSearchResults(page, limit);
+  const results = await collectFoodSearchResults(page, limit);
+  const latestKey = foodResultsKey(results.slice(0, Math.min(limit, 5)));
+  if (
+    results.length > 0 &&
+    latestKey === previousKey &&
+    previousInputValue.trim().toLowerCase() !== query.trim().toLowerCase()
+  ) {
+    return [];
+  }
+  return results;
+}
+
+async function waitForFoodSearchSettle(page: Page, previousKey: string, limit: number, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  await page.waitForTimeout(350);
+  let latestResults: SearchResult[] = [];
+
+  while (Date.now() < deadline) {
+    latestResults = await collectFoodSearchResults(page, limit).catch(() => latestResults);
+    const latestKey = foodResultsKey(latestResults);
+    if (latestResults.length > 0 && latestKey !== previousKey) return;
+
+    const dialogText = await activeDialog(page).innerText({ timeout: 500 }).catch(() => "");
+    if (/\b(no results|no foods found|did not match|nothing found)\b/i.test(dialogText)) return;
+    await page.waitForTimeout(150);
+  }
+}
+
+function foodResultsKey(results: SearchResult[]) {
+  return results
+    .map((result) => `${normalizeFoodName(result.name)}|${normalizeSource(result.source)}`)
+    .join("\n");
 }
 
 async function foodSearchBox(page: Page) {
@@ -2527,14 +3977,8 @@ async function foodSearchBox(page: Page) {
   ]);
 }
 
-async function clickFoodSearchResult(page: Page, selectedName: string) {
+async function clickFoodSearchResult(page: Page, selectedName: string, selectedSource?: string) {
   const dialog = activeDialog(page);
-  const exactCell = dialog.locator(".gwt-HTML").filter({ hasText: new RegExp(`^${escapeRegExp(selectedName)}$`, "i") });
-  if ((await exactCell.count().catch(() => 0)) > 0 && (await exactCell.first().isVisible().catch(() => false))) {
-    await exactCell.first().click();
-    return true;
-  }
-
   const rows = dialog.locator("tr:visible");
   const count = await rows.count().catch(() => 0);
   for (let index = 0; index < count; index += 1) {
@@ -2542,11 +3986,20 @@ async function clickFoodSearchResult(page: Page, selectedName: string) {
     const parsed = parseFoodRowText(await row.innerText().catch(() => ""));
     if (!parsed) continue;
     if (normalizeFoodName(parsed.name) !== normalizeFoodName(selectedName)) continue;
+    if (selectedSource && normalizeSource(parsed.source) !== normalizeSource(selectedSource)) continue;
 
     await row.scrollIntoViewIfNeeded().catch(() => undefined);
     await row.focus().catch(() => undefined);
     await row.click().catch(() => undefined);
     await page.keyboard.press("Enter").catch(() => undefined);
+    return true;
+  }
+
+  if (selectedSource) return false;
+
+  const exactCell = dialog.locator(".gwt-HTML").filter({ hasText: new RegExp(`^${escapeRegExp(selectedName)}$`, "i") });
+  if ((await exactCell.count().catch(() => 0)) > 0 && (await exactCell.first().isVisible().catch(() => false))) {
+    await exactCell.first().click();
     return true;
   }
 
@@ -2561,12 +4014,24 @@ async function clickFoodSearchResult(page: Page, selectedName: string) {
 }
 
 async function fillFoodAmount(page: Page, amount?: number) {
-  if (!amount) return;
+  if (amount === undefined) return { filled: true as const, skipped: true as const };
   const dialog = activeDialog(page);
   const textBoxes = dialog.locator("input.text-box:visible");
   const count = await textBoxes.count().catch(() => 0);
-  if (count === 0) return;
-  await textBoxes.nth(count - 1).fill(String(amount));
+  if (count === 0) return { filled: false as const, warning: "No visible food amount input was found." };
+  const input = textBoxes.nth(count - 1);
+  const value = String(amount);
+  await input.fill(value);
+  const actualValue = await input.inputValue().catch(() => "");
+  if (!numericInputMatches(actualValue, amount)) {
+    return {
+      filled: false as const,
+      value,
+      actualValue,
+      warning: `Food amount did not verify after filling. Requested ${value}, current value is ${actualValue || "blank"}.`,
+    };
+  }
+  return { filled: true as const, value, actualValue };
 }
 
 async function fillFoodTime(page: Page, timestamp?: string) {
@@ -2590,20 +4055,78 @@ async function fillFoodTime(page: Page, timestamp?: string) {
 }
 
 async function fillFoodUnit(page: Page, unit?: string) {
-  if (!unit) return;
+  if (!unit) return { filled: true as const, skipped: true as const };
   const dialog = activeDialog(page);
+  const normalizedUnit = unit.trim();
   const unitButton = dialog
     .locator("button.dropdown-toggle:visible")
     .filter({ hasText: /g|oz|serving|size|cup|tbsp|tsp|piece|slice|pint|pt|quart|ml|liter|litre/i })
     .last();
-  if ((await unitButton.count().catch(() => 0)) === 0) return;
-  await unitButton.click();
-  const option = page.locator(".dropdown-item:visible").filter({ hasText: new RegExp(escapeRegExp(unit), "i") }).first();
-  if ((await option.count().catch(() => 0)) > 0) {
-    await option.click().catch(() => undefined);
-  } else {
-    await page.keyboard.press("Escape").catch(() => undefined);
+  if ((await unitButton.count().catch(() => 0)) === 0) {
+    return { filled: false as const, unit: normalizedUnit, warning: "No visible food unit dropdown was found." };
   }
+  const currentUnitText = await unitButton.innerText().catch(() => "");
+  if (foodLogUnitTextMatches(currentUnitText, normalizedUnit)) {
+    return { filled: true as const, unit: normalizedUnit, strategy: "already-selected" as const, currentUnitText };
+  }
+  await unitButton.click();
+  const clicked = await clickExactFoodLogUnitOption(page, normalizedUnit);
+  if (!clicked) {
+    await page.keyboard.press("Escape").catch(() => undefined);
+    return {
+      filled: false as const,
+      unit: normalizedUnit,
+      currentUnitText,
+      warning: `Requested unit ${normalizedUnit} was not available as an exact serving unit. No food was written.`,
+    };
+  }
+  const updatedUnitText = await waitForFoodLogUnitText(page, unitButton, normalizedUnit, 1800);
+  if (!foodLogUnitTextMatches(updatedUnitText, normalizedUnit)) {
+    return {
+      filled: false as const,
+      unit: normalizedUnit,
+      strategy: "dropdown-option" as const,
+      currentUnitText: updatedUnitText,
+      warning: `Clicked a unit option, but the unit is still ${updatedUnitText || "unknown"}. No food was written.`,
+    };
+  }
+  return { filled: true as const, unit: normalizedUnit, strategy: "dropdown-option" as const, currentUnitText: updatedUnitText };
+}
+
+async function waitForFoodLogUnitText(page: Page, unitButton: ReturnType<Page["locator"]>, unit: string, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  let latest = await unitButton.innerText().catch(() => "");
+  while (Date.now() < deadline) {
+    latest = await unitButton.innerText().catch(() => latest);
+    if (foodLogUnitTextMatches(latest, unit)) return latest;
+    await page.waitForTimeout(150);
+  }
+  return latest;
+}
+
+async function clickExactFoodLogUnitOption(page: Page, unit: string) {
+  const labels = [unit.trim().toLowerCase(), ...unitAliases(unit)];
+  const labelPattern = labels.map(escapeRegExp).join("|");
+  const exactPattern = new RegExp(`^\\s*(?:1(?:\\.0+)?\\s+)?(?:${labelPattern})\\s*$`, "i");
+  const candidates = page
+    .locator(".dropdown-item:visible,[role='option']:visible,.gwt-MenuItem:visible,li:visible,td:visible,button:visible")
+    .filter({ hasText: exactPattern });
+  const count = await candidates.count().catch(() => 0);
+  for (let index = 0; index < count; index += 1) {
+    const candidate = candidates.nth(index);
+    if (!(await candidate.isVisible().catch(() => false))) continue;
+    const text = await candidate.innerText().catch(() => "");
+    if (!foodLogUnitTextMatches(text, unit)) continue;
+    await candidate.click().catch(async () => candidate.click({ force: true }));
+    return true;
+  }
+  return false;
+}
+
+function foodLogUnitTextMatches(text: string, unit: string) {
+  const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
+  const labels = [unit.trim().toLowerCase(), ...unitAliases(unit)];
+  return labels.some((label) => normalized === label || normalized === `1 ${label}`);
 }
 
 async function fillLikelyAmount(page: Page, amount?: number, selectedName?: string) {
@@ -2995,22 +4518,71 @@ async function fillCustomFoodServing(page: Page, servingSize?: string) {
     return result;
   }
 
-  result.amountFilled = await fillServingSizeCell(page, 0, String(parsed.amount));
+  result.amountFilled = await fillServingSizeCell(page, 0, parsed.amountText);
   result.measureFilled = await fillServingSizeCell(page, 1, parsed.unit);
 
   const rowText = await servingSizeRowText(page);
-  if (!result.amountFilled || !result.measureFilled || !new RegExp(`\\b${escapeRegExp(String(parsed.amount))}\\b`, "i").test(rowText) || !/\bg\b/i.test(rowText)) {
+  if (
+    !result.amountFilled ||
+    !result.measureFilled ||
+    !servingSizeRowMatches(rowText, parsed.amountText, parsed.unit)
+  ) {
     result.warning = "Could not verify Cronometer serving size row after editing.";
   }
   return result;
 }
 
-function parseServingSize(value?: string) {
-  const match = value?.trim().match(/^([0-9]+(?:\.[0-9]+)?)\s*(g|gram|grams)$/i);
+export function parseServingSize(value?: string) {
+  const match = value?.trim().match(/^([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z][a-zA-Z ]{0,40}|µg|mcg|mL|ml|oz|fl oz)$/i);
   if (!match) return undefined;
-  const grams = Number(match[1]);
-  if (!Number.isFinite(grams) || grams <= 0) return undefined;
-  return { amount: grams, unit: "g", grams };
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount) || amount <= 0) return undefined;
+  const unit = normalizeServingUnit(match[2] ?? "");
+  if (!unit) return undefined;
+  return { amount, amountText: match[1], unit };
+}
+
+export function normalizeServingUnit(unit: string) {
+  const normalized = unit.replace(/\s+/g, " ").trim();
+  if (!normalized) return undefined;
+  const lower = normalized.toLowerCase();
+  const aliases: Record<string, string> = {
+    gram: "g",
+    grams: "g",
+    milligram: "mg",
+    milligrams: "mg",
+    microgram: "mcg",
+    micrograms: "mcg",
+    ug: "mcg",
+    "µg": "mcg",
+    milliliter: "ml",
+    milliliters: "ml",
+    millilitre: "ml",
+    millilitres: "ml",
+    ounce: "oz",
+    ounces: "oz",
+    serving: "serving",
+    servings: "serving",
+  };
+  return aliases[lower] ?? normalized;
+}
+
+export function servingSizeRowMatches(rowText: string, amountText: string, unit: string) {
+  const normalized = rowText.replace(/\s+/g, " ").trim().toLowerCase();
+  const amountMatches = new RegExp(`(^|\\D)${escapeRegExp(amountText)}(\\D|$)`).test(normalized);
+  const unitLower = unit.toLowerCase();
+  const unitAliases = [unitLower, ...servingUnitAliases(unitLower)];
+  return amountMatches && unitAliases.some((alias) => new RegExp(`(^|\\W)${escapeRegExp(alias)}(\\W|$)`, "i").test(normalized));
+}
+
+export function servingUnitAliases(unit: string) {
+  if (unit === "g") return ["gram", "grams"];
+  if (unit === "mg") return ["milligram", "milligrams"];
+  if (unit === "mcg") return ["microgram", "micrograms", "ug", "µg"];
+  if (unit === "ml") return ["milliliter", "milliliters", "millilitre", "millilitres"];
+  if (unit === "oz") return ["ounce", "ounces"];
+  if (unit === "serving") return ["servings"];
+  return [];
 }
 
 async function fillServingSizeCell(page: Page, cellIndex: number, value: string) {
@@ -3094,7 +4666,7 @@ async function fillCustomFoodNutrients(page: Page, nutrients: Record<string, num
   return results;
 }
 
-function customFoodNutrientEntries(nutrients: Record<string, number>) {
+export function customFoodNutrientEntries(nutrients: Record<string, number>) {
   const mapped = new Map<string, { label: string; value: number; sourceKey: string }>();
   for (const [key, value] of Object.entries(nutrients)) {
     if (!Number.isFinite(value)) continue;
@@ -3103,6 +4675,29 @@ function customFoodNutrientEntries(nutrients: Record<string, number>) {
     mapped.set(label, { label, value, sourceKey: key });
   }
   return Array.from(mapped.values());
+}
+
+export function customFoodWritePreview(input: { servingSize?: string; nutrients?: Record<string, number> }) {
+  const parsedServingSize = parseServingSize(input.servingSize);
+  const nutrientEntries = customFoodNutrientEntries(input.nutrients ?? {});
+  const ignoredNutrients = Object.entries(input.nutrients ?? {})
+    .filter(([, value]) => !Number.isFinite(value))
+    .map(([sourceKey, value]) => ({
+      sourceKey,
+      value: Number.isNaN(value) ? "NaN" : String(value),
+    }));
+  return {
+    servingSize: {
+      requested: input.servingSize,
+      parsed: parsedServingSize,
+      warning: input.servingSize && !parsedServingSize
+        ? "Could not parse servingSize. Use values like '100 g', '1 serving', '250 ml', or '1 oz'."
+        : undefined,
+    },
+    nutrients: nutrientEntries,
+    ignoredNutrients,
+    nutrientCount: nutrientEntries.length,
+  };
 }
 
 async function fillCustomFoodNutrient(page: Page, label: string, value: number) {
@@ -3559,7 +5154,11 @@ async function customFoodDetailsForNames(page: Page, names: string[], maxDetails
   return details;
 }
 
-async function resolveCustomFoodTargets(page: Page, selector: CustomFoodSelectorInput, options: { maxDetails: number; timeoutMs?: number }) {
+async function resolveCustomFoodTargets(
+  page: Page,
+  selector: CustomFoodSelectorInput,
+  options: { maxDetails: number; timeoutMs?: number; lightweightExactName?: boolean },
+) {
   const rawText = await waitForCustomItemListText(page, "Custom Foods", options.timeoutMs ?? 12000);
   const names = parseCustomItemListNames(rawText, "Custom Foods");
   const query = selector.name;
@@ -3567,13 +5166,29 @@ async function resolveCustomFoodTargets(page: Page, selector: CustomFoodSelector
   if (query && matchingNames.length === 0 && !selector.foodId) {
     return { names, targets: [] };
   }
+  if (query && options.lightweightExactName && !selector.foodId) {
+    const lightweightTargets = exactCustomItemTargets(names, query);
+    if (lightweightTargets.length === 1) {
+      return { names, targets: lightweightTargets };
+    }
+  }
   const candidateNames = query && matchingNames.length === 0 ? [query] : matchingNames;
   const details = await customFoodDetailsForNames(page, candidateNames, options.maxDetails);
   const targets = details.filter((detail) => {
-    if (selector.foodId && detail.foodId !== selector.foodId) return false;
+    if (selector.foodId && detail.foodId && detail.foodId !== selector.foodId) return false;
+    if (selector.foodId && !detail.foodId && (!selector.name || detail.name.toLowerCase() !== selector.name.toLowerCase())) return false;
     if (selector.name && detail.name.toLowerCase() !== selector.name.toLowerCase()) return false;
     return Boolean(selector.foodId || selector.name);
   });
+  if (targets.length === 0 && query) {
+    const exactVisibleTargets = exactCustomItemTargets(names, query);
+    if (exactVisibleTargets.length === 1) {
+      return {
+        names,
+        targets: exactVisibleTargets.map((target) => ({ ...target, foodId: selector.foodId })),
+      };
+    }
+  }
   return { names, targets };
 }
 
@@ -3627,15 +5242,36 @@ function exactOrFuzzyCustomItemNames(names: string[], query: string) {
   return exact.length ? exact : names.filter((name) => name.toLowerCase().includes(normalizedQuery));
 }
 
+function exactCustomItemTargets(names: string[], query: string): CustomFoodDetail[] {
+  const normalizedQuery = query.toLowerCase();
+  const occurrences = new Map<string, number>();
+  const targets: CustomFoodDetail[] = [];
+
+  names.forEach((name, listIndex) => {
+    const normalizedName = name.toLowerCase();
+    const occurrence = occurrences.get(normalizedName) ?? 0;
+    occurrences.set(normalizedName, occurrence + 1);
+    if (normalizedName === normalizedQuery) {
+      targets.push({ name, listIndex, occurrence });
+    }
+  });
+
+  return targets;
+}
+
 async function openCustomFoodTarget(page: Page, target: CustomFoodDetail) {
   await page.goto(`${CRONOMETER_ORIGIN}/#custom-foods`);
   await page.waitForLoadState("domcontentloaded").catch(() => undefined);
   await waitForCustomItemListText(page, "Custom Foods", 12000).catch(() => "");
   const clicked = await clickCustomListItemByName(page, target.name, target.occurrence ?? 0);
   if (!clicked) return false;
-  await page.waitForTimeout(1000);
+  await waitForVisibleText(page, (text) =>
+    textHasFoodName(text, target.name) && /\b(BACK TO FOODS LIST|Nutrition Label|Food Name|ADD TO DIARY)\b/i.test(text),
+    5000,
+  ).catch(() => undefined);
   if (!target.foodId) return true;
   const detail = await extractCustomFoodDetail(page);
+  if (!detail?.foodId && textHasFoodName(await page.locator("body").innerText({ timeout: 3000 }).catch(() => ""), target.name)) return true;
   return detail?.foodId === target.foodId;
 }
 
@@ -3652,8 +5288,22 @@ async function openCustomRecipeTarget(page: Page, target: CustomRecipeDetail) {
 }
 
 async function clickCustomListItemByName(page: Page, name: string, occurrence: number) {
-  return page.evaluate(({ name, occurrence }) => {
+  const roleButton = page.getByRole("button", { name: new RegExp(`^${escapeRegExp(name)}$`, "i") });
+  const roleButtonCount = await roleButton.count().catch(() => 0);
+  if (roleButtonCount > 0) {
+    const button = roleButton.nth(Math.min(occurrence, roleButtonCount - 1));
+    if (await button.isVisible().catch(() => false)) {
+      await button.click({ timeout: 2500 }).catch(async () => {
+        const box = await button.boundingBox();
+        if (box) await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+      });
+      return true;
+    }
+  }
+
+  const box = await page.evaluate(({ name, occurrence }) => {
     const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
+    const normalizedName = normalize(name);
     const isVisible = (element: Element) => {
       const style = window.getComputedStyle(element);
       const rect = element.getBoundingClientRect();
@@ -3668,27 +5318,48 @@ async function clickCustomListItemByName(page: Page, name: string, occurrence: n
       }
       return total;
     };
+    const textMatches = (element: HTMLElement) => {
+      const innerText = normalize(element.innerText || element.textContent);
+      if (innerText === normalizedName) return { exact: true, line: true };
+      const lines = (element.innerText || element.textContent || "").split(/\n+/).map(normalize).filter(Boolean);
+      return { exact: false, line: lines.includes(normalizedName) };
+    };
+    const clickableAncestor = (element: HTMLElement) => {
+      let current: HTMLElement | null = element;
+      while (current && current !== document.body) {
+        if (
+          current.matches("button,a,[role='button'],[role='link'],li,tr,.list-item,.food-list-item,.ReactVirtualized__Table__row,.ag-row")
+          || current.onclick
+        ) return current;
+        current = current.parentElement;
+      }
+      return element;
+    };
     const candidates = Array.from(document.querySelectorAll("body *"))
       .filter((element): element is HTMLElement => element instanceof HTMLElement && isVisible(element))
-      .filter((element) => normalize(element.innerText || element.textContent) === name)
-      .map((element) => ({ element, rect: element.getBoundingClientRect(), depth: depth(element) }))
+      .map((element) => ({ element, match: textMatches(element) }))
+      .filter((candidate) => candidate.match.exact || candidate.match.line)
+      .map((candidate) => {
+        const element = clickableAncestor(candidate.element);
+        return {
+          element,
+          rect: element.getBoundingClientRect(),
+          depth: depth(element),
+          exact: candidate.match.exact,
+          area: element.getBoundingClientRect().width * element.getBoundingClientRect().height,
+        };
+      })
       .filter((candidate) => candidate.rect.y > 120)
-      .sort((a, b) => a.rect.y - b.rect.y || b.depth - a.depth || a.rect.x - b.rect.x);
+      .sort((a, b) => Number(b.exact) - Number(a.exact) || a.area - b.area || b.depth - a.depth || a.rect.y - b.rect.y || a.rect.x - b.rect.x);
     const target = candidates[occurrence]?.element ?? candidates[0]?.element;
-    if (!target) return false;
+    if (!target) return undefined;
     target.scrollIntoView({ block: "center" });
     const rect = target.getBoundingClientRect();
-    for (const type of ["mousedown", "mouseup", "click"]) {
-      target.dispatchEvent(new MouseEvent(type, {
-        bubbles: true,
-        cancelable: true,
-        view: window,
-        clientX: rect.x + rect.width / 2,
-        clientY: rect.y + rect.height / 2,
-      }));
-    }
-    return true;
-  }, { name, occurrence }).catch(() => false);
+    return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+  }, { name, occurrence }).catch(() => undefined);
+  if (!box) return false;
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  return true;
 }
 
 async function waitForCustomItemListText(page: Page, sectionTitle: string, timeoutMs: number) {
@@ -4668,7 +6339,128 @@ function mergeFoodResults(results: SearchResult[]) {
   return merged;
 }
 
-function rankFoodResults(query: string, results: SearchResult[], selectedName?: string, selectedSource?: string) {
+export function foodSearchTabAttempts(scope: FoodLogInput["searchScope"], selectedSource?: string) {
+  const source = normalizeSource(selectedSource);
+  const attempts: Array<string | undefined> = [];
+  const add = (tab: string | undefined) => {
+    if (!attempts.some((candidate) => candidate === tab)) attempts.push(tab);
+  };
+
+  if (scope === "all") add("All");
+  else if (scope === "custom") add("Custom");
+  else if (scope === "favorites") add("Favorites");
+  else if (source.includes("custom")) {
+    add("Custom");
+    add("All");
+  } else if (source) {
+    add("All");
+    add(undefined);
+  } else {
+    add("All");
+    add("Custom");
+    add("Favorites");
+    add(undefined);
+  }
+
+  return attempts.length ? attempts : [undefined, "Custom", "Favorites", "All"];
+}
+
+export function chooseFoodLogResult(input: FoodLogInput, results: SearchResult[]) {
+  const policy = input.matchPolicy ?? "high_confidence";
+  const ranked = rankFoodResults(input.query, results, input.selectedName, input.selectedSource);
+  const candidates = ranked.slice(0, 5);
+  const selectedName = input.selectedName?.trim();
+  const selectedSource = normalizeSource(input.selectedSource);
+
+  if (selectedName) {
+    const normalizedSelected = normalizeFoodName(selectedName);
+    const matches = ranked.filter((result) =>
+      normalizeFoodName(result.name) === normalizedSelected &&
+      (!selectedSource || normalizeSource(result.source) === selectedSource)
+    );
+    if (matches.length === 1 || (matches.length > 1 && selectedSource)) {
+      return {
+        status: "ok" as const,
+        policy,
+        result: matches[0],
+        candidates,
+        confidence: foodLogConfidence(input.query, matches[0], ranked.find((candidate) => candidate !== matches[0])),
+      };
+    }
+    return {
+      status: "needs_manual_step" as const,
+      policy,
+      candidates,
+      warning: selectedSource
+        ? `The selected food ${selectedName} from ${input.selectedSource} was not found in the visible Cronometer results.`
+        : `Multiple or no visible Cronometer rows matched selectedName=${selectedName}. Pass selectedSource from search_foods to avoid logging the wrong row.`,
+      nextStep: "Call search_foods for the query, then call log_food with the chosen selectedName and selectedSource.",
+    };
+  }
+
+  if (policy === "selected_only") {
+    return {
+      status: "needs_manual_step" as const,
+      policy,
+      candidates,
+      warning: "matchPolicy=selected_only requires selectedName from a prior search_foods result.",
+      nextStep: "Call search_foods first, then pass selectedName and selectedSource to log_food.",
+    };
+  }
+
+  const top = ranked[0];
+  if (!top) {
+    return {
+      status: "needs_manual_step" as const,
+      policy,
+      candidates,
+      warning: "No Cronometer food result was found.",
+      nextStep: "Try a more specific food query or create a custom food first.",
+    };
+  }
+
+  const next = ranked[1];
+  const confidence = foodLogConfidence(input.query, top, next);
+  if (policy === "best_effort" || confidence.highConfidence) {
+    return {
+      status: "ok" as const,
+      policy,
+      result: top,
+      candidates,
+      confidence,
+    };
+  }
+
+  return {
+    status: "needs_manual_step" as const,
+    policy,
+    candidates,
+    confidence,
+    warning: "Cronometer returned multiple plausible food matches, so cronogpt refused to log one automatically.",
+    nextStep: "Call log_food with selectedName and selectedSource from the preferred candidate, or set matchPolicy=best_effort if the top result is acceptable.",
+  };
+}
+
+export function foodLogConfidence(query: string, top: SearchResult, next?: SearchResult) {
+  const normalizedQuery = normalizeFoodName(query);
+  const normalizedName = normalizeFoodName(top.name);
+  const topScore = foodResultScore(top, normalizedQuery);
+  const nextScore = next ? foodResultScore(next, normalizedQuery) : undefined;
+  const scoreGap = nextScore === undefined ? Number.POSITIVE_INFINITY : topScore - nextScore;
+  const exactName = normalizedName === normalizedQuery;
+  const plainName = normalizedName === `${normalizedQuery} plain`;
+  const highConfidence = exactName || plainName || !next || (topScore >= 85 && scoreGap >= 30) || (topScore >= 70 && scoreGap >= 45);
+  return {
+    highConfidence,
+    exactName,
+    plainName,
+    topScore,
+    nextScore,
+    scoreGap: Number.isFinite(scoreGap) ? scoreGap : undefined,
+  };
+}
+
+export function rankFoodResults(query: string, results: SearchResult[], selectedName?: string, selectedSource?: string) {
   const normalizedQuery = normalizeFoodName(query);
   const normalizedSelected = selectedName ? normalizeFoodName(selectedName) : undefined;
   const normalizedSelectedSource = normalizeSource(selectedSource);
@@ -4680,7 +6472,7 @@ function rankFoodResults(query: string, results: SearchResult[], selectedName?: 
     });
 }
 
-function foodResultScore(result: SearchResult, normalizedQuery: string, normalizedSelected?: string, normalizedSelectedSource?: string) {
+export function foodResultScore(result: SearchResult, normalizedQuery: string, normalizedSelected?: string, normalizedSelectedSource?: string) {
   const normalizedName = normalizeFoodName(result.name);
   let score = sourcePriority(result.source);
   if (normalizedSelected) {
@@ -4710,7 +6502,7 @@ function sourcePriority(source?: string) {
   return 5;
 }
 
-function normalizeSource(source?: string) {
+export function normalizeSource(source?: string) {
   return (source ?? "").toLowerCase().replace(/\s+/g, " ").trim();
 }
 
@@ -4739,7 +6531,7 @@ function pickFoodResult(query: string, results: SearchResult[], selectedName?: s
   );
 }
 
-function normalizeFoodName(value: string) {
+export function normalizeFoodName(value: string) {
   return value
     .toLowerCase()
     .replace(/[,()[\]{}]/g, " ")
@@ -4774,6 +6566,14 @@ function loginFailureReason(text: string) {
     return "Cronometer rejected the configured email or password.";
   }
   return undefined;
+}
+
+function isLoginCooldownError(message: string) {
+  return /login is paused|Too Many Attempts|rate-limiting login attempts/i.test(message);
+}
+
+function isProbeTimeoutError(message: string) {
+  return /Timed out (running|opening)|Timeout .* exceeded|page\.goto: Timeout/i.test(message);
 }
 
 function isLoggedInText(text: string) {
