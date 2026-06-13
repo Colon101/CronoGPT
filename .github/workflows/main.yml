@@ -47,7 +47,6 @@ jobs:
       ORACLE_HOST: 129.159.156.186
       ORACLE_DOMAIN: cronogpt.129-159-156-186.sslip.io
       ORACLE_USER: ubuntu
-      ORACLE_SSH_KEY: ${{ runner.temp }}/cronogpt_oracle_ed25519
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -87,13 +86,15 @@ jobs:
           ORACLE_SSH_PRIVATE_KEY: ${{ secrets.ORACLE_SSH_PRIVATE_KEY }}
         run: |
           set -euo pipefail
+          key_path="$RUNNER_TEMP/cronogpt_oracle_ed25519"
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          printf '%s\n' "$ORACLE_SSH_PRIVATE_KEY" > "$ORACLE_SSH_KEY"
-          chmod 600 "$ORACLE_SSH_KEY"
+          printf '%s\n' "$ORACLE_SSH_PRIVATE_KEY" > "$key_path"
+          chmod 600 "$key_path"
+          echo "ORACLE_SSH_KEY=$key_path" >> "$GITHUB_ENV"
           ssh-keyscan -H "$ORACLE_HOST" >> ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
-          ssh -i "$ORACLE_SSH_KEY" -o BatchMode=yes "$ORACLE_USER@$ORACLE_HOST" "true"
+          ssh -i "$key_path" -o BatchMode=yes "$ORACLE_USER@$ORACLE_HOST" "true"
 
       - name: Deploy to Oracle
         env:
