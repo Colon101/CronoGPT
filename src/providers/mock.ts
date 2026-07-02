@@ -10,6 +10,7 @@ import type {
   ExerciseLogInput,
   ExportDataInput,
   FastInput,
+  FoodLogBatchInput,
   FoodLogInput,
   NoteLogInput,
   RecipeDeleteInput,
@@ -91,6 +92,10 @@ export class MockCronometerProvider extends BaseCronometerProvider {
 
   async logFood(input: FoodLogInput) {
     return this.dryRunWrite("log_food", input);
+  }
+
+  async logFoods(input: FoodLogBatchInput) {
+    return this.dryRunWrite("log_foods", input);
   }
 
   async logExercise(input: ExerciseLogInput) {

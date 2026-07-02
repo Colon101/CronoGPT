@@ -49,6 +49,7 @@ const readToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer
 const writeToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read", "cronometer:write"] }];
 const stableModelVisibleTools = new Set([
   "log_food",
+  "log_foods",
   "delete_diary_food_entry",
   "search_foods",
   "custom_food_nutrient_schema",
@@ -514,6 +515,36 @@ export function createCronoServer() {
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     async (args) => toMcpToolResponse(await provider.logFood(args as never)),
+  );
+
+  register(
+    "log_foods",
+    "Log multiple foods",
+    "Adds multiple foods to one Cronometer diary meal as one idempotent batch. Use this instead of several log_food calls for meals with multiple ingredients. The server logs items sequentially in one browser job, reports per-item status, and waits for completion by default.",
+    {
+      date: z.string().optional(),
+      meal: z.string().optional(),
+      items: z.array(z.object({
+        date: z.string().optional(),
+        meal: z.string().optional(),
+        query: z.string().min(1),
+        selectedName: z.string().optional(),
+        selectedSource: z.string().optional().describe("Optional Cronometer result source from search_foods, such as CRDB, NCCDB, USDA, Custom Food, Custom Recipe, or Brand."),
+        amount: z.number().positive().optional(),
+        unit: z.string().optional(),
+        timestamp: z.string().optional(),
+        matchPolicy: z.enum(["high_confidence", "selected_only", "best_effort"]).optional().describe("Defaults to high_confidence. selected_only requires selectedName. best_effort logs the top-ranked result when writes are enabled."),
+        searchScope: z.enum(["auto", "all", "custom", "favorites"]).optional().describe("Optional food-search tab preference. Use custom for private custom foods/recipes, all for official database lookups, or auto by default."),
+        idempotencyKey: z.string().optional().describe("Optional per-item idempotency key. If omitted, cronogpt derives one from date, meal, food, amount, and unit."),
+      })).min(1).max(50),
+      dryRun: z.boolean().optional(),
+      confirmed: z.boolean().optional(),
+      idempotencyKey: z.string().optional().describe("Optional caller-supplied batch idempotency key. If omitted, cronogpt derives one from all normalized item keys."),
+      stopOnFirstFailure: z.boolean().optional().describe("Defaults to false so one ambiguous or missing food does not prevent later ingredients from being attempted."),
+      waitForCompletionSeconds: z.number().int().min(0).max(600).optional().describe("Defaults to a server-chosen wait window for batch writes. Use 0 to return immediately after accepting the background job."),
+    },
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    async (args) => toMcpToolResponse(await provider.logFoods(args as never)),
   );
 
   register(

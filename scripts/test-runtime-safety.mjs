@@ -64,13 +64,33 @@ try {
   assert.equal(pausedRead.data.browserOpened, false);
   assert.equal(pausedRead.data.writeAttempted, false);
 
+  const batchDryRun = await provider.logFoods({
+    date: "today",
+    meal: "Lunch",
+    items: [
+      { query: "Banana", amount: 100, unit: "g" },
+      { query: "1% fat milk", amount: 62, unit: "grams" },
+    ],
+    dryRun: true,
+    confirmed: false,
+  });
+  assert.equal(batchDryRun.status, "dry_run");
+  assert.equal(batchDryRun.data.browserOpened, false);
+  assert.equal(batchDryRun.data.writeAttempted, false);
+  assert.equal(batchDryRun.data.count, 2);
+  assert.equal(batchDryRun.data.items[0].normalized.meal, "Lunch");
+  assert.equal(batchDryRun.data.items[1].normalized.query, "milk 1%");
+  assert.equal(batchDryRun.data.items[1].normalized.unit, "g");
+
   assert.equal(provider.featureQueueWaitTimeoutMs("log_food"), 10000);
+  assert.equal(provider.featureQueueWaitTimeoutMs("log_foods"), 10000);
   assert.equal(provider.featureQueueWaitTimeoutMs("search_foods"), 5000);
   const hostedProvider = new BrowserCronometerProvider({
     ...provider.config,
     operationTimeoutMs: 180000,
   });
   assert.equal(hostedProvider.featureQueueWaitTimeoutMs("log_food"), 180000);
+  assert.equal(hostedProvider.featureQueueWaitTimeoutMs("log_foods"), 180000);
   assert.equal(hostedProvider.featureQueueWaitTimeoutMs("create_and_log_custom_food"), 180000);
   assert.equal(hostedProvider.featureQueueWaitTimeoutMs("delete_diary_food_entry"), 180000);
 

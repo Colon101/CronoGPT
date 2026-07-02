@@ -11,6 +11,7 @@ import {
 } from "../dist/providers/browser.js";
 import { customFoodNutrientLabelForKey } from "../dist/nutrients.js";
 import {
+  foodLogBatchIdempotencyKey,
   foodLogIdempotencyKey,
   normalizeFoodLogInput,
   normalizeFoodLogQuery,
@@ -136,6 +137,24 @@ const sameMilkKey = foodLogIdempotencyKey({
   unit: "G",
 });
 assert.equal(milkLog.idempotencyKey, sameMilkKey);
+
+const batchKey = foodLogBatchIdempotencyKey([
+  milkLog,
+  normalizeFoodLogInput(
+    { query: "Bananas, Raw", meal: "Dinner", amount: 1, unit: "g", selectedName: "Bananas, Raw" },
+    "Asia/Jerusalem",
+    new Date("2026-06-06T08:00:00.000Z"),
+  ),
+]);
+const sameBatchKey = foodLogBatchIdempotencyKey([
+  milkLog,
+  normalizeFoodLogInput(
+    { query: "bananas, raw", meal: "dinner", amount: 1, unit: "grams", selectedName: "BANANAS, RAW" },
+    "Asia/Jerusalem",
+    new Date("2026-06-06T08:00:00.000Z"),
+  ),
+]);
+assert.equal(batchKey, sameBatchKey);
 
 const verifiedMilk = verifyFoodLogInDiaryText("Dinner\nMilk, 1% Fat\n301 g", milkLog);
 assert.equal(verifiedMilk.status, "verified");

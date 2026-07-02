@@ -14,6 +14,7 @@ if (!token) {
 const checks = [];
 const chatGptActionToolNames = [
   "log_food",
+  "log_foods",
   "delete_diary_food_entry",
   "search_foods",
   "custom_food_nutrient_schema",
@@ -129,6 +130,36 @@ await withClient(async (client) => {
       createStatus: createAndLogDryRun.structuredContent?.data?.createCustomFood?.status,
       logStatus: createAndLogDryRun.structuredContent?.data?.logFood?.status,
       logNormalized: createAndLogDryRun.structuredContent?.data?.logFood?.data?.normalized,
+    },
+  });
+
+  const batchDryRun = await client.callTool({
+    name: "log_foods",
+    arguments: {
+      date: "today",
+      meal: "Lunch",
+      items: [
+        { query: "Banana", amount: 100, unit: "g" },
+        { query: "1% fat milk", amount: 62, unit: "grams" },
+      ],
+      dryRun: true,
+      confirmed: false,
+    },
+  });
+  checks.push({
+    name: "log_foods_dry_run",
+    ok: batchDryRun.structuredContent?.status === "dry_run" &&
+      batchDryRun.structuredContent?.data?.browserOpened === false &&
+      batchDryRun.structuredContent?.data?.writeAttempted === false &&
+      batchDryRun.structuredContent?.data?.count === 2 &&
+      batchDryRun.structuredContent?.data?.items?.[0]?.normalized?.meal === "Lunch" &&
+      batchDryRun.structuredContent?.data?.items?.[1]?.normalized?.query === "milk 1%",
+    data: {
+      status: batchDryRun.structuredContent?.status,
+      count: batchDryRun.structuredContent?.data?.count,
+      items: batchDryRun.structuredContent?.data?.items,
+      browserOpened: batchDryRun.structuredContent?.data?.browserOpened,
+      writeAttempted: batchDryRun.structuredContent?.data?.writeAttempted,
     },
   });
 

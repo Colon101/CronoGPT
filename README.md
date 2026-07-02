@@ -104,6 +104,8 @@ Food logs write directly when `CRONOMETER_ENABLE_WRITES=true` unless the tool ca
 
 Browser-backed tools are serialized inside the hosted process to reduce Chromium contention. Confirmed `log_food` writes are accepted as background jobs and deduped by idempotency key, so slow Cronometer UI work can finish after the caller returns. `CRONOMETER_OPERATION_TIMEOUT_MS` bounds individual browser attempts, and `CRONOMETER_BROWSER_RETRY_COUNT` retries transient automation failures without retrying login/CAPTCHA/credential failures.
 
+For multi-ingredient meals, use `log_foods` instead of several separate `log_food` calls. It accepts an `items` array, derives one batch idempotency key, logs the foods sequentially in one browser job, verifies each item, and returns a per-item status table. By default it waits briefly for the batch to finish; if Cronometer is slow, poll `cronometer_runtime_status` for the returned background job instead of submitting the same batch again.
+
 If Cronometer returns `Too Many Attempts`, stop live browser checks and seed the shared cooldown before retrying later:
 
 ```bash
@@ -183,6 +185,7 @@ npm run oracle:wipe-local-env
 By default, only these tools are model-visible:
 
 - `log_food`
+- `log_foods`
 - `delete_diary_food_entry`
 - `search_foods`
 - `custom_food_nutrient_schema`
@@ -196,7 +199,7 @@ By default, only these tools are model-visible:
 
 The rest remain app-callable for rollback and direct testing. Set `CRONOGPT_FULL_TOOL_SURFACE=true` only when deliberately exposing the legacy broad surface.
 
-`log_food` is transactional. `dryRun=true` does not open Chromium. Confirmed real writes return `accepted`, run in the browser queue, write once, then read back the target diary entry. Poll `cronometer_runtime_status` for the final background result before retrying. Final states include `written`, `already_exists`, `busy`, `not_written_login_paused`, `not_written_ambiguous`, `not_written_not_found`, and `possibly_written_verify_failed`.
+`log_food` is transactional. `dryRun=true` does not open Chromium. Confirmed real writes return `accepted`, run in the browser queue, write once, then read back the target diary entry. Poll `cronometer_runtime_status` for the final background result before retrying. Final states include `written`, `already_exists`, `busy`, `not_written_login_paused`, `not_written_ambiguous`, `not_written_not_found`, and `possibly_written_verify_failed`. For a whole meal, prefer `log_foods`; it reduces ChatGPT/tool-call drift by keeping all ingredients in one server-side transaction and returns exact per-item results.
 
 ## Backends
 
@@ -226,6 +229,7 @@ The existing lowercase `email` and `password` keys are supported only for local 
 - `search_foods`
 - `resolve_recipe_ingredients`
 - `log_food`
+- `log_foods`
 - `log_exercise`
 - `log_biometric`
 - `log_note`

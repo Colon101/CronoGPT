@@ -14,6 +14,7 @@ import type {
   ExerciseLogInput,
   ExportDataInput,
   FastInput,
+  FoodLogBatchInput,
   FoodLogInput,
   NoteLogInput,
   ProviderResult,
@@ -109,6 +110,10 @@ export class BaseCronometerProvider implements CronometerProvider {
 
   async logFood(input: FoodLogInput): Promise<ProviderResult> {
     return this.unsupported("log_food", input);
+  }
+
+  async logFoods(input: FoodLogBatchInput): Promise<ProviderResult> {
+    return this.unsupported("log_foods", input);
   }
 
   async deleteDiaryFoodEntry(input: DiaryFoodDeleteInput): Promise<ProviderResult> {

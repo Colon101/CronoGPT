@@ -144,6 +144,22 @@ export function foodLogIdempotencyKey(input: {
   return createHash("sha256").update(canonical).digest("hex").slice(0, 24);
 }
 
+export function foodLogBatchIdempotencyKey(items: NormalizedFoodLog[]) {
+  const canonical = JSON.stringify({
+    items: items.map((item) => ({
+      idempotencyKey: item.idempotencyKey,
+      date: item.date,
+      meal: normalizeComparable(item.meal),
+      query: normalizeComparable(item.query),
+      amount: item.amount ?? null,
+      unit: normalizeComparable(item.unit ?? ""),
+      selectedName: normalizeComparable(item.selectedName ?? ""),
+      selectedSource: normalizeComparable(item.selectedSource ?? ""),
+    })),
+  });
+  return createHash("sha256").update(canonical).digest("hex").slice(0, 24);
+}
+
 export function verifyFoodLogInDiaryText(text: string, normalized: NormalizedFoodLog): FoodLogVerification {
   const comparable = normalizeComparable(text);
   const mealSection = diaryMealSectionText(text, normalized.meal);

@@ -18,6 +18,7 @@ import type {
   ExerciseLogInput,
   ExportDataInput,
   FastInput,
+  FoodLogBatchInput,
   FoodLogInput,
   NoteLogInput,
   ProviderResult,
@@ -37,6 +38,7 @@ import { BaseCronometerProvider } from "./base.js";
 import { capabilitiesForMode } from "../features.js";
 import { customFoodNutrientLabelForKey } from "../nutrients.js";
 import {
+  foodLogBatchIdempotencyKey,
   foodLogBrowserPreflightData,
   normalizeFoodLogDate,
   normalizeFoodLogInput,
@@ -175,6 +177,7 @@ const BROWSER_VIEWPORT = { width: 1024, height: 768 };
 const DIARY_MEAL_SECTION_RE = /\b(Breakfast|Lunch|Dinner|Snacks|Supplements)\b/i;
 const MAX_DIARY_ARROW_DAYS = 45;
 const ACCOUNT_VERIFICATION_TTL_MS = 10 * 60 * 1000;
+const DEFAULT_BATCH_WRITE_WAIT_SECONDS = 120;
 const CRONOMETER_PAGE_HASHES = {
   diary: "#diary",
   customFoods: "#custom-foods",
@@ -298,6 +301,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         "Use dryRun=true for validation and previews; dry-run write tools do not open Cronometer.",
         "Use refresh_cronometer_session only as an optional read-only warmup; do not block a confirmed create_and_log_custom_food workflow on it.",
         "Confirmed log_food writes run as background jobs; poll cronometer_runtime_status until the job is completed before retrying.",
+        "Use log_foods for multi-ingredient meals; it submits one idempotent batch and reports per-item write status.",
         "Confirmed create_and_log_custom_food writes run as background jobs; poll cronometer_runtime_status until the job is completed before retrying.",
         "Use resolve_recipe_ingredients with a low limitPerIngredient and a larger maxSeconds value for large recipes.",
         "If loginPaused is true and storageStateUsable is false, wait or provide durable storage state/remote browser before retrying browser actions. Usable storage state may still allow non-login browser actions during cooldown.",
@@ -576,6 +580,139 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     }
 
     return this.withPage("log_food", (page) => this.logFoodOnPage(page, input, normalized, preflightData));
+  }
+
+  async logFoods(input: FoodLogBatchInput & { confirmed?: boolean }) {
+    const normalizedItems = normalizeFoodLogBatchItems(input, this.config.timeZone);
+    const batchIdempotencyKey = input.idempotencyKey?.trim() || foodLogBatchIdempotencyKey(
+      normalizedItems.map((item) => item.normalized),
+    );
+    const batchPreflightData = {
+      batchIdempotencyKey,
+      count: normalizedItems.length,
+      items: normalizedItems.map((item) => ({
+        index: item.index,
+        normalized: foodLogBrowserPreflightData(item.normalized).normalized,
+      })),
+    };
+
+    if (normalizedItems.length === 0) {
+      return this.result("log_foods", "needs_manual_step", {
+        ...batchPreflightData,
+        input: safeInput(input),
+        browserOpened: false,
+        writeAttempted: false,
+      }, "log_foods requires at least one food item.");
+    }
+
+    if (input.dryRun === true) {
+      return this.result("log_foods", "dry_run", {
+        ...batchPreflightData,
+        input: safeInput(input),
+        browserOpened: false,
+        writeAttempted: false,
+        verification: {
+          status: "not_attempted",
+          reason: "Dry-run requested; no browser was opened.",
+        },
+        nextStep: "Call log_foods again without dryRun=true to write the whole batch as one idempotent browser job.",
+      });
+    }
+
+    const loginBackoff = this.currentLoginBackoff();
+    if (Date.now() < loginBackoff.until && !this.storageStateInfo().usable) {
+      const waitSeconds = Math.ceil((loginBackoff.until - Date.now()) / 1000);
+      return this.loginPausedResult("log_foods", waitSeconds, loginBackoff.reason, {
+        ...batchPreflightData,
+        input: safeInput(input),
+        browserOpened: false,
+        writeAttempted: false,
+      });
+    }
+
+    const willAttemptWrite =
+      this.config.writeEnabled &&
+      input.confirmed !== false &&
+      (!this.config.requireFoodConfirmation || input.confirmed === true);
+    if (!willAttemptWrite) {
+      return this.result("log_foods", "dry_run", {
+        ...batchPreflightData,
+        input: safeInput(input),
+        browserOpened: false,
+        writeAttempted: false,
+        reason: writeGateReasonForFoodLog(input, this.config.writeEnabled, this.config.requireFoodConfirmation),
+        nextStep: this.config.requireFoodConfirmation
+          ? "Call log_foods with confirmed=true after reviewing the normalized batch."
+          : "Enable CRONOMETER_ENABLE_WRITES=true, then call log_foods again to write the batch.",
+      });
+    }
+
+    const backgroundKey = backgroundBrowserJobKey("log_foods", {
+      idempotencyKey: batchIdempotencyKey,
+    });
+    const accepted = this.startBackgroundBrowserJob(
+      "log_foods",
+      backgroundKey,
+      {
+        ...batchPreflightData,
+        input: safeInput(input),
+      },
+      () => this.withPage("log_foods", (page) => this.logFoodsOnPage(page, input, normalizedItems, batchIdempotencyKey)),
+    );
+
+    return this.waitForAcceptedBackgroundJob(
+      "log_foods",
+      accepted,
+      input.waitForCompletionSeconds ?? DEFAULT_BATCH_WRITE_WAIT_SECONDS,
+    );
+  }
+
+  private async logFoodsOnPage(
+    page: Page,
+    input: FoodLogBatchInput & { confirmed?: boolean },
+    normalizedItems: ReturnType<typeof normalizeFoodLogBatchItems>,
+    batchIdempotencyKey: string,
+  ): Promise<ProviderResult> {
+    const startedAt = Date.now();
+    const itemResults = [];
+    let stoppedEarly = false;
+
+    for (const item of normalizedItems) {
+      const result = await this.logFoodOnPage(
+        page,
+        item.input,
+        item.normalized,
+        foodLogBrowserPreflightData(item.normalized),
+      );
+      const summary = summarizeBatchFoodLogResult(item.index, item.normalized, result);
+      itemResults.push(summary);
+
+      if (input.stopOnFirstFailure === true && !foodLogBatchItemSucceeded(result.status)) {
+        stoppedEarly = true;
+        break;
+      }
+    }
+
+    const counts = countBatchFoodLogStatuses(itemResults.map((item) => item.status));
+    const status = batchFoodLogStatus(itemResults.map((item) => item.status), normalizedItems.length);
+    const completed = itemResults.length === normalizedItems.length && itemResults.every((item) => foodLogBatchItemSucceeded(item.status));
+    const warning = batchFoodLogWarning(status, itemResults.length, normalizedItems.length, counts);
+
+    return this.result("log_foods", status, {
+      batchIdempotencyKey,
+      count: normalizedItems.length,
+      attemptedCount: itemResults.length,
+      completed,
+      stoppedEarly,
+      elapsedMs: Date.now() - startedAt,
+      browserOpened: true,
+      writeAttempted: true,
+      counts,
+      items: itemResults,
+      retry: status === "written"
+        ? "No retry needed; every batch item was written or already existed."
+        : "Do not blindly retry the full batch. Inspect items and retry only entries that are not written, not already_exists, and not possibly_written_verify_failed.",
+    }, warning);
   }
 
   private async logFoodOnPage(
@@ -2463,6 +2600,53 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     });
   }
 
+  private async waitForAcceptedBackgroundJob(feature: string, result: ProviderResult, waitSeconds: number): Promise<ProviderResult> {
+    if (result.status !== "accepted") return result;
+    const data = resultDataObject(result);
+    const backgroundJob = data.backgroundJob && typeof data.backgroundJob === "object"
+      ? data.backgroundJob as { id?: unknown }
+      : undefined;
+    const jobId = typeof backgroundJob?.id === "string" ? backgroundJob.id : undefined;
+    const waitMs = Math.max(0, Math.min(600, Math.floor(waitSeconds))) * 1000;
+    if (!jobId || waitMs <= 0) return result;
+
+    const startedAt = Date.now();
+    const deadline = startedAt + waitMs;
+    while (Date.now() < deadline) {
+      const job = backgroundBrowserJobs.get(jobId);
+      if (!job) {
+        return this.result(feature, "error", {
+          ...data,
+          waitedForCompletionMs: Date.now() - startedAt,
+        }, "Background Cronometer browser job disappeared before completion.", "browser");
+      }
+      if (job.status === "completed" && job.result) {
+        return this.result(feature, job.result.status, {
+          ...resultDataObject(job.result),
+          backgroundJob: summarizeBackgroundBrowserJob(job, Date.now()),
+          returnedFromBackgroundJob: true,
+          waitedForCompletionMs: Date.now() - startedAt,
+        }, job.result.warning, job.result.source);
+      }
+      if (job.status === "failed") {
+        return this.result(feature, "error", {
+          backgroundJob: summarizeBackgroundBrowserJob(job, Date.now()),
+          returnedFromBackgroundJob: true,
+          waitedForCompletionMs: Date.now() - startedAt,
+        }, job.error ?? "Background Cronometer browser job failed.", "browser");
+      }
+      await delay(500);
+    }
+
+    const job = backgroundBrowserJobs.get(jobId);
+    return this.result(feature, "accepted", {
+      ...data,
+      backgroundJob: job ? summarizeBackgroundBrowserJob(job, Date.now()) : data.backgroundJob,
+      waitedForCompletionMs: Date.now() - startedAt,
+      nextStep: "The background job is still running. Call cronometer_runtime_status until it completes; do not submit the same batch again.",
+    }, result.warning, result.source);
+  }
+
   private async withPage(feature: string, handler: (page: Page) => Promise<ProviderResult>): Promise<ProviderResult> {
     if (!this.hasRunnableBrowser()) {
       return this.result(
@@ -2635,7 +2819,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private featureQueueWaitTimeoutMs(feature: string) {
-    if (/^(log_food|delete_diary_food_entry|create_custom_food|create_and_log_custom_food|update_custom_food|delete_custom_food|retire_custom_food)$/.test(feature)) {
+    if (/^(log_food|log_foods|delete_diary_food_entry|create_custom_food|create_and_log_custom_food|update_custom_food|delete_custom_food|retire_custom_food)$/.test(feature)) {
       return Math.max(10000, Math.min(this.config.operationTimeoutMs, 180000));
     }
     if (/^(refresh_cronometer_session|cronometer_stability_check|search_foods|read_cronometer_page|list_custom_foods|find_duplicate_custom_foods|list_custom_meals|list_custom_recipes|list_private_recipe_names)$/.test(feature)) return 5000;
@@ -3378,6 +3562,94 @@ function normalizedToFoodInput(normalized: NormalizedFoodLog, original: FoodLogI
     selectedSource: normalized.selectedSource,
     idempotencyKey: normalized.idempotencyKey,
   };
+}
+
+function normalizeFoodLogBatchItems(input: FoodLogBatchInput, timeZone: string) {
+  return (input.items ?? []).map((item, index) => {
+    const merged: FoodLogInput = {
+      ...item,
+      date: item.date ?? input.date,
+      meal: item.meal ?? input.meal,
+      dryRun: item.dryRun ?? input.dryRun,
+      confirmed: item.confirmed ?? input.confirmed,
+    };
+    return {
+      index,
+      input: merged,
+      normalized: normalizeFoodLogInput(merged, timeZone),
+    };
+  });
+}
+
+function summarizeBatchFoodLogResult(index: number, normalized: NormalizedFoodLog, result: ProviderResult) {
+  const data = resultDataObject(result);
+  const logged = data.logged && typeof data.logged === "object" ? data.logged as Record<string, unknown> : undefined;
+  const selection = data.selection && typeof data.selection === "object" ? data.selection as Record<string, unknown> : undefined;
+  const selectedResult = selection?.result && typeof selection.result === "object"
+    ? selection.result as Record<string, unknown>
+    : undefined;
+  return {
+    index,
+    query: normalized.query,
+    date: normalized.date,
+    meal: normalized.meal,
+    amount: normalized.amount,
+    unit: normalized.unit,
+    idempotencyKey: normalized.idempotencyKey,
+    status: result.status,
+    warning: result.warning,
+    selectedName: stringValue(logged?.selectedName) ?? stringValue(selectedResult?.name) ?? normalized.selectedName,
+    selectedSource: stringValue(logged?.selectedSource) ?? stringValue(selectedResult?.source) ?? normalized.selectedSource,
+    queryUsed: stringValue(data.queryUsed),
+    verification: data.verification,
+    retry: data.retry,
+  };
+}
+
+function stringValue(value: unknown) {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function foodLogBatchItemSucceeded(status: ProviderResult["status"]) {
+  return status === "written" || status === "already_exists";
+}
+
+function countBatchFoodLogStatuses(statuses: Array<ProviderResult["status"]>) {
+  const counts: Record<string, number> = {};
+  for (const status of statuses) {
+    counts[status] = (counts[status] ?? 0) + 1;
+  }
+  return counts;
+}
+
+function batchFoodLogStatus(statuses: Array<ProviderResult["status"]>, expectedCount: number): ProviderResult["status"] {
+  if (statuses.length === 0) return "needs_manual_step";
+  if (statuses.length < expectedCount) return "needs_manual_step";
+  if (statuses.every(foodLogBatchItemSucceeded)) return "written";
+  if (statuses.some((status) => status === "possibly_written_verify_failed")) return "possibly_written_verify_failed";
+  if (statuses.some((status) => status === "error")) return "error";
+  if (statuses.every((status) => status === "not_written_login_paused")) return "not_written_login_paused";
+  if (statuses.every((status) => status === "not_written_not_found")) return "not_written_not_found";
+  if (statuses.every((status) => status === "not_written_ambiguous")) return "not_written_ambiguous";
+  if (statuses.every((status) => status === "busy")) return "busy";
+  return "needs_manual_step";
+}
+
+function batchFoodLogWarning(
+  status: ProviderResult["status"],
+  attemptedCount: number,
+  expectedCount: number,
+  counts: Record<string, number>,
+) {
+  if (status === "written") return undefined;
+  const writtenCount = (counts.written ?? 0) + (counts.already_exists ?? 0);
+  if (status === "possibly_written_verify_failed") {
+    return `At least one batch item may have been written but did not verify. ${writtenCount}/${expectedCount} items were written or already present. Inspect per-item statuses before retrying anything.`;
+  }
+  if (attemptedCount < expectedCount) {
+    return `Batch stopped after ${attemptedCount}/${expectedCount} items. ${writtenCount} items were written or already present.`;
+  }
+  return `Batch completed with ${writtenCount}/${expectedCount} items written or already present. Inspect per-item statuses and retry only unresolved items.`;
 }
 
 function normalizeDiaryFoodDeleteInput(input: DiaryFoodDeleteInput, timeZone: string): NormalizedDiaryFoodDelete {

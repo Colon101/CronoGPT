@@ -48,6 +48,17 @@ export interface FoodLogInput {
   idempotencyKey?: string;
 }
 
+export interface FoodLogBatchInput {
+  date?: string;
+  meal?: string;
+  items: FoodLogInput[];
+  dryRun?: boolean;
+  confirmed?: boolean;
+  idempotencyKey?: string;
+  stopOnFirstFailure?: boolean;
+  waitForCompletionSeconds?: number;
+}
+
 export interface DiaryFoodDeleteInput {
   date?: string;
   meal?: string;
@@ -309,6 +320,7 @@ export interface CronometerProvider {
   searchFoods(input: SearchFoodsInput): Promise<ProviderResult>;
   resolveRecipeIngredients(input: ResolveRecipeIngredientsInput): Promise<ProviderResult>;
   logFood(input: FoodLogInput): Promise<ProviderResult>;
+  logFoods(input: FoodLogBatchInput): Promise<ProviderResult>;
   deleteDiaryFoodEntry(input: DiaryFoodDeleteInput): Promise<ProviderResult>;
   logExercise(input: ExerciseLogInput): Promise<ProviderResult>;
   logBiometric(input: BiometricLogInput): Promise<ProviderResult>;

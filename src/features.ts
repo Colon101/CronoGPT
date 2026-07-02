@@ -139,6 +139,14 @@ export const FEATURE_DEFINITIONS: FeatureDefinition[] = [
     notes: "Write action. Food logs write directly when server writes are enabled; use dryRun=true for previews or ambiguity.",
   },
   {
+    id: "log_foods",
+    group: "logging",
+    title: "Log multiple foods",
+    preferredBackend: "browser",
+    supportedModes: ["mock"],
+    notes: "Write action. Logs a multi-ingredient meal as one idempotent sequential batch with per-item verification.",
+  },
+  {
     id: "delete_diary_food_entry",
     group: "logging",
     title: "Delete diary food entry",
@@ -491,6 +499,7 @@ const BROWSER_FEATURE_STATUS: Record<string, ProviderStatus> = {
   search_foods: "ok",
   resolve_recipe_ingredients: "ok",
   log_food: "ok",
+  log_foods: "ok",
   log_exercise: "needs_manual_step",
   log_biometric: "needs_manual_step",
   log_note: "needs_manual_step",
