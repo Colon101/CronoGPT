@@ -86,7 +86,8 @@ CRONOMETER_EMAIL=...
 CRONOMETER_PASSWORD=...
 CRONOMETER_STORAGE_STATE_BASE64=optional-playwright-storage-state
 CRONOMETER_LOCAL_CHROMIUM=true
-CRONOMETER_REUSE_LOCAL_BROWSER=false
+CRONOMETER_REUSE_LOCAL_BROWSER=true
+CRONOMETER_BROWSER_PROFILE_DIR=/opt/cronogpt/state/chromium-profile
 REMOTE_CHROME_WS_ENDPOINT=optional-remote-chrome-endpoint
 CRONOMETER_ENABLE_WRITES=true
 CRONOMETER_REQUIRE_FOOD_CONFIRMATION=false
@@ -98,7 +99,7 @@ CRONOMETER_BROWSER_RETRY_COUNT=1
 CRONOGPT_FULL_TOOL_SURFACE=false
 ```
 
-The Oracle Docker image includes local Chromium through the Playwright base image. Keep `CRONOMETER_REUSE_LOCAL_BROWSER=false` so Chromium is closed after each queued tool call. `REMOTE_CHROME_WS_ENDPOINT` is optional if you want Browserless or another remote Chrome provider instead. `CRONOMETER_STORAGE_STATE_BASE64` lets the hosted browser reuse a valid Cronometer session instead of logging in from scratch on every tool call. `CRONOMETER_LOGIN_BACKOFF_MS` pauses new login attempts after a rate-limit or bot challenge, and `CRONOMETER_LOGIN_BACKOFF_FILE` persists that cooldown across server restarts.
+The Oracle Docker image includes local Chromium through the Playwright base image. Keep `CRONOMETER_REUSE_LOCAL_BROWSER=true` and `CRONOMETER_BROWSER_PROFILE_DIR=/opt/cronogpt/state/chromium-profile` so the hosted process reuses one warm Chromium session and persists Cronometer cookies across deploys. `REMOTE_CHROME_WS_ENDPOINT` is optional if you want Browserless or another remote Chrome provider instead. `CRONOMETER_STORAGE_STATE_BASE64` seeds the hosted browser with a valid Cronometer session when the persistent profile is empty or stale. `CRONOMETER_LOGIN_BACKOFF_MS` pauses new login attempts after a rate-limit, challenge, or ambiguous login-page failure, and `CRONOMETER_LOGIN_BACKOFF_FILE` persists that cooldown across server restarts.
 
 Food logs write directly when `CRONOMETER_ENABLE_WRITES=true` unless the tool call sets `dryRun=true`. Set `CRONOMETER_REQUIRE_FOOD_CONFIRMATION=true` to restore the older second-step confirmation behavior. Other write tools require `confirmed=true` and will write as long as `dryRun` is not `true`. Dry-run write previews return without opening Cronometer, so recipe/custom-food validation does not burn browser login attempts. Set `CRONOMETER_ENABLE_WRITES=false` for read-only dry-run mode.
 

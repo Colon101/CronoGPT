@@ -59,6 +59,14 @@ try {
   assert.equal(pausedWrite.data.writeAttempted, false);
   assert.ok(pausedWrite.data.loginPauseSecondsRemaining > 0);
 
+  const pausedBatchWrite = await provider.logFoods({
+    meal: "Lunch",
+    items: [{ query: "banana", amount: 1, unit: "g" }],
+  });
+  assert.equal(pausedBatchWrite.status, "not_written_login_paused");
+  assert.equal(pausedBatchWrite.data.browserOpened, false);
+  assert.equal(pausedBatchWrite.data.writeAttempted, false);
+
   const pausedRead = await provider.stabilityCheck({ includeFoodSearch: false });
   assert.equal(pausedRead.status, "needs_manual_step");
   assert.equal(pausedRead.data.browserOpened, false);

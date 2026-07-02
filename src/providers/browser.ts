@@ -2316,7 +2316,9 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
     await page.waitForTimeout(1200);
     if (!(await this.isLoggedIn(page))) {
-      throw new Error("Cronometer login succeeded but the app page did not load.");
+      const reason = "Cronometer login succeeded but the app page did not load.";
+      this.pauseLoginAttempts(reason);
+      throw new Error(reason);
     }
     await this.ensureConfiguredAccount(page, hash);
     if (hash && !page.url().includes(hash)) {
@@ -2469,7 +2471,9 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     if (!emailInput || !passwordInput) {
       const loginText = compactText(await this.visibleText(page).catch(() => ""), 2000);
       if (await this.isLoggedIn(page, loginText)) return;
-      throw new Error(`Cronometer login form did not render expected fields. Visible text: ${loginText}`);
+      const reason = `Cronometer login form did not render expected fields. Visible text: ${loginText}`;
+      this.pauseLoginAttempts(reason);
+      throw new Error(reason);
     }
 
     await emailInput.fill(this.config.email);
@@ -2764,7 +2768,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private loginPausedResult(feature: string, waitSeconds: number, reason: string | undefined, data: Record<string, unknown> = {}) {
-    const status = feature === "log_food" ? "not_written_login_paused" : "needs_manual_step";
+    const status = feature === "log_food" || feature === "log_foods" ? "not_written_login_paused" : "needs_manual_step";
     return this.result(
       feature,
       status,
