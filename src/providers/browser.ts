@@ -1608,7 +1608,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         }, "Could not find the custom food actions menu.");
       }
       await page.waitForTimeout(500);
-      const deleteClicked = await clickByText(page, /^(DELETE|DELETE FOOD|REMOVE)$/i);
+      const deleteClicked = await clickByText(page, /^(DELETE|DELETE FOOD|DELETE \/ RETIRE FOOD(?:\.\.\.)?|REMOVE)$/i);
       if (!deleteClicked) {
         return this.result("delete_custom_food", "needs_manual_step", {
           input: safeInput(input),
