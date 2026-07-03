@@ -282,34 +282,44 @@ await withClient(async (client) => {
   const diaryWarmup = await callTool(client, "get_daily_summary", {
     date: "today",
   }, { timeout: browserWarmupTimeoutMs });
-  checks.push({
-    name: "diary_warmup",
-    ok: diaryWarmup.structuredContent?.status === "ok" &&
-      diaryWarmup.structuredContent?.data?.dateStatus?.selected === true &&
-      Boolean(diaryWarmup.structuredContent?.data?.summary),
-    data: {
-      status: diaryWarmup.structuredContent?.status,
-      date: diaryWarmup.structuredContent?.data?.date,
-      dateStatus: diaryWarmup.structuredContent?.data?.dateStatus,
-      summary: diaryWarmup.structuredContent?.data?.summary,
-    },
-  });
+  const diaryWarmupBusy = isBrowserBusyResult(diaryWarmup);
+  checks.push(diaryWarmupBusy
+    ? skippedBusyBrowserCheck("diary_warmup", diaryWarmup)
+    : {
+        name: "diary_warmup",
+        ok: diaryWarmup.structuredContent?.status === "ok" &&
+          diaryWarmup.structuredContent?.data?.dateStatus?.selected === true &&
+          Boolean(diaryWarmup.structuredContent?.data?.summary),
+        data: {
+          status: diaryWarmup.structuredContent?.status,
+          date: diaryWarmup.structuredContent?.data?.date,
+          dateStatus: diaryWarmup.structuredContent?.data?.dateStatus,
+          summary: diaryWarmup.structuredContent?.data?.summary,
+        },
+      });
 
-  const stability = await callTool(client, "cronometer_stability_check", {
-    foodQuery: "Banana cream",
-    includeFoodSearch: true,
-  }, { timeout: browserProbeTimeoutMs });
-  const stabilityLoginPaused = stability.structuredContent?.status === "needs_manual_step" &&
-    stability.structuredContent?.data?.loginPauseSecondsRemaining > 0;
-  checks.push({
-    name: "stability",
-    ok: stabilityLoginPaused ||
-      stability.structuredContent?.status === "ok" &&
-        stability.structuredContent?.data?.ready === true &&
-        stability.structuredContent?.data?.checks?.hasMealSections === true,
-    skipped: stabilityLoginPaused,
-    data: stability.structuredContent?.data,
-  });
+  if (diaryWarmupBusy) {
+    checks.push(skippedBusyBrowserCheck("stability", diaryWarmup));
+  } else {
+    const stability = await callTool(client, "cronometer_stability_check", {
+      foodQuery: "Banana cream",
+      includeFoodSearch: true,
+    }, { timeout: browserProbeTimeoutMs });
+    const stabilityLoginPaused = stability.structuredContent?.status === "needs_manual_step" &&
+      stability.structuredContent?.data?.loginPauseSecondsRemaining > 0;
+    const stabilityBusy = isBrowserBusyResult(stability);
+    checks.push(stabilityBusy
+      ? skippedBusyBrowserCheck("stability", stability)
+      : {
+          name: "stability",
+          ok: stabilityLoginPaused ||
+            stability.structuredContent?.status === "ok" &&
+              stability.structuredContent?.data?.ready === true &&
+              stability.structuredContent?.data?.checks?.hasMealSections === true,
+          skipped: stabilityLoginPaused,
+          data: stability.structuredContent?.data,
+        });
+  }
 
   const datedFoodDryRun = await client.callTool({
     name: "log_food",
@@ -403,6 +413,30 @@ async function waitForBrowserQueueIdle(client, initialRuntimeData, maxWaitMs) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isBrowserBusyResult(result) {
+  const structured = result?.structuredContent;
+  const data = structured?.data;
+  return structured?.status === "busy" ||
+    data?.status === "busy" ||
+    Number(data?.queue?.activeBrowserJobs ?? 0) > 0 ||
+    Number(data?.queue?.queuedBrowserJobs ?? 0) > 0 ||
+    /browser queue is busy/i.test(structured?.warning ?? "");
+}
+
+function skippedBusyBrowserCheck(name, result) {
+  return {
+    name,
+    ok: true,
+    skipped: true,
+    data: {
+      reason: "Cronometer browser queue became busy during the smoke test; browser probe was skipped to avoid colliding with user work.",
+      status: result?.structuredContent?.status,
+      warning: result?.structuredContent?.warning,
+      data: result?.structuredContent?.data,
+    },
+  };
 }
 
 function hasOutputTemplate(tool) {
