@@ -6,6 +6,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 const defaultOracleDomain = process.env.ORACLE_DOMAIN ?? "cronogpt.129-159-156-186.sslip.io";
 const serverUrl = process.env.CRONOGPT_SMOKE_URL ?? `https://${defaultOracleDomain}/mcp`;
 const token = process.env.CRONOGPT_API_TOKEN;
+const browserProbeTimeoutMs = Number(process.env.CRONOGPT_SMOKE_BROWSER_TIMEOUT_MS ?? 180000);
 
 if (!token) {
   throw new Error("Missing CRONOGPT_API_TOKEN.");
@@ -246,10 +247,10 @@ await withClient(async (client) => {
     return;
   }
 
-  const stability = await client.callTool({
-    name: "cronometer_stability_check",
-    arguments: { foodQuery: "Banana cream", includeFoodSearch: true },
-  });
+  const stability = await callTool(client, "cronometer_stability_check", {
+    foodQuery: "Banana cream",
+    includeFoodSearch: true,
+  }, { timeout: browserProbeTimeoutMs });
   const stabilityLoginPaused = stability.structuredContent?.status === "needs_manual_step" &&
     stability.structuredContent?.data?.loginPauseSecondsRemaining > 0;
   checks.push({
@@ -306,6 +307,10 @@ async function withClient(fn) {
   } finally {
     await client.close();
   }
+}
+
+function callTool(client, name, args, options) {
+  return client.callTool({ name, arguments: args }, undefined, options);
 }
 
 function hasOutputTemplate(tool) {
