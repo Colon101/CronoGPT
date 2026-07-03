@@ -6,6 +6,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 const defaultOracleDomain = process.env.ORACLE_DOMAIN ?? "cronogpt.129-159-156-186.sslip.io";
 const serverUrl = process.env.CRONOGPT_SMOKE_URL ?? `https://${defaultOracleDomain}/mcp`;
 const token = process.env.CRONOGPT_API_TOKEN;
+const browserWarmupTimeoutMs = Number(process.env.CRONOGPT_SMOKE_BROWSER_WARMUP_TIMEOUT_MS ?? 240000);
 const browserProbeTimeoutMs = Number(process.env.CRONOGPT_SMOKE_BROWSER_TIMEOUT_MS ?? 180000);
 
 if (!token) {
@@ -246,6 +247,22 @@ await withClient(async (client) => {
     });
     return;
   }
+
+  const diaryWarmup = await callTool(client, "get_daily_summary", {
+    date: "today",
+  }, { timeout: browserWarmupTimeoutMs });
+  checks.push({
+    name: "diary_warmup",
+    ok: diaryWarmup.structuredContent?.status === "ok" &&
+      diaryWarmup.structuredContent?.data?.dateStatus?.selected === true &&
+      Boolean(diaryWarmup.structuredContent?.data?.summary),
+    data: {
+      status: diaryWarmup.structuredContent?.status,
+      date: diaryWarmup.structuredContent?.data?.date,
+      dateStatus: diaryWarmup.structuredContent?.data?.dateStatus,
+      summary: diaryWarmup.structuredContent?.data?.summary,
+    },
+  });
 
   const stability = await callTool(client, "cronometer_stability_check", {
     foodQuery: "Banana cream",
