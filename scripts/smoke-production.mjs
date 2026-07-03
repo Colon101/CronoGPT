@@ -8,6 +8,7 @@ const serverUrl = process.env.CRONOGPT_SMOKE_URL ?? `https://${defaultOracleDoma
 const token = process.env.CRONOGPT_API_TOKEN;
 const browserWarmupTimeoutMs = Number(process.env.CRONOGPT_SMOKE_BROWSER_WARMUP_TIMEOUT_MS ?? 240000);
 const browserProbeTimeoutMs = Number(process.env.CRONOGPT_SMOKE_BROWSER_TIMEOUT_MS ?? 180000);
+const browserQueueWaitMs = Number(process.env.CRONOGPT_SMOKE_BROWSER_QUEUE_WAIT_MS ?? 240000);
 
 if (!token) {
   throw new Error("Missing CRONOGPT_API_TOKEN.");
@@ -248,6 +249,36 @@ await withClient(async (client) => {
     return;
   }
 
+  const queueIdle = await waitForBrowserQueueIdle(client, runtimeData, browserQueueWaitMs);
+  checks.push({
+    name: "browser_queue_idle",
+    ok: true,
+    skipped: !queueIdle.idle,
+    data: queueIdle,
+  });
+  if (!queueIdle.idle) {
+    const reason = "Cronometer browser queue is busy with an in-flight write; browser probes were skipped to avoid colliding with user work.";
+    checks.push({
+      name: "diary_warmup",
+      ok: true,
+      skipped: true,
+      data: { reason, queue: queueIdle },
+    });
+    checks.push({
+      name: "stability",
+      ok: true,
+      skipped: true,
+      data: { reason, queue: queueIdle },
+    });
+    checks.push({
+      name: "dated_food_dry_run",
+      ok: true,
+      skipped: true,
+      data: { reason, queue: queueIdle },
+    });
+    return;
+  }
+
   const diaryWarmup = await callTool(client, "get_daily_summary", {
     date: "today",
   }, { timeout: browserWarmupTimeoutMs });
@@ -328,6 +359,50 @@ async function withClient(fn) {
 
 function callTool(client, name, args, options) {
   return client.callTool({ name, arguments: args }, undefined, options);
+}
+
+async function waitForBrowserQueueIdle(client, initialRuntimeData, maxWaitMs) {
+  const startedAt = Date.now();
+  const deadline = startedAt + Math.max(0, maxWaitMs);
+  let runtimeData = initialRuntimeData;
+  const samples = [];
+
+  while (true) {
+    const active = Number(runtimeData?.activeBrowserJobs ?? 0);
+    const queued = Number(runtimeData?.queuedBrowserJobs ?? 0);
+    samples.push({
+      activeBrowserJobs: active,
+      queuedBrowserJobs: queued,
+      activeFeature: runtimeData?.activeBrowserJob?.feature,
+      activeAgeMs: runtimeData?.activeBrowserJob?.ageMs,
+    });
+
+    if (active === 0 && queued === 0) {
+      return {
+        idle: true,
+        waitedMs: Date.now() - startedAt,
+        runtime: runtimeData,
+        samples: samples.slice(-8),
+      };
+    }
+
+    if (Date.now() >= deadline) {
+      return {
+        idle: false,
+        waitedMs: Date.now() - startedAt,
+        runtime: runtimeData,
+        samples: samples.slice(-8),
+      };
+    }
+
+    await sleep(Math.min(5000, Math.max(1000, deadline - Date.now())));
+    const runtime = await callTool(client, "cronometer_runtime_status", {}, { timeout: 30000 });
+    runtimeData = runtime.structuredContent?.data ?? runtimeData;
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function hasOutputTemplate(tool) {
