@@ -868,7 +868,21 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
     await page.waitForTimeout(1000);
     await fillFoodTime(page, input.timestamp);
-    const unitFill = await fillFoodUnit(page, normalized.unit);
+    let convertedFoodAmount = await convertFoodLogGramAmountForCurrentServingUnit(
+      page,
+      normalized.amount,
+      normalized.unit,
+      selectedName,
+    );
+    let unitFill = convertedFoodAmount?.converted === true
+      ? convertedFoodLogUnitFill(normalized.unit, convertedFoodAmount.currentUnitText ?? "")
+      : await fillFoodUnit(page, normalized.unit);
+    convertedFoodAmount = unitFill.filled === false
+      ? await convertFoodLogGramAmountForCurrentServingUnit(page, normalized.amount, normalized.unit, selectedName)
+      : convertedFoodAmount;
+    if (unitFill.filled === false && convertedFoodAmount?.converted === true) {
+      unitFill = convertedFoodLogUnitFill(normalized.unit, convertedFoodAmount.currentUnitText ?? "");
+    }
     if (!unitFill.filled) {
       return this.result(
         "log_food",
@@ -880,6 +894,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           selectedSource,
           selection,
           unitFill,
+          convertedFoodAmount,
           browserOpened: true,
           writeAttempted: false,
           queryUsed,
@@ -888,7 +903,9 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         unitFill.warning ?? `Could not select requested unit ${normalized.unit}. No food was written.`,
       );
     }
-    const amountFill = await fillFoodAmount(page, normalized.amount);
+    const amountFill = convertedFoodAmount?.converted === true && convertedFoodAmount.amount
+      ? convertedFoodAmount.amount
+      : await fillFoodAmount(page, normalized.amount, selectedName);
     if (!amountFill.filled) {
       return this.result(
         "log_food",
@@ -901,6 +918,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           selection,
           unitFill,
           amountFill,
+          convertedFoodAmount,
           browserOpened: true,
           writeAttempted: false,
           queryUsed,
@@ -911,7 +929,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     }
     await chooseMeal(page, normalized.meal);
 
-    const saved = await clickDialogButton(page, /^(ADD|ADD TO DIARY|ADD TO DIARY|SAVE|DONE)$/i);
+    const saved = await clickDialogButton(page, /^(ADD|ADD FOOD|ADD TO DIARY|ADD SERVING|SAVE|SAVE CHANGES|DONE|OK)$/i);
     if (!saved) {
       return this.result(
         "log_food",
@@ -945,6 +963,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       selection,
       unitFill,
       amountFill,
+      convertedFoodAmount,
       browserOpened: true,
       writeAttempted: true,
       queryUsed,
@@ -4108,19 +4127,29 @@ async function waitForFoodDialogReady(page: Page, timeoutMs: number) {
 
 async function clickDialogButton(page: Page, label: string | RegExp) {
   const dialog = activeDialog(page);
-  const candidates = [
-    dialog.getByRole("button", { name: label }),
-    dialog.locator("button,.gwt-Button,[role='button']").filter({ hasText: label }),
+  const scopes = [
+    dialog,
+    page.locator("body"),
   ];
 
-  for (const candidate of candidates) {
-    if ((await candidate.count().catch(() => 0)) === 0) continue;
-    const first = candidate.first();
-    if (!(await first.isVisible().catch(() => false))) continue;
-    await first.click();
-    return true;
+  for (const scope of scopes) {
+    const candidates = [
+      scope.getByRole("button", { name: label }),
+      scope.locator("button,.gwt-Button,[role='button'],input[type='button'],input[type='submit']").filter({ hasText: label }),
+    ];
+
+    for (const candidate of candidates) {
+      if ((await candidate.count().catch(() => 0)) === 0) continue;
+      const first = candidate.first();
+      if (!(await first.isVisible().catch(() => false))) continue;
+      await first.click();
+      return true;
+    }
+
+    if (await clickVisibleControlByLabel(scope, label)) return true;
   }
-  return clickVisibleControlByLabel(dialog, label);
+
+  return false;
 }
 
 async function clickVisibleControlByLabel(scope: ReturnType<Page["locator"]>, label: string | RegExp) {
@@ -4329,25 +4358,30 @@ async function clickFoodSearchResult(page: Page, selectedName: string, selectedS
   return false;
 }
 
-async function fillFoodAmount(page: Page, amount?: number) {
+async function fillFoodAmount(page: Page, amount?: number, selectedName?: string) {
   if (amount === undefined) return { filled: true as const, skipped: true as const };
   const dialog = activeDialog(page);
   const textBoxes = dialog.locator("input.text-box:visible");
   const count = await textBoxes.count().catch(() => 0);
-  if (count === 0) return { filled: false as const, warning: "No visible food amount input was found." };
-  const input = textBoxes.nth(count - 1);
+  const selectedPanel = count === 0 ? await recipeIngredientSelectedPanel(page, selectedName) : undefined;
+  const input = count > 0
+    ? textBoxes.nth(count - 1)
+    : await editableAmountInput(page, 2500, selectedPanel);
+  if (!input) return { filled: false as const, warning: "No visible food amount input was found." };
   const value = String(amount);
   await input.fill(value);
+  await page.keyboard.press("Tab").catch(() => undefined);
   const actualValue = await input.inputValue().catch(() => "");
   if (!numericInputMatches(actualValue, amount)) {
     return {
       filled: false as const,
       value,
       actualValue,
+      selectedPanel,
       warning: `Food amount did not verify after filling. Requested ${value}, current value is ${actualValue || "blank"}.`,
     };
   }
-  return { filled: true as const, value, actualValue };
+  return { filled: true as const, value, actualValue, selectedPanel };
 }
 
 async function fillFoodTime(page: Page, timestamp?: string) {
@@ -4372,13 +4406,9 @@ async function fillFoodTime(page: Page, timestamp?: string) {
 
 async function fillFoodUnit(page: Page, unit?: string) {
   if (!unit) return { filled: true as const, skipped: true as const };
-  const dialog = activeDialog(page);
   const normalizedUnit = unit.trim();
-  const unitButton = dialog
-    .locator("button.dropdown-toggle:visible")
-    .filter({ hasText: /g|oz|serving|size|cup|tbsp|tsp|piece|slice|pint|pt|quart|ml|liter|litre/i })
-    .last();
-  if ((await unitButton.count().catch(() => 0)) === 0) {
+  const unitButton = await foodLogUnitDropdownButton(page);
+  if (!unitButton) {
     return { filled: false as const, unit: normalizedUnit, warning: "No visible food unit dropdown was found." };
   }
   const currentUnitText = await unitButton.innerText().catch(() => "");
@@ -4407,6 +4437,35 @@ async function fillFoodUnit(page: Page, unit?: string) {
     };
   }
   return { filled: true as const, unit: normalizedUnit, strategy: "dropdown-option" as const, currentUnitText: updatedUnitText };
+}
+
+async function foodLogUnitDropdownButton(page: Page) {
+  const scopes = [activeDialog(page), page.locator("body")];
+  for (const scope of scopes) {
+    const buttons = scope.locator("button.dropdown-toggle:visible, button.dropdown-btn:visible");
+    const count = await buttons.count().catch(() => 0);
+    for (let index = count - 1; index >= 0; index -= 1) {
+      const button = buttons.nth(index);
+      const meta = await button.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        const text = (element.textContent ?? "").replace(/\s+/g, " ").trim();
+        return {
+          text,
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+        };
+      }).catch(() => undefined);
+      if (!meta || meta.width < 20 || meta.height < 16) continue;
+      if (/\b(AM|PM|All|Custom|NCCDB|USDA|CRDB|Category|Source|Show score)\b/i.test(meta.text)) continue;
+      if (foodLogUnitTextLooksSelectable(meta.text)) return button;
+    }
+  }
+  return undefined;
+}
+
+function foodLogUnitTextLooksSelectable(text: string) {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  return /\b(g|gram|grams|oz|ounce|ounces|lb|pound|pounds|ml|milliliter|millilitre|cup|tbsp|tablespoon|tsp|teaspoon|serving|size|pint|pt|quart|liter|litre|piece|slice)\b/i.test(normalized);
 }
 
 async function waitForFoodLogUnitText(page: Page, unitButton: ReturnType<Page["locator"]>, unit: string, timeoutMs: number) {
@@ -4609,6 +4668,86 @@ async function waitForUnitText(page: Page, unitButton: ReturnType<Page["locator"
 async function currentRecipeUnitText(page: Page) {
   const unitButton = await recipeUnitDropdownButton(page);
   return unitButton ? unitButton.innerText().catch(() => "") : "";
+}
+
+async function currentFoodLogUnitText(page: Page, selectedName?: string) {
+  const unitButton = await foodLogUnitDropdownButton(page);
+  const buttonText = unitButton ? await unitButton.innerText().catch(() => "") : "";
+  if (buttonText.trim()) return buttonText;
+  return foodLogVisibleServingUnitText(page, selectedName);
+}
+
+async function foodLogVisibleServingUnitText(page: Page, selectedName?: string) {
+  return page.evaluate((selectedName) => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
+    const target = normalize(selectedName).toLowerCase();
+    const gramsPerServingUnit = (text: string) => {
+      const normalized = normalize(text).toLowerCase();
+      const exact = normalized.match(/^([0-9]+(?:\.[0-9]+)?)\s*(?:g|gram|grams)$/i);
+      if (exact?.[1]) return Number(exact[1]);
+      const annotated = normalized.match(/[—-]\s*([0-9]+(?:\.[0-9]+)?)\s*(?:g|gram|grams)\b/i)
+        ?? normalized.match(/\(\s*([0-9]+(?:\.[0-9]+)?)\s*(?:g|gram|grams)\s*\)/i)
+        ?? normalized.match(/\b([0-9]+(?:\.[0-9]+)?)\s*(?:g|gram|grams)\b/i);
+      return annotated?.[1] ? Number(annotated[1]) : undefined;
+    };
+    const isVisible = (element: Element) => {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    };
+    const dialogs = Array.from(document.querySelectorAll(".pretty-dialog, [role='dialog'], .gwt-DialogBox, .popupContent"))
+      .filter(isVisible);
+    const root = dialogs.at(-1) ?? document.body;
+    const candidates = Array.from(root.querySelectorAll(".food-search-serving-size,[class*='serving'][class*='size'],[class*='Serving'][class*='Size']"))
+      .filter(isVisible)
+      .map((element) => {
+        const text = normalize(element.textContent);
+        const rect = element.getBoundingClientRect();
+        const nearbyText = normalize(element.parentElement?.textContent).toLowerCase();
+        const targetNearby = !target || nearbyText.includes(target);
+        return { text, width: rect.width, height: rect.height, gramsPerServing: gramsPerServingUnit(text), targetNearby };
+      })
+      .filter((candidate) => candidate.text && candidate.gramsPerServing && candidate.targetNearby)
+      .sort((a, b) => {
+        const score = (candidate: typeof a) => {
+          let total = 0;
+          if (candidate.targetNearby) total += 60;
+          total -= Math.min(candidate.text.length, 80);
+          total -= Math.min(candidate.width * candidate.height / 2000, 30);
+          return total;
+        };
+        return score(b) - score(a);
+      });
+    return candidates[0]?.text ?? "";
+  }, selectedName).catch(() => "");
+}
+
+async function convertFoodLogGramAmountForCurrentServingUnit(page: Page, amount?: number, unit?: string, selectedName?: string) {
+  if (amount === undefined || unit?.trim().toLowerCase() !== "g") return undefined;
+  const unitText = await currentFoodLogUnitText(page, selectedName);
+  const gramsPerServing = gramsPerServingUnit(unitText);
+  if (!gramsPerServing) return { converted: false, unitText, warning: "Current food log serving unit does not expose a gram weight for conversion." };
+  const convertedAmount = Number((amount / gramsPerServing).toFixed(6));
+  const filled = await fillFoodAmount(page, convertedAmount, selectedName);
+  return {
+    converted: filled?.filled === true,
+    originalAmount: amount,
+    originalUnit: unit,
+    convertedAmount,
+    currentUnitText: unitText,
+    gramsPerServing,
+    amount: filled,
+  };
+}
+
+function convertedFoodLogUnitFill(unit: string | undefined, currentUnitText: string) {
+  return {
+    filled: true as const,
+    skipped: false as const,
+    unit: unit?.trim() ?? "",
+    strategy: "converted-current-serving" as const,
+    currentUnitText,
+  };
 }
 
 function unitTextAlreadyMatches(text: string, unit: string) {
