@@ -12,6 +12,7 @@ import {
   __setActiveBrowserJobForTests,
   releaseAndSnapshotBrowserQueue,
 } from "../dist/providers/browser.js";
+import { STABLE_MODEL_VISIBLE_TOOLS } from "../dist/mcp.js";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const tempDir = mkdtempSync(join(tmpdir(), "cronogpt-runtime-safety-"));
@@ -36,6 +37,23 @@ try {
   status = runCooldown(["set"], { CRONOMETER_LOGIN_BACKOFF_MS: "900000" });
   assert.equal(status.active, true);
   assert.ok(status.secondsRemaining > 0 && status.secondsRemaining <= 900);
+
+  for (const toolName of [
+    "get_daily_summary",
+    "list_food_entries",
+    "list_biometrics",
+    "list_exercises",
+    "list_notes",
+    "list_custom_foods",
+    "find_duplicate_custom_foods",
+    "list_private_recipe_names",
+    "find_private_recipe",
+    "resolve_recipe_ingredients",
+    "ensure_private_recipe",
+    "get_targets",
+  ]) {
+    assert.ok(STABLE_MODEL_VISIBLE_TOOLS.includes(toolName), `${toolName} should be ChatGPT-visible by default`);
+  }
 
   const provider = new BrowserCronometerProvider({
     email: "test@example.com",

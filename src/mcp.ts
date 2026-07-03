@@ -47,21 +47,34 @@ const commonOutputSchema = {
 export const MCP_PATH = "/mcp";
 const readToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read"] }];
 const writeToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read", "cronometer:write"] }];
-const stableModelVisibleTools = new Set([
+export const STABLE_MODEL_VISIBLE_TOOLS = [
+  "get_daily_summary",
+  "list_food_entries",
+  "list_biometrics",
+  "list_exercises",
+  "list_notes",
   "log_food",
   "log_foods",
   "delete_diary_food_entry",
   "search_foods",
   "custom_food_nutrient_schema",
+  "list_custom_foods",
+  "find_duplicate_custom_foods",
   "create_custom_food",
   "create_and_log_custom_food",
   "update_custom_food",
   "delete_custom_food",
   "retire_custom_food",
+  "list_private_recipe_names",
+  "find_private_recipe",
+  "resolve_recipe_ingredients",
+  "ensure_private_recipe",
+  "get_targets",
   "cronometer_runtime_status",
   "cronometer_stability_check",
   "refresh_cronometer_session",
-]);
+] as const;
+const stableModelVisibleTools = new Set<string>(STABLE_MODEL_VISIBLE_TOOLS);
 
 export function createCronoServer() {
   const server = new McpServer({ name: "cronogpt", version: "0.1.4" });
@@ -457,10 +470,20 @@ export function createCronoServer() {
   register(
     "search_foods",
     "Search foods",
-    "Searches the bounded Cronometer food database and the authenticated user's private Cronometer foods for visible food matches. It does not browse arbitrary websites or access files.",
-    { query: z.string().min(1), limit: z.number().int().positive().max(25).optional() },
+    "Searches the bounded Cronometer food database and the authenticated user's private Cronometer foods for visible food matches. Use searchScope=custom for private custom foods/recipes, all for official database lookups, or auto by default. It does not browse arbitrary websites or access files.",
+    {
+      query: z.string().min(1),
+      limit: z.number().int().positive().max(25).optional(),
+      searchScope: z.enum(["auto", "all", "custom", "favorites"]).optional(),
+      selectedSource: z.string().optional().describe("Optional source preference such as CRDB, NCCDB, USDA, Custom Food, Custom Recipe, or Brand."),
+    },
     { readOnlyHint: true, openWorldHint: false },
-    async (args) => toMcpToolResponse(await provider.searchFoods({ query: String(args.query), limit: args.limit as number | undefined })),
+    async (args) => toMcpToolResponse(await provider.searchFoods({
+      query: String(args.query),
+      limit: args.limit as number | undefined,
+      searchScope: args.searchScope as "auto" | "all" | "custom" | "favorites" | undefined,
+      selectedSource: args.selectedSource as string | undefined,
+    })),
   );
 
   register(
@@ -497,7 +520,7 @@ export function createCronoServer() {
   register(
     "log_food",
     "Log food",
-    "Adds a food to the Cronometer diary. For explicit food-log requests, confirmed real writes are accepted as background browser jobs; poll cronometer_runtime_status until completion before retrying. Use selectedName/selectedSource from search_foods for exact choices, or dryRun=true for previews.",
+    "Adds a food to the Cronometer diary. For explicit food-log requests, confirmed real writes run as idempotent background browser jobs and wait briefly for verified completion by default. If the result is still accepted, poll cronometer_runtime_status before retrying. Use selectedName/selectedSource from search_foods for exact choices, or dryRun=true for previews.",
     {
       date: z.string().optional(),
       meal: z.string().optional(),
@@ -512,6 +535,7 @@ export function createCronoServer() {
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
       idempotencyKey: z.string().optional().describe("Optional caller-supplied idempotency key. If omitted, cronogpt derives one from date, meal, food, amount, and unit."),
+      waitForCompletionSeconds: z.number().int().min(0).max(600).optional().describe("Defaults to a short server-chosen wait window. Use 0 to return immediately after accepting the background job."),
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     async (args) => toMcpToolResponse(await provider.logFood(args as never)),
@@ -560,6 +584,7 @@ export function createCronoServer() {
       confirmName: z.string().optional().describe("Must exactly match name when executing the delete."),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
+      waitForCompletionSeconds: z.number().int().min(0).max(600).optional().describe("Defaults to a server-chosen wait window for confirmed deletes. Use 0 to return immediately after accepting the background job."),
     },
     { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     async (args) => toMcpToolResponse(await provider.deleteDiaryFoodEntry(args as never)),
@@ -626,6 +651,7 @@ export function createCronoServer() {
       duplicatePolicy: z.enum(["fail", "update_existing", "create_new"]).optional().describe("Defaults to update_existing for exactly one same-named food, fails on multiple matches, and creates only when no match exists. Use create_new only when a duplicate is intentional."),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
+      waitForCompletionSeconds: z.number().int().min(0).max(600).optional().describe("Defaults to a server-chosen wait window for confirmed writes. Use 0 to return immediately after accepting the background job."),
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     async (args) => toMcpToolResponse(await provider.createCustomFood(args as never)),
@@ -649,6 +675,7 @@ export function createCronoServer() {
       timestamp: z.string().optional(),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
+      waitForCompletionSeconds: z.number().int().min(0).max(600).optional().describe("Defaults to a server-chosen wait window for confirmed create-and-log writes. Use 0 to return immediately after accepting the background job."),
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     async (args) => toMcpToolResponse(await provider.createAndLogCustomFood(args as never)),
@@ -691,6 +718,7 @@ export function createCronoServer() {
       nutrients: z.record(z.number()).optional().describe("Numeric nutrient values using custom_food_nutrient_schema keys, aliases, or exact Cronometer labels."),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
+      waitForCompletionSeconds: z.number().int().min(0).max(600).optional().describe("Defaults to a server-chosen wait window for confirmed updates. Use 0 to return immediately after accepting the background job."),
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     async (args) => toMcpToolResponse(await provider.updateCustomFood(args as never)),
@@ -707,6 +735,7 @@ export function createCronoServer() {
       ifUsed: z.enum(["stop", "retire", "force"]).optional().describe("Defaults to stop. Use retire to rename instead if Cronometer warns that old diary entries use this food; use force only after explicit user approval."),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
+      waitForCompletionSeconds: z.number().int().min(0).max(600).optional().describe("Defaults to a server-chosen wait window for confirmed deletes. Use 0 to return immediately after accepting the background job."),
     },
     { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     async (args) => toMcpToolResponse(await provider.deleteCustomFood(args as never)),
@@ -722,6 +751,7 @@ export function createCronoServer() {
       retiredName: z.string().optional().describe("Optional exact replacement name. Defaults to 'Retired - <name> - YYYY-MM-DD'."),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
+      waitForCompletionSeconds: z.number().int().min(0).max(600).optional().describe("Defaults to a server-chosen wait window for confirmed retire writes. Use 0 to return immediately after accepting the background job."),
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     async (args) => toMcpToolResponse(await provider.retireCustomFood(args as never)),
@@ -1269,6 +1299,7 @@ export async function handleMcpHttpRequest(req: IncomingMessage, res: ServerResp
         gitCommit: process.env.CRONOGPT_GIT_COMMIT,
         buildTimestamp: process.env.CRONOGPT_BUILD_TIMESTAMP,
         stableToolSurface: process.env.CRONOGPT_FULL_TOOL_SURFACE !== "true",
+        stableModelVisibleTools: STABLE_MODEL_VISIBLE_TOOLS,
       }));
     return;
   }

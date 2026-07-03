@@ -83,6 +83,8 @@ export class MockCronometerProvider extends BaseCronometerProvider {
   async searchFoods(input: SearchFoodsInput) {
     return this.result("search_foods", "dry_run", {
       query: input.query,
+      searchScope: input.searchScope ?? "auto",
+      selectedSource: input.selectedSource,
       results: [
         { id: "sample-result-1", name: `${input.query} - generic`, source: "mock" },
         { id: "sample-result-2", name: `${input.query} - branded`, source: "mock" },

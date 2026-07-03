@@ -85,6 +85,11 @@ LINK_SECRET="$(secret_or_remote_or_generate CRONOGPT_LINK_SECRET)"
 CRONOMETER_EMAIL_VALUE="$(secret_or_remote_required CRONOMETER_EMAIL)"
 CRONOMETER_PASSWORD_VALUE="$(secret_or_remote_required CRONOMETER_PASSWORD)"
 CRONOMETER_STORAGE_STATE_VALUE="$(secret_or_remote_optional CRONOMETER_STORAGE_STATE_BASE64)"
+GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if ! git diff --quiet --ignore-submodules -- 2>/dev/null || ! git diff --cached --quiet --ignore-submodules -- 2>/dev/null; then
+  GIT_COMMIT="${GIT_COMMIT}-dirty"
+fi
+BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 ssh "${SSH_ARGS[@]}" "$SSH_TARGET" "bash -s" < scripts/oracle/bootstrap-host.sh
 ssh "${SSH_ARGS[@]}" "$SSH_TARGET" "sudo chown -R $ORACLE_USER:$ORACLE_USER /opt/cronogpt/app /opt/cronogpt/config /opt/cronogpt/secrets /opt/cronogpt/state && chmod 700 /opt/cronogpt/secrets"
@@ -108,8 +113,8 @@ CRONOMETER_LOGIN_BACKOFF_MS=900000
 CRONOMETER_LOGIN_BACKOFF_FILE=/opt/cronogpt/state/cronometer-login-backoff.json
 CRONOMETER_TIME_ZONE=Asia/Jerusalem
 CRONOGPT_FULL_TOOL_SURFACE=false
-CRONOGPT_GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
-CRONOGPT_BUILD_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+CRONOGPT_GIT_COMMIT=${GIT_COMMIT}
+CRONOGPT_BUILD_TIMESTAMP=${BUILD_TIMESTAMP}
 EOF_REMOTE_CONFIG
 
 ssh "${SSH_ARGS[@]}" "$SSH_TARGET" "cat > /opt/cronogpt/secrets/cronogpt.env && chmod 600 /opt/cronogpt/secrets/cronogpt.env" <<EOF_REMOTE_SECRETS

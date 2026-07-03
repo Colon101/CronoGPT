@@ -46,6 +46,7 @@ export interface FoodLogInput {
   dryRun?: boolean;
   confirmed?: boolean;
   idempotencyKey?: string;
+  waitForCompletionSeconds?: number;
 }
 
 export interface FoodLogBatchInput {
@@ -68,6 +69,7 @@ export interface DiaryFoodDeleteInput {
   confirmName?: string;
   dryRun?: boolean;
   confirmed?: boolean;
+  waitForCompletionSeconds?: number;
 }
 
 export interface ExerciseLogInput {
@@ -101,6 +103,8 @@ export interface NoteLogInput {
 export interface SearchFoodsInput {
   query: string;
   limit?: number;
+  searchScope?: "auto" | "all" | "custom" | "favorites";
+  selectedSource?: string;
 }
 
 export interface StabilityCheckInput {
@@ -171,6 +175,7 @@ export interface CustomFoodInput {
   duplicatePolicy?: "fail" | "update_existing" | "create_new";
   dryRun?: boolean;
   confirmed?: boolean;
+  waitForCompletionSeconds?: number;
 }
 
 export interface CustomFoodAndLogInput extends CustomFoodInput {
@@ -199,6 +204,7 @@ export interface CustomFoodUpdateInput extends CustomFoodSelectorInput {
   nutrients?: Record<string, number>;
   dryRun?: boolean;
   confirmed?: boolean;
+  waitForCompletionSeconds?: number;
 }
 
 export interface CustomFoodDeleteInput extends CustomFoodSelectorInput {
@@ -206,12 +212,14 @@ export interface CustomFoodDeleteInput extends CustomFoodSelectorInput {
   ifUsed?: "stop" | "retire" | "force";
   dryRun?: boolean;
   confirmed?: boolean;
+  waitForCompletionSeconds?: number;
 }
 
 export interface CustomFoodRetireInput extends CustomFoodSelectorInput {
   retiredName?: string;
   dryRun?: boolean;
   confirmed?: boolean;
+  waitForCompletionSeconds?: number;
 }
 
 export interface CustomFoodDuplicateInput {

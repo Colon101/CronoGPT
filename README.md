@@ -188,19 +188,32 @@ By default, only these tools are model-visible:
 - `log_food`
 - `log_foods`
 - `delete_diary_food_entry`
+- `get_daily_summary`
+- `list_food_entries`
+- `list_biometrics`
+- `list_exercises`
+- `list_notes`
 - `search_foods`
 - `custom_food_nutrient_schema`
 - `list_custom_foods`
 - `find_duplicate_custom_foods`
 - `create_custom_food`
+- `create_and_log_custom_food`
 - `update_custom_food`
+- `delete_custom_food`
+- `retire_custom_food`
+- `list_private_recipe_names`
+- `find_private_recipe`
+- `resolve_recipe_ingredients`
+- `ensure_private_recipe`
+- `get_targets`
 - `cronometer_runtime_status`
 - `cronometer_stability_check`
 - `refresh_cronometer_session`
 
 The rest remain app-callable for rollback and direct testing. Set `CRONOGPT_FULL_TOOL_SURFACE=true` only when deliberately exposing the legacy broad surface.
 
-`log_food` is transactional. `dryRun=true` does not open Chromium. Confirmed real writes return `accepted`, run in the browser queue, write once, then read back the target diary entry. Poll `cronometer_runtime_status` for the final background result before retrying. Final states include `written`, `already_exists`, `busy`, `not_written_login_paused`, `not_written_ambiguous`, `not_written_not_found`, and `possibly_written_verify_failed`. For a whole meal, prefer `log_foods`; it reduces ChatGPT/tool-call drift by keeping all ingredients in one server-side transaction and returns exact per-item results.
+`log_food` is transactional. `dryRun=true` does not open Chromium. Confirmed real writes run in the browser queue, write once, and read back the target diary entry. Single-food writes wait briefly for verified completion by default; if the result is still `accepted`, poll `cronometer_runtime_status` for the final background result before retrying. Final states include `written`, `already_exists`, `busy`, `not_written_login_paused`, `not_written_ambiguous`, `not_written_not_found`, and `possibly_written_verify_failed`. For a whole meal, prefer `log_foods`; it reduces ChatGPT/tool-call drift by keeping all ingredients in one server-side transaction and returns exact per-item results.
 
 ## Backends
 

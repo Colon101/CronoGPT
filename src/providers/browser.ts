@@ -177,7 +177,9 @@ const BROWSER_VIEWPORT = { width: 1024, height: 768 };
 const DIARY_MEAL_SECTION_RE = /\b(Breakfast|Lunch|Dinner|Snacks|Supplements)\b/i;
 const MAX_DIARY_ARROW_DAYS = 45;
 const ACCOUNT_VERIFICATION_TTL_MS = 10 * 60 * 1000;
+const DEFAULT_FOOD_WRITE_WAIT_SECONDS = 75;
 const DEFAULT_BATCH_WRITE_WAIT_SECONDS = 120;
+const DEFAULT_CUSTOM_WRITE_WAIT_SECONDS = 120;
 const CRONOMETER_PAGE_HASHES = {
   diary: "#diary",
   customFoods: "#custom-foods",
@@ -453,11 +455,16 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   async searchFoods(input: SearchFoodsInput) {
     return this.withPage("search_foods", async (page) => {
-      const outcome = await this.searchFoodUi(page, input.query, input.limit ?? 10);
-      const results = rankFoodResults(input.query, outcome.results);
+      const outcome = await this.searchFoodUi(page, input.query, input.limit ?? 10, undefined, {
+        searchScope: input.searchScope,
+        selectedSource: input.selectedSource,
+      });
+      const results = rankFoodResults(input.query, outcome.results, undefined, input.selectedSource);
       const selection = chooseFoodLogResult({ query: input.query }, results);
       return this.result("search_foods", "ok", {
         query: input.query,
+        searchScope: input.searchScope ?? "auto",
+        selectedSource: input.selectedSource,
         results,
         selection,
       });
@@ -568,7 +575,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       const backgroundKey = backgroundBrowserJobKey("log_food", {
         idempotencyKey: normalized.idempotencyKey,
       });
-      return this.startBackgroundBrowserJob(
+      const accepted = this.startBackgroundBrowserJob(
         "log_food",
         backgroundKey,
         {
@@ -576,6 +583,11 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           input: safeInput(input),
         },
         () => this.withPage("log_food", (page) => this.logFoodOnPage(page, input, normalized, preflightData)),
+      );
+      return this.waitForAcceptedBackgroundJob(
+        "log_food",
+        accepted,
+        input.waitForCompletionSeconds ?? DEFAULT_FOOD_WRITE_WAIT_SECONDS,
       );
     }
 
@@ -897,7 +909,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         amountFill.warning ?? `Could not fill requested amount ${normalized.amount}. No food was written.`,
       );
     }
-    await chooseMeal(page, input.meal);
+    await chooseMeal(page, normalized.meal);
 
     const saved = await clickDialogButton(page, /^(ADD|ADD TO DIARY|ADD TO DIARY|SAVE|DONE)$/i);
     if (!saved) {
@@ -954,11 +966,16 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         unit: target.unit,
         confirmName: input.confirmName,
       });
-      return this.startBackgroundBrowserJob(
+      const accepted = this.startBackgroundBrowserJob(
         "delete_diary_food_entry",
         backgroundKey,
         safeInput(input),
         () => this.runDeleteDiaryFoodEntry(input),
+      );
+      return this.waitForAcceptedBackgroundJob(
+        "delete_diary_food_entry",
+        accepted,
+        input.waitForCompletionSeconds ?? DEFAULT_CUSTOM_WRITE_WAIT_SECONDS,
       );
     }
     return this.runDeleteDiaryFoodEntry(input);
@@ -1172,11 +1189,16 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         barcode: input.barcode,
         duplicatePolicy: input.duplicatePolicy ?? "update_existing",
       });
-      return this.startBackgroundBrowserJob(
+      const accepted = this.startBackgroundBrowserJob(
         "create_custom_food",
         backgroundKey,
         safeInput(input),
         () => this.runCreateCustomFood(input),
+      );
+      return this.waitForAcceptedBackgroundJob(
+        "create_custom_food",
+        accepted,
+        input.waitForCompletionSeconds ?? DEFAULT_CUSTOM_WRITE_WAIT_SECONDS,
       );
     }
     return this.runCreateCustomFood(input);
@@ -1364,11 +1386,16 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       timestamp: logInput.timestamp,
     });
 
-    return this.startBackgroundBrowserJob(
+    const accepted = this.startBackgroundBrowserJob(
       "create_and_log_custom_food",
       backgroundKey,
       safeInput(input),
       () => this.runCreateAndLogCustomFood(input, logInput, customFoodInput),
+    );
+    return this.waitForAcceptedBackgroundJob(
+      "create_and_log_custom_food",
+      accepted,
+      input.waitForCompletionSeconds ?? DEFAULT_CUSTOM_WRITE_WAIT_SECONDS,
     );
   }
 
@@ -1422,11 +1449,16 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         servingSize: input.servingSize,
         nutrients: input.nutrients,
       });
-      return this.startBackgroundBrowserJob(
+      const accepted = this.startBackgroundBrowserJob(
         "update_custom_food",
         backgroundKey,
         safeInput(input),
         () => this.runUpdateCustomFood(input),
+      );
+      return this.waitForAcceptedBackgroundJob(
+        "update_custom_food",
+        accepted,
+        input.waitForCompletionSeconds ?? DEFAULT_CUSTOM_WRITE_WAIT_SECONDS,
       );
     }
     return this.runUpdateCustomFood(input);
@@ -1512,11 +1544,16 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         confirmName: input.confirmName,
         ifUsed: input.ifUsed ?? "stop",
       });
-      return this.startBackgroundBrowserJob(
+      const accepted = this.startBackgroundBrowserJob(
         "delete_custom_food",
         backgroundKey,
         safeInput(input),
         () => this.runDeleteCustomFood(input),
+      );
+      return this.waitForAcceptedBackgroundJob(
+        "delete_custom_food",
+        accepted,
+        input.waitForCompletionSeconds ?? DEFAULT_CUSTOM_WRITE_WAIT_SECONDS,
       );
     }
     return this.runDeleteCustomFood(input);
@@ -1623,11 +1660,16 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         name: input.name,
         retiredName: input.retiredName,
       });
-      return this.startBackgroundBrowserJob(
+      const accepted = this.startBackgroundBrowserJob(
         "retire_custom_food",
         backgroundKey,
         safeInput(input),
         () => this.runRetireCustomFood(input),
+      );
+      return this.waitForAcceptedBackgroundJob(
+        "retire_custom_food",
+        accepted,
+        input.waitForCompletionSeconds ?? DEFAULT_CUSTOM_WRITE_WAIT_SECONDS,
       );
     }
     return this.runRetireCustomFood(input);
