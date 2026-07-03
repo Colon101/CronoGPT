@@ -213,7 +213,7 @@ By default, only these tools are model-visible:
 
 The rest remain app-callable for rollback and direct testing. Set `CRONOGPT_FULL_TOOL_SURFACE=true` only when deliberately exposing the legacy broad surface.
 
-`log_food` is transactional. `dryRun=true` does not open Chromium. Confirmed real writes run in the browser queue, write once, and read back the target diary entry. Single-food writes wait briefly for verified completion by default; if the result is still `accepted`, poll `cronometer_runtime_status` for the final background result before retrying. Final states include `written`, `already_exists`, `busy`, `not_written_login_paused`, `not_written_ambiguous`, `not_written_not_found`, and `possibly_written_verify_failed`. For a whole meal, prefer `log_foods`; it reduces ChatGPT/tool-call drift by keeping all ingredients in one server-side transaction and returns exact per-item results.
+`log_food` is transactional. `dryRun=true` does not open Chromium. Confirmed real writes run in the browser queue, write once, and read back the target diary entry. Single-food writes wait briefly for verified completion by default; confirmed custom-food writes and deletes wait up to the hosted operation window. If the result is still `accepted`, poll `cronometer_runtime_status` for the final background result before retrying. Final states include `written`, `already_exists`, `busy`, `not_written_login_paused`, `not_written_ambiguous`, `not_written_not_found`, and `possibly_written_verify_failed`. For a whole meal, prefer `log_foods`; it reduces ChatGPT/tool-call drift by keeping all ingredients in one server-side transaction and returns exact per-item results.
 
 ## Backends
 

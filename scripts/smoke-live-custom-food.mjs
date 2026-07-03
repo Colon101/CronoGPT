@@ -38,6 +38,7 @@ try {
     duplicatePolicy: "create_new",
     confirmed: true,
     dryRun: false,
+    waitForCompletionSeconds: 600,
   });
   emit("create", createResult);
   if (createResult.status !== "ok") fail("create_custom_food did not complete with status ok.");
@@ -55,6 +56,7 @@ try {
     ifUsed: "stop",
     confirmed: true,
     dryRun: false,
+    waitForCompletionSeconds: 600,
   });
   emit("delete", deleteResult);
   if (deleteResult.status !== "ok") throw new Error("delete_custom_food did not complete with status ok.");
@@ -85,6 +87,7 @@ async function cleanupByRetire(name) {
     retiredName,
     confirmed: true,
     dryRun: false,
+    waitForCompletionSeconds: 600,
   }).catch((error) => ({
     status: "error",
     warning: error instanceof Error ? error.message : String(error),
