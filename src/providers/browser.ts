@@ -1641,15 +1641,13 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       }
 
       await page.waitForTimeout(1200);
-      await this.openApp(page, "#custom-foods");
-      const listText = await waitForCustomItemListText(page, "Custom Foods", this.config.navigationTimeoutMs);
-      const stillListed = textHasFoodName(listText, target.name);
-      return this.result("delete_custom_food", stillListed ? "needs_manual_step" : "ok", {
-        deleted: !stillListed,
+      const deletion = await waitForCustomFoodGone(page, target, this.config.navigationTimeoutMs);
+      return this.result("delete_custom_food", deletion.gone ? "ok" : "needs_manual_step", {
+        deleted: deletion.gone,
         target,
         confirmation,
-        visibleText: compactText(listText, 8000),
-      }, stillListed ? "Delete was clicked, but the food name still appeared in the Custom Foods list afterward." : undefined);
+        verification: deletion,
+      }, deletion.gone ? undefined : "Delete was clicked, but the exact custom food still resolved from the Custom Foods list afterward.");
     });
   }
 
@@ -5508,6 +5506,39 @@ async function resolveCustomFoodTargets(
     }
   }
   return { names, targets };
+}
+
+async function waitForCustomFoodGone(page: Page, target: CustomFoodDetail, timeoutMs: number) {
+  const deadline = Date.now() + Math.max(5000, Math.min(timeoutMs, 30000));
+  let lastResolved: Awaited<ReturnType<typeof resolveCustomFoodTargets>> | undefined;
+
+  do {
+    await page.goto(`${CRONOMETER_ORIGIN}/#custom-foods`).catch(() => undefined);
+    await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+    const remaining = Math.max(3000, deadline - Date.now());
+    lastResolved = await resolveCustomFoodTargets(page, {
+      foodId: target.foodId,
+      name: target.name,
+    }, {
+      maxDetails: 5,
+      timeoutMs: Math.min(remaining, 12000),
+    }).catch(() => lastResolved);
+    if (!lastResolved || lastResolved.targets.length === 0) {
+      return {
+        gone: true,
+        visibleNameCount: lastResolved?.names.length ?? 0,
+        candidateCount: 0,
+      };
+    }
+    await page.waitForTimeout(1000);
+  } while (Date.now() < deadline);
+
+  return {
+    gone: false,
+    visibleNames: lastResolved?.names.slice(0, 25) ?? [],
+    candidates: lastResolved?.targets ?? [],
+    candidateCount: lastResolved?.targets.length ?? 0,
+  };
 }
 
 async function customRecipeDetailsForNames(page: Page, names: string[], maxDetails: number) {
