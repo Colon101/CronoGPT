@@ -5753,10 +5753,11 @@ async function openCustomFoodTarget(page: Page, target: CustomFoodDetail) {
   await waitForCustomItemListText(page, "Custom Foods", 12000).catch(() => "");
   const clicked = await clickCustomListItemByName(page, target.name, target.occurrence ?? 0);
   if (!clicked) return false;
-  await waitForVisibleText(page, (text) =>
+  const openedDetail = await waitForVisibleText(page, (text) =>
     textHasFoodName(text, target.name) && /\b(BACK TO FOODS LIST|Nutrition Label|Food Name|ADD TO DIARY)\b/i.test(text),
     5000,
-  ).catch(() => undefined);
+  ).then(() => true).catch(() => false);
+  if (!openedDetail) return false;
   if (!target.foodId) return true;
   const detail = await extractCustomFoodDetail(page);
   if (!detail?.foodId && textHasFoodName(await page.locator("body").innerText({ timeout: 3000 }).catch(() => ""), target.name)) return true;
@@ -5769,7 +5770,11 @@ async function openCustomRecipeTarget(page: Page, target: CustomRecipeDetail) {
   await waitForCustomItemListText(page, "Custom Recipes", 12000).catch(() => "");
   const clicked = await clickCustomListItemByName(page, target.name, target.occurrence ?? 0);
   if (!clicked) return false;
-  await page.waitForTimeout(1000);
+  const openedDetail = await waitForVisibleText(page, (text) =>
+    textHasFoodName(text, target.name) && /\b(BACK TO RECIPE LIST|Recipe #|Ingredients|ADD TO DIARY)\b/i.test(text),
+    5000,
+  ).then(() => true).catch(() => false);
+  if (!openedDetail) return false;
   if (!target.recipeId) return true;
   const detail = await extractCustomRecipeDetail(page);
   return detail?.recipeId === target.recipeId;
