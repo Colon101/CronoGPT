@@ -4,9 +4,11 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 const AUTH_REALM = "cronogpt MCP";
 const MCP_PATH = "/mcp";
 const SCOPES = ["cronometer:read", "cronometer:write"];
+const MAX_OAUTH_REQUEST_BODY_BYTES = 64 * 1024;
 const ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30;
 const REFRESH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 180;
 const AUTH_CODE_TTL_SECONDS = 60 * 10;
+const consumedAuthorizationCodes = new Map<string, number>();
 
 interface SignedPayload {
   typ: "code" | "access" | "refresh";
@@ -51,12 +53,8 @@ export function requestHost(req: IncomingMessage) {
 }
 
 export function isLocalRequest(req: IncomingMessage) {
-  const host = requestHost(req).split(":")[0]?.toLowerCase();
   const remote = req.socket.remoteAddress;
   return (
-    host === "localhost" ||
-    host === "127.0.0.1" ||
-    host === "::1" ||
     remote === "127.0.0.1" ||
     remote === "::1" ||
     remote === "::ffff:127.0.0.1"
@@ -66,38 +64,40 @@ export function isLocalRequest(req: IncomingMessage) {
 export function authorizeMcpRequest(req: IncomingMessage) {
   const token = getAuthToken();
   if (!token) {
+    const ok = process.env.NODE_ENV !== "production" && isLocalRequest(req);
     return {
-      ok: process.env.NODE_ENV !== "production" && isLocalRequest(req),
-      reason: "CRONOGPT_API_TOKEN is not configured.",
+      ok,
+      scopes: ok ? [...SCOPES] : [],
+      reason: ok ? undefined : "CRONOGPT_API_TOKEN is not configured.",
     };
   }
 
   const authorization = req.headers.authorization ?? "";
   const [scheme, credential] = authorization.split(/\s+/, 2);
   if (scheme?.toLowerCase() !== "bearer" || !credential) {
-    return { ok: false, reason: "Missing bearer token." };
+    return { ok: false, scopes: [], reason: "Missing bearer token." };
   }
 
   if (safeEqual(credential, token)) {
-    return { ok: true, reason: undefined };
+    return { ok: true, scopes: [...SCOPES], reason: undefined };
   }
 
   const payload = verifySignedPayload(credential, "access");
   if (!payload) {
-    return { ok: false, reason: "Invalid bearer token." };
+    return { ok: false, scopes: [], reason: "Invalid bearer token." };
   }
 
   const validAudiences = new Set([resourceIdentifier(req), publicOrigin(req)]);
   if (!payload.aud || !validAudiences.has(payload.aud)) {
-    return { ok: false, reason: "Bearer token audience does not match this MCP server." };
+    return { ok: false, scopes: [], reason: "Bearer token audience does not match this MCP server." };
   }
 
-  const scopes = new Set((payload.scope ?? "").split(/\s+/).filter(Boolean));
-  if (!scopes.has("cronometer:read")) {
-    return { ok: false, reason: "Bearer token does not include the required cronometer:read scope." };
+  const grantedScopes = parseScopes(payload.scope, false);
+  if (!grantedScopes || !grantedScopes.includes("cronometer:read")) {
+    return { ok: false, scopes: [], reason: "Bearer token does not include the required cronometer:read scope." };
   }
 
-  return { ok: true, reason: undefined };
+  return { ok: true, scopes: grantedScopes, reason: undefined };
 }
 
 export function rejectUnauthorized(req: IncomingMessage, res: ServerResponse, reason: string) {
@@ -137,13 +137,18 @@ export async function handleOAuthRequest(req: IncomingMessage, res: ServerRespon
   }
 
   if (req.method === "POST" && url.pathname === "/oauth/register") {
-    const body = await readRequestBody(req);
+    const body = await readOAuthRequestBody(req, res);
+    if (body === undefined) return true;
     const registration = body ? parseJsonObject(body) : {};
     const redirectUris = stringArray(registration.redirect_uris);
     logOAuth(req, "register", {
       redirect_count: redirectUris.length,
       redirect_uris: summarizeUrlList(redirectUris),
     });
+    if (redirectUris.length === 0 || redirectUris.some((redirectUri) => !isAllowedRedirect(redirectUri, req))) {
+      oauthError(res, 400, "invalid_redirect_uri", "Every registered redirect_uri must be an allowed ChatGPT callback URL.");
+      return true;
+    }
     writeJson(res, {
       client_id: `cronogpt-${base64Url(randomBytes(18))}`,
       client_id_issued_at: Math.floor(Date.now() / 1000),
@@ -165,13 +170,16 @@ export async function handleOAuthRequest(req: IncomingMessage, res: ServerRespon
   }
 
   if (req.method === "POST" && url.pathname === "/oauth/authorize") {
-    const params = parseFormBody(await readRequestBody(req));
+    const body = await readOAuthRequestBody(req, res);
+    if (body === undefined) return true;
+    const params = parseFormBody(body);
     handleAuthorizePost(req, res, params);
     return true;
   }
 
   if (req.method === "POST" && url.pathname === "/oauth/token") {
-    const body = await readRequestBody(req);
+    const body = await readOAuthRequestBody(req, res);
+    if (body === undefined) return true;
     const params = req.headers["content-type"]?.includes("application/json")
       ? parseJsonParams(body)
       : parseFormBody(body);
@@ -234,6 +242,29 @@ function handleAuthorizePost(req: IncomingMessage, res: ServerResponse, params: 
     return;
   }
 
+  if (
+    params.code_challenge_method !== "S256" ||
+    !params.code_challenge ||
+    !isValidPkceChallenge(params.code_challenge)
+  ) {
+    logOAuth(req, "authorize_error", { ...oauthParamLogDetails(req, params), reason: "invalid_pkce_challenge" });
+    oauthError(res, 400, "invalid_request", "A valid S256 PKCE code_challenge is required.");
+    return;
+  }
+
+  const scope = normalizeScope(params.scope);
+  if (!scope) {
+    logOAuth(req, "authorize_error", { ...oauthParamLogDetails(req, params), reason: "unsupported_scope" });
+    oauthError(res, 400, "invalid_scope", "One or more requested OAuth scopes are not supported.");
+    return;
+  }
+  const resource = params.resource || resourceIdentifier(req);
+  if (!isAllowedResource(resource, req)) {
+    logOAuth(req, "authorize_error", { ...oauthParamLogDetails(req, params), reason: "resource_not_allowed" });
+    oauthError(res, 400, "invalid_target", "The requested OAuth resource does not match this cronogpt server.");
+    return;
+  }
+
   const now = Math.floor(Date.now() / 1000);
   const code = signPayload({
     typ: "code",
@@ -241,8 +272,8 @@ function handleAuthorizePost(req: IncomingMessage, res: ServerResponse, params: 
     exp: now + AUTH_CODE_TTL_SECONDS,
     client_id: params.client_id,
     redirect_uri: params.redirect_uri,
-    scope: normalizeScope(params.scope),
-    resource: params.resource || resourceIdentifier(req),
+    scope,
+    resource,
     code_challenge: params.code_challenge,
     code_challenge_method: params.code_challenge_method,
     nonce: base64Url(randomBytes(18)),
@@ -274,9 +305,9 @@ function handleTokenRequest(req: IncomingMessage, res: ServerResponse, params: R
     return;
   }
 
-  if (params.grant_type !== "authorization_code" || !params.code || !params.redirect_uri) {
+  if (params.grant_type !== "authorization_code" || !params.code || !params.client_id || !params.redirect_uri) {
     logOAuth(req, "token_error", { grant_type: params.grant_type, reason: "missing_authorization_code_params" });
-    oauthError(res, 400, "invalid_request", "Expected authorization_code grant with code and redirect_uri.");
+    oauthError(res, 400, "invalid_request", "Expected authorization_code grant with code, client_id, and redirect_uri.");
     return;
   }
 
@@ -287,7 +318,7 @@ function handleTokenRequest(req: IncomingMessage, res: ServerResponse, params: R
     return;
   }
 
-  if (code.redirect_uri !== params.redirect_uri || (params.client_id && code.client_id !== params.client_id)) {
+  if (code.redirect_uri !== params.redirect_uri || code.client_id !== params.client_id) {
     logOAuth(req, "token_error", {
       grant_type: params.grant_type,
       reason: "code_request_mismatch",
@@ -299,17 +330,25 @@ function handleTokenRequest(req: IncomingMessage, res: ServerResponse, params: R
     return;
   }
 
-  if (code.code_challenge) {
-    if (code.code_challenge_method !== "S256" || !params.code_verifier) {
-      logOAuth(req, "token_error", { grant_type: params.grant_type, reason: "missing_pkce_verifier" });
-      oauthError(res, 400, "invalid_grant", "PKCE verifier is required.");
-      return;
-    }
-    if (!safeEqual(pkceChallenge(params.code_verifier), code.code_challenge)) {
-      logOAuth(req, "token_error", { grant_type: params.grant_type, reason: "pkce_mismatch" });
-      oauthError(res, 400, "invalid_grant", "PKCE verifier does not match the authorization code.");
-      return;
-    }
+  if (
+    code.code_challenge_method !== "S256" ||
+    !code.code_challenge ||
+    !params.code_verifier ||
+    !isValidPkceVerifier(params.code_verifier)
+  ) {
+    logOAuth(req, "token_error", { grant_type: params.grant_type, reason: "missing_pkce_verifier" });
+    oauthError(res, 400, "invalid_grant", "A valid PKCE verifier is required.");
+    return;
+  }
+  if (!safeEqual(pkceChallenge(params.code_verifier), code.code_challenge)) {
+    logOAuth(req, "token_error", { grant_type: params.grant_type, reason: "pkce_mismatch" });
+    oauthError(res, 400, "invalid_grant", "PKCE verifier does not match the authorization code.");
+    return;
+  }
+  if (!consumeAuthorizationCode(params.code, code.exp)) {
+    logOAuth(req, "token_error", { grant_type: params.grant_type, reason: "authorization_code_reused" });
+    oauthError(res, 400, "invalid_grant", "Authorization code has already been used.");
+    return;
   }
 
   logOAuth(req, "token_success", {
@@ -321,9 +360,9 @@ function handleTokenRequest(req: IncomingMessage, res: ServerResponse, params: R
 }
 
 function handleRefreshToken(req: IncomingMessage, res: ServerResponse, params: Record<string, string>) {
-  if (!params.refresh_token) {
+  if (!params.refresh_token || !params.client_id) {
     logOAuth(req, "token_error", { grant_type: params.grant_type, reason: "missing_refresh_token" });
-    oauthError(res, 400, "invalid_request", "Missing refresh_token.");
+    oauthError(res, 400, "invalid_request", "Missing refresh_token or client_id.");
     return;
   }
 
@@ -331,6 +370,11 @@ function handleRefreshToken(req: IncomingMessage, res: ServerResponse, params: R
   if (!refresh) {
     logOAuth(req, "token_error", { grant_type: params.grant_type, reason: "invalid_refresh_token" });
     oauthError(res, 400, "invalid_grant", "Refresh token is invalid or expired.");
+    return;
+  }
+  if (refresh.client_id !== params.client_id || !refresh.aud || !isAllowedResource(refresh.aud, req)) {
+    logOAuth(req, "token_error", { grant_type: params.grant_type, reason: "refresh_request_mismatch" });
+    oauthError(res, 400, "invalid_grant", "Refresh token does not match this client or MCP resource.");
     return;
   }
 
@@ -352,6 +396,10 @@ function writeTokenResponse(
 ) {
   const now = Math.floor(Date.now() / 1000);
   const normalizedScope = normalizeScope(scope);
+  if (!normalizedScope) {
+    oauthError(res, 400, "invalid_scope", "One or more token scopes are not supported.");
+    return;
+  }
   const accessToken = signPayload({
     typ: "access",
     iat: now,
@@ -464,8 +512,25 @@ function pkceChallenge(verifier: string) {
 }
 
 function normalizeScope(scope?: string) {
-  const requested = new Set((scope ?? SCOPES.join(" ")).split(/\s+/).filter(Boolean));
-  return SCOPES.filter((scopeName) => requested.has(scopeName)).join(" ") || SCOPES.join(" ");
+  return parseScopes(scope)?.join(" ");
+}
+
+function parseScopes(scope?: string, defaultToAll = true) {
+  const requestedScopes = scope?.trim()
+    ? scope.trim().split(/\s+/)
+    : defaultToAll ? [...SCOPES] : [];
+  if (requestedScopes.length === 0) return undefined;
+  if (requestedScopes.some((scopeName) => !SCOPES.includes(scopeName))) return undefined;
+  const requested = new Set(requestedScopes);
+  return SCOPES.filter((scopeName) => requested.has(scopeName));
+}
+
+function isValidPkceChallenge(value: string) {
+  return /^[A-Za-z0-9_-]{43}$/.test(value);
+}
+
+function isValidPkceVerifier(value: string) {
+  return /^[A-Za-z0-9._~-]{43,128}$/.test(value);
 }
 
 function isAllowedRedirect(redirectUri: string, req: IncomingMessage) {
@@ -481,17 +546,84 @@ function isAllowedRedirect(redirectUri: string, req: IncomingMessage) {
   }
 }
 
+function isAllowedResource(resource: string, req: IncomingMessage) {
+  return resource === resourceIdentifier(req) || resource === publicOrigin(req);
+}
+
+function consumeAuthorizationCode(code: string, expiresAt: number) {
+  const now = Math.floor(Date.now() / 1000);
+  for (const [digest, expiry] of consumedAuthorizationCodes) {
+    if (expiry < now) consumedAuthorizationCodes.delete(digest);
+  }
+  const digest = createHash("sha256").update(code).digest("base64url");
+  if (consumedAuthorizationCodes.has(digest)) return false;
+  consumedAuthorizationCodes.set(digest, expiresAt);
+  return true;
+}
+
 function isOAuthPath(pathname: string) {
   return pathname.startsWith("/oauth/") || pathname.startsWith("/.well-known/oauth");
 }
 
-async function readRequestBody(req: IncomingMessage) {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+async function readOAuthRequestBody(req: IncomingMessage, res: ServerResponse) {
+  try {
+    return await readRequestBody(req);
+  } catch (error) {
+    if (!(error instanceof RequestBodyTooLargeError)) throw error;
+    oauthError(res, 413, "invalid_request", `OAuth request body exceeds ${MAX_OAUTH_REQUEST_BODY_BYTES} bytes.`);
+    return undefined;
   }
-  return Buffer.concat(chunks).toString("utf8");
 }
+
+function readRequestBody(req: IncomingMessage): Promise<string> {
+  const contentLength = Number(headerValue(req.headers["content-length"]));
+  if (Number.isFinite(contentLength) && contentLength > MAX_OAUTH_REQUEST_BODY_BYTES) {
+    req.resume();
+    return Promise.reject(new RequestBodyTooLargeError());
+  }
+
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+
+    const cleanup = () => {
+      req.off("data", onData);
+      req.off("end", onEnd);
+      req.off("error", onError);
+      req.off("aborted", onAborted);
+    };
+    const onData = (chunk: Buffer | string) => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += buffer.length;
+      if (size > MAX_OAUTH_REQUEST_BODY_BYTES) {
+        cleanup();
+        req.resume();
+        reject(new RequestBodyTooLargeError());
+        return;
+      }
+      chunks.push(buffer);
+    };
+    const onEnd = () => {
+      cleanup();
+      resolve(Buffer.concat(chunks, size).toString("utf8"));
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onAborted = () => {
+      cleanup();
+      reject(new Error("OAuth request body was aborted."));
+    };
+
+    req.on("data", onData);
+    req.once("end", onEnd);
+    req.once("error", onError);
+    req.once("aborted", onAborted);
+  });
+}
+
+class RequestBodyTooLargeError extends Error {}
 
 function parseFormBody(body: string) {
   return Object.fromEntries(new URLSearchParams(body).entries());

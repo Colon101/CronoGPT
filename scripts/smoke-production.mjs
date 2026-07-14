@@ -97,6 +97,7 @@ await withClient(async (client) => {
     arguments: {
       name: "cronogpt smoke test dry run",
       servingSize: "1 serving",
+      barcode: "4006381333931",
       nutrients: { calories: 1, net_carbs: 2, caffeine: 80, "omega-3 dha": 0.2, "20:5n3": 0.1, vitamin_c: 12 },
       dryRun: true,
       confirmed: false,
@@ -108,6 +109,7 @@ await withClient(async (client) => {
     name: "custom_food_dry_run",
     ok: dryRun.structuredContent?.status === "dry_run" &&
       customFoodPreview?.servingSize?.parsed?.unit === "serving" &&
+      customFoodPreview?.barcode?.normalized === "4006381333931" &&
       customFoodPreviewLabels.includes("Energy") &&
       customFoodPreviewLabels.includes("Total Carbs") &&
       customFoodPreviewLabels.includes("Caffeine") &&
@@ -126,6 +128,7 @@ await withClient(async (client) => {
     arguments: {
       name: "cronogpt smoke test researched snack",
       servingSize: "1 serving",
+      barcode: "036000291452",
       nutrients: { calories: 123, protein: 4, net_carbs: 20, total_fat: 3 },
       nutritionSource: "smoke test fixture",
       meal: "Snacks",

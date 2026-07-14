@@ -36,7 +36,9 @@ import type {
 } from "../domain.js";
 import { BaseCronometerProvider } from "./base.js";
 import { capabilitiesForMode } from "../features.js";
-import { customFoodNutrientLabelForKey } from "../nutrients.js";
+import { compareStringsOrdinal, isoDateInTimeZone, stableJson } from "../determinism.js";
+import { customFoodNutrientMetadataForKey } from "../nutrients.js";
+import { validateBarcode } from "../barcode.js";
 import {
   foodLogBatchIdempotencyKey,
   foodLogBrowserPreflightData,
@@ -111,6 +113,7 @@ interface CustomFoodDetail {
   listIndex?: number;
   occurrence?: number;
   servingSize?: string;
+  barcodes?: string[];
   energy?: { value: number; unit: string };
   macros?: Record<string, { value: number; unit: string }>;
   nutrients?: Record<string, { value: number; unit: string; percentDailyValue?: number }>;
@@ -1200,27 +1203,40 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   async createCustomFood(input: CustomFoodInput & { confirmed?: boolean }) {
     const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
+    const preview = customFoodWritePreview(input);
+    if (confirmedWrite && !preview.valid) {
+      return this.result("create_custom_food", "needs_manual_step", {
+        input: safeInput(input),
+        preview,
+        browserOpened: false,
+        writeAttempted: false,
+        nextStep: "Correct the invalid serving size, barcode, or nutrient values, then retry with confirmed=true.",
+      }, preview.issues.join(" "));
+    }
+    const normalizedInput = preview.barcode.normalized
+      ? { ...input, barcode: preview.barcode.normalized }
+      : input;
     if (confirmedWrite) {
       const backgroundKey = backgroundBrowserJobKey("create_custom_food", {
-        name: input.name,
-        servingSize: input.servingSize,
-        nutrients: input.nutrients,
-        barcode: input.barcode,
-        duplicatePolicy: input.duplicatePolicy ?? "update_existing",
+        name: normalizedInput.name,
+        servingSize: normalizedInput.servingSize,
+        nutrients: normalizedInput.nutrients,
+        barcode: normalizedInput.barcode,
+        duplicatePolicy: normalizedInput.duplicatePolicy ?? "update_existing",
       });
       const accepted = this.startBackgroundBrowserJob(
         "create_custom_food",
         backgroundKey,
-        safeInput(input),
-        () => this.runCreateCustomFood(input),
+        safeInput(normalizedInput),
+        () => this.runCreateCustomFood(normalizedInput),
       );
       return this.waitForAcceptedBackgroundJob(
         "create_custom_food",
         accepted,
-        input.waitForCompletionSeconds ?? DEFAULT_CUSTOM_WRITE_WAIT_SECONDS,
+        normalizedInput.waitForCompletionSeconds ?? DEFAULT_CUSTOM_WRITE_WAIT_SECONDS,
       );
     }
-    return this.runCreateCustomFood(input);
+    return this.runCreateCustomFood(normalizedInput);
   }
 
   private async runCreateCustomFood(input: CustomFoodInput & { confirmed?: boolean }) {
@@ -1301,9 +1317,32 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     await page.waitForTimeout(1200);
     const nameFilled = await fillCustomFoodName(page, input.name);
     const serving = await fillCustomFoodServing(page, input.servingSize);
-    traceStep("basics_filled", { nameFilled, servingWarning: serving.warning });
+    const barcode = input.barcode ? await fillCustomFoodBarcode(page, input.barcode) : undefined;
+    traceStep("basics_filled", { nameFilled, servingWarning: serving.warning, barcodeStatus: barcode?.status });
     const nutrients = await fillCustomFoodNutrients(page, input.nutrients ?? {});
     traceStep("nutrients_filled", summarizeFillResults(nutrients));
+
+    const formIssues = [
+      ...(!nameFilled ? ["Could not verify the custom food name field."] : []),
+      ...(serving.warning ? [serving.warning] : []),
+      ...(barcode && !["ok", "already_present"].includes(barcode.status) ? [barcode.warning ?? "Could not verify the barcode field."] : []),
+      ...nutrients
+        .filter((entry) => entry.status === "not_found")
+        .map((entry) => entry.warning ?? `Could not find the ${entry.label} nutrient row.`),
+    ];
+    if (formIssues.length > 0) {
+      await clickByText(page, /^REVERT CHANGES$/i).catch(() => false);
+      return this.result("create_custom_food", "needs_manual_step", {
+        input: safeInput(input),
+        nameFilled,
+        serving,
+        barcode,
+        nutrients,
+        trace,
+        writeAttempted: false,
+        formIssues,
+      }, `The detailed custom-food editor could not be filled completely, so cronogpt did not save a partial food. ${formIssues.join(" ")}`);
+    }
 
     const saved = await clickByText(page, /^SAVE CHANGES$/i);
     traceStep("save_clicked", { saved });
@@ -1315,6 +1354,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           input: safeInput(input),
           nameFilled,
           serving,
+          barcode,
           nutrients,
           trace,
           visibleText: compactText(await this.visibleText(page), 12000),
@@ -1327,14 +1367,18 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     const confirmationClicked = await clickOptionalSaveConfirmation(page);
     if (confirmationClicked) await page.waitForTimeout(1300);
     const afterSaveText = compactText(await this.visibleText(page).catch(() => ""), 12000);
+    const finalDetail = await extractCustomFoodDetail(page);
+    const verification = verifyCustomFoodWrite(finalDetail, input);
     await page.waitForTimeout(900);
     await this.openApp(page, "#custom-foods");
     const listText = await this.visibleText(page);
-    const listed = textHasFoodName(listText, input.name);
-    traceStep("listed_checked", { listed, confirmationClicked });
+    const listed = parseCustomItemListNames(listText, "Custom Foods")
+      .some((name) => normalizeCustomFoodName(name) === normalizeCustomFoodName(input.name));
+    const verified = listed && verification.verified;
+    traceStep("listed_checked", { listed, verified, confirmationClicked, verificationIssues: verification.issues.length });
     return this.result(
       "create_custom_food",
-      listed ? "ok" : "needs_manual_step",
+      verified ? "ok" : "possibly_written_verify_failed",
       {
         created: listed,
         updated: openedExisting,
@@ -1343,47 +1387,70 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         foodName: input.name,
         nameFilled,
         serving,
+        barcode,
         nutrients,
         confirmationClicked,
         afterSaveText,
+        finalDetail,
+        verification,
         trace,
         visibleText: compactText(listText, 12000),
       },
-      listed ? undefined : "Clicked Save Changes, but the custom food was not found in the Custom Foods list afterward.",
+      verified
+        ? undefined
+        : listed
+          ? `Cronometer saved the food, but read-back verification failed: ${verification.issues.join(" ")}`
+          : "Clicked Save Changes, but the exact custom food was not found in the Custom Foods list afterward. Check list_custom_foods before retrying to avoid a duplicate.",
     );
   }
 
   async createAndLogCustomFood(input: CustomFoodAndLogInput & { confirmed?: boolean }) {
+    const preview = customFoodWritePreview(input);
+    const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
+    if (confirmedWrite && !preview.valid) {
+      return this.result("create_and_log_custom_food", "needs_manual_step", {
+        input: safeInput(input),
+        preview,
+        browserOpened: false,
+        writeAttempted: false,
+        createCustomFood: { skipped: true, reason: "Custom-food validation failed." },
+        logFood: { skipped: true, reason: "No diary log was attempted because custom-food validation failed." },
+        nextStep: "Correct the invalid serving size, barcode, or nutrient values, then retry with confirmed=true.",
+      }, preview.issues.join(" "));
+    }
+    const normalizedInput = preview.barcode.normalized
+      ? { ...input, barcode: preview.barcode.normalized }
+      : input;
     const logInput: FoodLogInput = {
-      date: input.date,
-      meal: input.meal ?? "Snacks",
-      query: input.name,
-      selectedName: input.name,
+      date: normalizedInput.date,
+      meal: normalizedInput.meal ?? "Snacks",
+      query: normalizedInput.name,
+      selectedName: normalizedInput.name,
       selectedSource: "Custom Food",
-      amount: input.amount ?? 1,
-      unit: input.unit,
-      timestamp: input.timestamp,
+      amount: normalizedInput.amount ?? 1,
+      unit: normalizedInput.unit,
+      timestamp: normalizedInput.timestamp,
       matchPolicy: "selected_only",
       searchScope: "custom",
-      dryRun: input.dryRun,
-      confirmed: input.confirmed,
+      dryRun: normalizedInput.dryRun,
+      confirmed: normalizedInput.confirmed,
     };
     const customFoodInput: CustomFoodInput & { confirmed?: boolean } = {
-      name: input.name,
-      servingSize: input.servingSize,
-      nutrients: input.nutrients,
-      barcode: input.barcode,
-      duplicatePolicy: input.duplicatePolicy ?? "update_existing",
-      dryRun: input.dryRun,
-      confirmed: input.confirmed,
+      name: normalizedInput.name,
+      servingSize: normalizedInput.servingSize,
+      nutrients: normalizedInput.nutrients,
+      barcode: normalizedInput.barcode,
+      duplicatePolicy: normalizedInput.duplicatePolicy ?? "update_existing",
+      dryRun: normalizedInput.dryRun,
+      confirmed: normalizedInput.confirmed,
     };
 
-    if (input.dryRun === true || !shouldRunConfirmedWrite(input, this.config.writeEnabled)) {
+    if (normalizedInput.dryRun === true || !confirmedWrite) {
       const createPreview = await this.createCustomFood({ ...customFoodInput, dryRun: true, confirmed: false });
       const logPreview = await this.logFood({ ...logInput, dryRun: true, confirmed: false });
       return this.result("create_and_log_custom_food", "dry_run", {
-        input: safeInput(input),
-        nutritionSource: input.nutritionSource,
+        input: safeInput(normalizedInput),
+        nutritionSource: normalizedInput.nutritionSource,
         createCustomFood: createPreview,
         logFood: logPreview,
         nextStep: this.config.writeEnabled
@@ -1393,10 +1460,10 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     }
 
     const backgroundKey = backgroundBrowserJobKey("create_and_log_custom_food", {
-      name: input.name,
-      servingSize: input.servingSize,
-      nutrients: input.nutrients,
-      barcode: input.barcode,
+      name: normalizedInput.name,
+      servingSize: normalizedInput.servingSize,
+      nutrients: normalizedInput.nutrients,
+      barcode: normalizedInput.barcode,
       duplicatePolicy: customFoodInput.duplicatePolicy,
       date: logInput.date,
       meal: logInput.meal,
@@ -1408,13 +1475,13 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     const accepted = this.startBackgroundBrowserJob(
       "create_and_log_custom_food",
       backgroundKey,
-      safeInput(input),
-      () => this.runCreateAndLogCustomFood(input, logInput, customFoodInput),
+      safeInput(normalizedInput),
+      () => this.runCreateAndLogCustomFood(normalizedInput, logInput, customFoodInput),
     );
     return this.waitForAcceptedBackgroundJob(
       "create_and_log_custom_food",
       accepted,
-      input.waitForCompletionSeconds ?? DEFAULT_CUSTOM_WRITE_WAIT_SECONDS,
+      normalizedInput.waitForCompletionSeconds ?? DEFAULT_CUSTOM_WRITE_WAIT_SECONDS,
     );
   }
 
@@ -1460,27 +1527,41 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   async updateCustomFood(input: CustomFoodUpdateInput & { confirmed?: boolean }) {
-    if (shouldRunConfirmedWrite(input, this.config.writeEnabled)) {
+    const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
+    const preview = customFoodUpdatePreview(input);
+    if (!preview.valid) {
+      return this.result("update_custom_food", "needs_manual_step", {
+        input: safeInput(input),
+        preview,
+        browserOpened: false,
+        writeAttempted: false,
+      }, preview.issues.join(" "));
+    }
+    const normalizedInput = preview.barcode.normalized
+      ? { ...input, barcode: preview.barcode.normalized }
+      : input;
+    if (confirmedWrite) {
       const backgroundKey = backgroundBrowserJobKey("update_custom_food", {
-        foodId: input.foodId,
-        name: input.name,
-        newName: input.newName,
-        servingSize: input.servingSize,
-        nutrients: input.nutrients,
+        foodId: normalizedInput.foodId,
+        name: normalizedInput.name,
+        newName: normalizedInput.newName,
+        servingSize: normalizedInput.servingSize,
+        nutrients: normalizedInput.nutrients,
+        barcode: normalizedInput.barcode,
       });
       const accepted = this.startBackgroundBrowserJob(
         "update_custom_food",
         backgroundKey,
-        safeInput(input),
-        () => this.runUpdateCustomFood(input),
+        safeInput(normalizedInput),
+        () => this.runUpdateCustomFood(normalizedInput),
       );
       return this.waitForAcceptedBackgroundJob(
         "update_custom_food",
         accepted,
-        input.waitForCompletionSeconds ?? DEFAULT_CUSTOM_WRITE_WAIT_SECONDS,
+        normalizedInput.waitForCompletionSeconds ?? DEFAULT_CUSTOM_WRITE_WAIT_SECONDS,
       );
     }
-    return this.runUpdateCustomFood(input);
+    return this.runUpdateCustomFood(normalizedInput);
   }
 
   private async runUpdateCustomFood(input: CustomFoodUpdateInput & { confirmed?: boolean }) {
@@ -1504,13 +1585,14 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         name: input.newName ?? before.name,
         servingSize: input.servingSize ?? before.servingSize,
         nutrients: input.nutrients,
+        barcodes: input.barcode ? [...new Set([...(before.barcodes ?? []), input.barcode])] : before.barcodes,
       };
       if (!confirmedWrite) {
         return this.result("update_custom_food", "dry_run", {
           input: safeInput(input),
           before,
           after,
-          preview: customFoodWritePreview(input),
+          preview: customFoodUpdatePreview(input),
           reason: writeGateReason(input, this.config.writeEnabled),
           nextStep: "Review the before/after diff, then call with confirmed=true to update this exact custom food.",
         });
@@ -1523,7 +1605,27 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
       const nameFilled = input.newName ? await fillCustomFoodName(page, input.newName) : true;
       const serving = input.servingSize ? await fillCustomFoodServing(page, input.servingSize) : undefined;
+      const barcode = input.barcode ? await fillCustomFoodBarcode(page, input.barcode) : undefined;
       const nutrients = input.nutrients ? await fillCustomFoodNutrients(page, input.nutrients) : [];
+      const formIssues = [
+        ...(!nameFilled ? ["Could not verify the custom food name field."] : []),
+        ...(serving?.warning ? [serving.warning] : []),
+        ...(barcode && !["ok", "already_present"].includes(barcode.status) ? [barcode.warning ?? "Could not verify the barcode field."] : []),
+        ...nutrients.filter((entry) => entry.status === "not_found").map((entry) => entry.warning ?? `Could not find ${entry.label}.`),
+      ];
+      if (formIssues.length > 0) {
+        await clickByText(page, /^REVERT CHANGES$/i).catch(() => false);
+        return this.result("update_custom_food", "needs_manual_step", {
+          input: safeInput(input),
+          before,
+          nameFilled,
+          serving,
+          barcode,
+          nutrients,
+          formIssues,
+          writeAttempted: false,
+        }, `The detailed custom-food editor could not be filled completely, so cronogpt did not save a partial update. ${formIssues.join(" ")}`);
+      }
       const saved = await clickByText(page, /^SAVE CHANGES$/i);
       if (!saved) {
         return this.result("update_custom_food", "needs_manual_step", {
@@ -1531,6 +1633,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           before,
           nameFilled,
           serving,
+          barcode,
           nutrients,
           visibleText: compactText(await this.visibleText(page), 12000),
         }, "Filled the custom food editor but could not find Save Changes.");
@@ -1541,21 +1644,38 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       if (confirmationClicked) await page.waitForTimeout(1300);
       const afterSaveText = compactText(await this.visibleText(page).catch(() => ""), 12000);
       const finalDetail = await extractCustomFoodDetail(page);
-      return this.result("update_custom_food", "ok", {
+      const verificationInput: CustomFoodInput = {
+        name: input.newName ?? before.name,
+        servingSize: input.servingSize,
+        nutrients: input.nutrients,
+        barcode: input.barcode,
+      };
+      const verification = verifyCustomFoodWrite(finalDetail, verificationInput);
+      return this.result("update_custom_food", verification.verified ? "ok" : "possibly_written_verify_failed", {
         updated: true,
         action: "updated_existing",
         before,
         after: finalDetail ?? after,
         nameFilled,
         serving,
+        barcode,
         nutrients,
         confirmationClicked,
         afterSaveText,
-      });
+        verification,
+      }, verification.verified ? undefined : `Cronometer saved the update, but read-back verification failed: ${verification.issues.join(" ")}`);
     });
   }
 
   async deleteCustomFood(input: CustomFoodDeleteInput & { confirmed?: boolean }) {
+    if (!input.name?.trim()) {
+      return this.result("delete_custom_food", "needs_manual_step", {
+        input: safeInput(input),
+        browserOpened: false,
+        writeAttempted: false,
+        nextStep: "Pass the exact current custom food name; include foodId as well when duplicate names exist.",
+      }, "Delete requires the exact current custom food name so cronogpt cannot scan or delete an unintended item by a partially resolved ID.");
+    }
     if (shouldRunConfirmedWrite(input, this.config.writeEnabled)) {
       const backgroundKey = backgroundBrowserJobKey("delete_custom_food", {
         foodId: input.foodId,
@@ -1647,7 +1767,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       }
 
       if (confirmation.retireInstead) {
-        const retiredName = retiredItemName(input.name ?? target.name, input.foodId);
+        const retiredName = retiredItemName(input.name ?? target.name, input.foodId, this.config.timeZone);
         const retired = await retireOpenCustomFood(page, target, retiredName);
         return this.result(retired.saved ? "delete_custom_food" : "delete_custom_food", retired.saved ? "ok" : "needs_manual_step", {
           deleted: false,
@@ -1671,6 +1791,14 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   async retireCustomFood(input: CustomFoodRetireInput & { confirmed?: boolean }) {
+    if (!input.name?.trim()) {
+      return this.result("retire_custom_food", "needs_manual_step", {
+        input: safeInput(input),
+        browserOpened: false,
+        writeAttempted: false,
+        nextStep: "Pass the exact current custom food name; include foodId as well when duplicate names exist.",
+      }, "Retire requires the exact current custom food name so cronogpt cannot rename an unintended item by a partially resolved ID.");
+    }
     if (shouldRunConfirmedWrite(input, this.config.writeEnabled)) {
       const backgroundKey = backgroundBrowserJobKey("retire_custom_food", {
         foodId: input.foodId,
@@ -1708,7 +1836,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       }
 
       const target = resolved.targets[0];
-      const retiredName = input.retiredName ?? retiredItemName(target.name, target.foodId);
+      const retiredName = input.retiredName ?? retiredItemName(target.name, target.foodId, this.config.timeZone);
       if (!confirmedWrite) {
         return this.result("retire_custom_food", "dry_run", {
           input: safeInput(input),
@@ -2018,7 +2146,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       }
 
       if (confirmation.retireInstead) {
-        const retiredName = retiredItemName(input.name ?? target.name, input.recipeId);
+        const retiredName = retiredItemName(input.name ?? target.name, input.recipeId, this.config.timeZone);
         const retired = await retireOpenCustomRecipe(page, target, retiredName);
         return this.result("delete_custom_recipe", retired.saved ? "ok" : "needs_manual_step", {
           deleted: false,
@@ -2059,7 +2187,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       }
 
       const target = resolved.targets[0];
-      const retiredName = input.retiredName ?? retiredItemName(target.name, target.recipeId);
+      const retiredName = input.retiredName ?? retiredItemName(target.name, target.recipeId, this.config.timeZone);
       if (!confirmedWrite) {
         return this.result("retire_custom_recipe", "dry_run", {
           input: safeInput(input),
@@ -2360,12 +2488,14 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     await gotoAllowingAbort(page, targetUrl, this.config.navigationTimeoutMs);
     await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
     await page.waitForTimeout(1200);
+    await dismissCronometerMarketingOverlays(page);
     if (await this.isLoggedIn(page)) {
       await this.ensureConfiguredAccount(page, hash);
       if (hash && !page.url().includes(hash)) {
         await gotoAllowingAbort(page, targetUrl, this.config.navigationTimeoutMs);
         await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
         await page.waitForTimeout(900);
+        await dismissCronometerMarketingOverlays(page);
       }
       return;
     }
@@ -2374,6 +2504,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     await gotoAllowingAbort(page, targetUrl, this.config.navigationTimeoutMs);
     await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
     await page.waitForTimeout(1200);
+    await dismissCronometerMarketingOverlays(page);
     if (!(await this.isLoggedIn(page))) {
       const reason = "Cronometer login succeeded but the app page did not load.";
       this.pauseLoginAttempts(reason);
@@ -2384,6 +2515,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       await gotoAllowingAbort(page, targetUrl, this.config.navigationTimeoutMs);
       await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
       await page.waitForTimeout(900);
+      await dismissCronometerMarketingOverlays(page);
     }
   }
 
@@ -2939,6 +3071,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         storageState: this.storageState(),
       });
       const page = context.pages().find((candidate) => candidate.url().includes("cronometer.com")) ?? context.pages()[0] ?? await context.newPage();
+      await blockHeavyBrowserAssets(page);
       page.setDefaultTimeout(this.config.navigationTimeoutMs);
       page.setDefaultNavigationTimeout(this.config.navigationTimeoutMs);
       return { browser, context, page, closeContext: false, closeBrowser: false };
@@ -2952,6 +3085,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         storageState: this.storageState(),
       });
       const page = await context.newPage();
+      await blockHeavyBrowserAssets(page);
       page.setDefaultTimeout(this.config.navigationTimeoutMs);
       page.setDefaultNavigationTimeout(this.config.navigationTimeoutMs);
       cachedLocalSession = { browser, context, page, closeContext: false, closeBrowser: false };
@@ -3098,6 +3232,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 }
 
 async function clickByText(page: Page, label: string | RegExp) {
+  await dismissCronometerMarketingOverlays(page);
   const candidates = [
     page.getByRole("button", { name: label }),
     page.getByRole("link", { name: label }),
@@ -3369,8 +3504,7 @@ async function enqueueBrowserJob<T>(
   return result;
 }
 
-export function releaseAndSnapshotBrowserQueue(staleJobMs = 240000) {
-  const now = Date.now();
+export function releaseAndSnapshotBrowserQueue(staleJobMs = 240000, now = Date.now()) {
   const activeStaleJobMs = activeBrowserJob?.staleJobMs ?? staleJobMs;
   const staleActiveJob = activeBrowserJob && now - activeBrowserJob.startedAt > activeStaleJobMs
     ? { ...activeBrowserJob, ageMs: now - activeBrowserJob.startedAt, staleJobMs: activeStaleJobMs }
@@ -3432,21 +3566,11 @@ function backgroundBrowserJobKey(feature: string, input: unknown) {
   return `${feature}:${digest}`;
 }
 
-function stableJson(value: unknown): string {
-  if (value === undefined) return "\"__undefined__\"";
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([, item]) => item !== undefined)
-    .sort(([left], [right]) => left.localeCompare(right));
-  return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(",")}}`;
-}
-
 function pruneBackgroundBrowserJobs(now = Date.now()) {
   const maxAgeMs = 6 * 60 * 60 * 1000;
   const completed = Array.from(backgroundBrowserJobs.values())
     .filter((job) => job.status !== "running")
-    .sort((left, right) => right.updatedAt - left.updatedAt);
+    .sort((left, right) => right.updatedAt - left.updatedAt || compareStringsOrdinal(left.id, right.id));
   const keepCompleted = new Set(completed.slice(0, 20).map((job) => job.id));
 
   for (const job of backgroundBrowserJobs.values()) {
@@ -3462,11 +3586,11 @@ function summarizeBackgroundBrowserJobs(now = Date.now()) {
   const jobs = Array.from(backgroundBrowserJobs.values());
   const running = jobs
     .filter((job) => job.status === "running")
-    .sort((left, right) => left.startedAt - right.startedAt)
+    .sort((left, right) => left.startedAt - right.startedAt || compareStringsOrdinal(left.id, right.id))
     .map((job) => summarizeBackgroundBrowserJob(job, now));
   const recent = jobs
     .filter((job) => job.status !== "running")
-    .sort((left, right) => right.updatedAt - left.updatedAt)
+    .sort((left, right) => right.updatedAt - left.updatedAt || compareStringsOrdinal(left.id, right.id))
     .slice(0, 10)
     .map((job) => summarizeBackgroundBrowserJob(job, now));
   return {
@@ -3544,6 +3668,22 @@ async function blockHeavyBrowserAssets(page: Page) {
     }
     await route.continue().catch(() => undefined);
   }).catch(() => undefined);
+}
+
+async function dismissCronometerMarketingOverlays(page: Page) {
+  return page.evaluate(() => {
+    const selectors = [
+      ".ab-iam-root",
+      ".ab-page-blocker",
+      "[class*='ab-iam-root']",
+    ];
+    const elements = new Set<Element>();
+    for (const selector of selectors) {
+      for (const element of document.querySelectorAll(selector)) elements.add(element);
+    }
+    for (const element of elements) element.remove();
+    return elements.size;
+  }).catch(() => 0);
 }
 
 async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
@@ -4247,7 +4387,7 @@ async function foodDialogFilterClickBox(page: Page, label: string) {
         };
       })
       .filter((candidate) => candidate.text.toLowerCase() === expected)
-      .sort((a, b) => Number(b.tabLike) - Number(a.tabLike) || a.area - b.area || a.y - b.y);
+      .sort((a, b) => Number(b.tabLike) - Number(a.tabLike) || a.area - b.area || a.y - b.y || a.x - b.x);
     return candidates[0];
   }, label).catch(() => undefined);
 }
@@ -4820,7 +4960,7 @@ async function clickVisibleOptionByExactText(page: Page, value?: string) {
         return { text, x: rect.x, y: rect.y, width: rect.width, height: rect.height };
       })
       .filter((candidate) => candidate.text.toLowerCase() === normalizedValue)
-      .sort((a, b) => (a.width * a.height) - (b.width * b.height));
+      .sort((a, b) => (a.width * a.height) - (b.width * b.height) || a.y - b.y || a.x - b.x);
     return candidates[0];
   }, normalizedValue).catch(() => undefined);
   if (!box) return false;
@@ -4956,6 +5096,153 @@ async function openCustomFoodByName(page: Page, name: string) {
   await page.waitForTimeout(1200);
   const text = await page.locator("body").innerText({ timeout: 5000 }).catch(() => "");
   return textHasFoodName(text, name) && /\b(Food Name|Nutrition Label|ADD TO DIARY)\b/i.test(text);
+}
+
+async function fillCustomFoodBarcode(page: Page, requestedBarcode: string) {
+  const validation = validateBarcode(requestedBarcode);
+  if (!validation.valid || !validation.normalized) {
+    return {
+      status: "invalid" as const,
+      requested: requestedBarcode,
+      normalized: validation.normalized,
+      warning: validation.warning ?? "Barcode is invalid.",
+    };
+  }
+
+  await dismissCronometerMarketingOverlays(page);
+  const advancedToggle = page.locator("a[aria-controls='main-food-editor-advanced-area']");
+  if ((await advancedToggle.count().catch(() => 0)) !== 1) {
+    return {
+      status: "not_found" as const,
+      requested: requestedBarcode,
+      normalized: validation.normalized,
+      warning: "Could not find Cronometer's Advanced Info section.",
+    };
+  }
+  if ((await advancedToggle.getAttribute("aria-expanded").catch(() => "false")) !== "true") {
+    const expanded = await advancedToggle.click({ timeout: 2500, force: true }).then(() => true).catch(() => false);
+    if (!expanded) {
+      return {
+        status: "not_found" as const,
+        requested: requestedBarcode,
+        normalized: validation.normalized,
+        warning: "Could not expand Cronometer's Advanced Info section.",
+      };
+    }
+    await page.waitForTimeout(200);
+  }
+
+  const barcodeInputs = page.locator("#main-food-editor-advanced-area table.crono-table input.gwt-TextBox");
+  let inputCount = await barcodeInputs.count().catch(() => 0);
+  const existingValues: string[] = [];
+  let emptyInputIndex: number | undefined;
+  for (let index = 0; index < inputCount; index += 1) {
+    const value = (await barcodeInputs.nth(index).inputValue().catch(() => "")).replace(/[\s-]+/g, "");
+    if (!value && emptyInputIndex === undefined) emptyInputIndex = index;
+    if (value) existingValues.push(value);
+  }
+  if (existingValues.includes(validation.normalized)) {
+    return {
+      status: "already_present" as const,
+      requested: requestedBarcode,
+      normalized: validation.normalized,
+      format: validation.format,
+      existingValues,
+      verified: true,
+    };
+  }
+
+  let targetIndex = emptyInputIndex;
+  if (targetIndex === undefined) {
+    const addBarcode = page.locator("#main-food-editor-advanced-area [title='Add Barcode...']");
+    if ((await addBarcode.count().catch(() => 0)) !== 1) {
+      return {
+        status: "not_found" as const,
+        requested: requestedBarcode,
+        normalized: validation.normalized,
+        existingValues,
+        warning: "Could not find Cronometer's Add Barcode control.",
+      };
+    }
+    const previousInputCount = inputCount;
+    await addBarcode.scrollIntoViewIfNeeded({ timeout: 2500 }).catch(() => undefined);
+    const activationAttempts = [
+      () => addBarcode.click({ timeout: 3000, force: true }),
+      () => addBarcode.dispatchEvent("click"),
+      () => addBarcode.evaluate((element) => {
+        if (element instanceof HTMLElement) element.click();
+      }),
+    ];
+    let added = false;
+    for (const activate of activationAttempts) {
+      await activate().catch(() => undefined);
+      await page.waitForTimeout(300);
+      inputCount = await barcodeInputs.count().catch(() => 0);
+      if (inputCount > previousInputCount) {
+        added = true;
+        break;
+      }
+    }
+    if (!added) {
+      return {
+        status: "not_found" as const,
+        requested: requestedBarcode,
+        normalized: validation.normalized,
+        existingValues,
+        warning: "Cronometer's Add Barcode control did not create an editable barcode row.",
+      };
+    }
+    targetIndex = inputCount - 1;
+  }
+
+  await page.waitForTimeout(350);
+  const normalizedBarcode = validation.normalized;
+  const input = barcodeInputs.nth(targetIndex);
+  const fillAttempts = [
+    () => input.fill(normalizedBarcode, { timeout: 3000 }),
+    async () => {
+      await input.click({ timeout: 3000, force: true });
+      await input.press(process.platform === "darwin" ? "Meta+A" : "Control+A");
+      await input.pressSequentially(normalizedBarcode, { delay: 15 });
+    },
+    () => input.evaluate((element, value) => {
+      if (!(element instanceof HTMLInputElement)) return;
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(element, value);
+      element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+      element.dispatchEvent(new Event("change", { bubbles: true }));
+      element.blur();
+    }, normalizedBarcode),
+  ];
+  let actual = "";
+  for (const fill of fillAttempts) {
+    await fill().catch(() => undefined);
+    await page.waitForTimeout(120);
+    actual = (await input.inputValue().catch(() => "")).replace(/[\s-]+/g, "");
+    if (actual === normalizedBarcode) break;
+  }
+  if (actual !== normalizedBarcode) {
+    return {
+      status: "not_found" as const,
+      requested: requestedBarcode,
+      normalized: validation.normalized,
+      existingValues,
+      actual,
+      warning: "Could not fill Cronometer's barcode input.",
+    };
+  }
+  await input.press("Tab").catch(() => undefined);
+  const verified = actual === normalizedBarcode;
+  return {
+    status: verified ? ("ok" as const) : ("unverified" as const),
+    requested: requestedBarcode,
+    normalized: validation.normalized,
+    format: validation.format,
+    existingValues,
+    actual,
+    verified,
+    warning: verified ? undefined : "Filled the barcode field, but its value could not be verified before saving.",
+  };
 }
 
 async function fillCustomFoodServing(page: Page, servingSize?: string) {
@@ -5122,37 +5409,165 @@ async function fillCustomFoodNutrients(page: Page, nutrients: Record<string, num
 }
 
 export function customFoodNutrientEntries(nutrients: Record<string, number>) {
-  const mapped = new Map<string, { label: string; value: number; sourceKey: string }>();
-  for (const [key, value] of Object.entries(nutrients)) {
-    if (!Number.isFinite(value)) continue;
-    const label = customFoodNutrientLabelForKey(key);
-    if (!label) continue;
-    mapped.set(label, { label, value, sourceKey: key });
+  const candidates = Object.entries(nutrients)
+    .filter(([, value]) => Number.isFinite(value) && value >= 0)
+    .flatMap(([sourceKey, value]) => {
+      const metadata = customFoodNutrientMetadataForKey(sourceKey);
+      return metadata.label ? [{ ...metadata, label: metadata.label, sourceKey, value }] : [];
+    })
+    .sort((left, right) => left.order - right.order
+      || left.aliasPriority - right.aliasPriority
+      || compareStringsOrdinal(left.sourceKey, right.sourceKey));
+
+  const mapped = new Map<string, (typeof candidates)[number]>();
+  for (const candidate of candidates) {
+    if (!mapped.has(candidate.label)) mapped.set(candidate.label, candidate);
   }
-  return Array.from(mapped.values());
+  return Array.from(mapped.values()).map(({ label, value, sourceKey }) => ({ label, value, sourceKey }));
 }
 
-export function customFoodWritePreview(input: { servingSize?: string; nutrients?: Record<string, number> }) {
+export function customFoodWritePreview(input: { name?: string; servingSize?: string; nutrients?: Record<string, number>; barcode?: string }) {
   const parsedServingSize = parseServingSize(input.servingSize);
   const nutrientEntries = customFoodNutrientEntries(input.nutrients ?? {});
   const ignoredNutrients = Object.entries(input.nutrients ?? {})
-    .filter(([, value]) => !Number.isFinite(value))
+    .filter(([, value]) => !Number.isFinite(value) || value < 0)
+    .sort(([left], [right]) => compareStringsOrdinal(left, right))
     .map(([sourceKey, value]) => ({
       sourceKey,
       value: Number.isNaN(value) ? "NaN" : String(value),
+      warning: Number.isFinite(value) && value < 0
+        ? "Nutrient values cannot be negative."
+        : "Nutrient value must be a finite number.",
     }));
+  const barcode = validateBarcode(input.barcode);
+  const issues = [
+    ...(typeof input.name === "string" && !input.name.trim() ? ["Custom food name cannot be empty."] : []),
+    ...(input.servingSize !== undefined && !parsedServingSize ? ["Could not parse servingSize. Use values like '100 g', '1 serving', '250 ml', or '1 oz'."] : []),
+    ...(!barcode.valid && barcode.warning ? [barcode.warning] : []),
+    ...ignoredNutrients.map((item) => `${item.sourceKey}: ${item.warning}`),
+  ];
   return {
+    valid: issues.length === 0,
+    issues,
     servingSize: {
       requested: input.servingSize,
       parsed: parsedServingSize,
-      warning: input.servingSize && !parsedServingSize
+      warning: input.servingSize !== undefined && !parsedServingSize
         ? "Could not parse servingSize. Use values like '100 g', '1 serving', '250 ml', or '1 oz'."
         : undefined,
     },
     nutrients: nutrientEntries,
     ignoredNutrients,
     nutrientCount: nutrientEntries.length,
+    barcode,
   };
+}
+
+export function customFoodUpdatePreview(input: CustomFoodUpdateInput) {
+  const writePreview = customFoodWritePreview({
+    name: input.newName,
+    servingSize: input.servingSize,
+    nutrients: input.nutrients,
+    barcode: input.barcode,
+  });
+  const hasSelector = Boolean(input.name?.trim());
+  const hasChange = input.newName !== undefined
+    || input.servingSize !== undefined
+    || input.barcode !== undefined
+    || Boolean(input.nutrients && Object.keys(input.nutrients).length > 0);
+  const issues = [
+    ...(!hasSelector ? ["Update requires the exact current custom food name and optionally its foodId."] : []),
+    ...(!hasChange ? ["Update requires at least one changed field: newName, servingSize, barcode, or a nutrient value."] : []),
+    ...writePreview.issues,
+  ];
+  return {
+    ...writePreview,
+    valid: issues.length === 0,
+    issues,
+    hasSelector,
+    hasChange,
+  };
+}
+
+export function verifyCustomFoodWrite(
+  detail: {
+    name?: string;
+    servingSize?: string;
+    barcodes?: string[];
+    nutrients?: Record<string, { value: number; unit: string }>;
+  } | undefined,
+  input: { name: string; servingSize?: string; barcode?: string; nutrients?: Record<string, number> },
+) {
+  const issues: string[] = [];
+  const nameVerified = Boolean(
+    detail?.name
+      && normalizeCustomFoodName(detail.name) === normalizeCustomFoodName(input.name),
+  );
+  if (!nameVerified) issues.push(`Expected food name ${JSON.stringify(input.name)} was not read back exactly.`);
+
+  const expectedServing = parseServingSize(input.servingSize);
+  const actualServing = parseServingSize(detail?.servingSize);
+  const servingVerified = !input.servingSize || Boolean(
+    expectedServing
+      && actualServing
+      && expectedServing.unit.toLowerCase() === actualServing.unit.toLowerCase()
+      && Math.abs(expectedServing.amount - actualServing.amount) <= 0.000001,
+  );
+  if (!servingVerified) {
+    issues.push(`Expected serving size ${JSON.stringify(input.servingSize)} but read back ${JSON.stringify(detail?.servingSize)}.`);
+  }
+
+  const barcode = validateBarcode(input.barcode);
+  const actualBarcodes = (detail?.barcodes ?? []).map((value) => value.replace(/[\s-]+/g, ""));
+  const barcodeVerified = !input.barcode || Boolean(barcode.valid && barcode.normalized && actualBarcodes.includes(barcode.normalized));
+  if (!barcodeVerified) {
+    issues.push(`Expected barcode ${JSON.stringify(barcode.normalized ?? input.barcode)} was not present after save.`);
+  }
+
+  const nutrientResults = customFoodNutrientEntries(input.nutrients ?? {}).map((expected) => {
+    const actual = detail?.nutrients?.[expected.label];
+    const tolerance = Math.max(0.0051, Math.abs(expected.value) * 0.00001);
+    const valueVerified = Boolean(actual && Number.isFinite(actual.value) && Math.abs(actual.value - expected.value) <= tolerance);
+    const expectedUnit = customFoodNutrientMetadataForKey(expected.sourceKey).unit;
+    const unitVerified = !expectedUnit || Boolean(actual && normalizeNutritionUnit(actual.unit) === normalizeNutritionUnit(expectedUnit));
+    const verified = valueVerified && unitVerified;
+    if (!verified) {
+      issues.push(
+        `${expected.label} expected ${expected.value}${expectedUnit ? ` ${expectedUnit}` : ""} but read back ${actual ? `${actual.value} ${actual.unit}` : "no value"}.`,
+      );
+    }
+    return {
+      ...expected,
+      expectedUnit,
+      actual,
+      tolerance,
+      valueVerified,
+      unitVerified,
+      verified,
+    };
+  });
+
+  return {
+    verified: issues.length === 0,
+    issues,
+    nameVerified,
+    servingVerified,
+    barcodeVerified,
+    expectedBarcode: barcode.normalized,
+    actualBarcodes,
+    nutrientsVerified: nutrientResults.every((result) => result.verified),
+    nutrientResults,
+  };
+}
+
+function normalizeCustomFoodName(value: string) {
+  return value.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function normalizeNutritionUnit(value: string) {
+  const normalized = value.replace(/µ/g, "u").trim().toLowerCase();
+  if (normalized === "ug") return "mcg";
+  return normalized;
 }
 
 async function fillCustomFoodNutrient(page: Page, label: string, value: number) {
@@ -5907,6 +6322,11 @@ async function extractCustomFoodDetail(page: Page): Promise<CustomFoodDetail | u
     const name = normalize(nameInput?.value || titleName || "");
     if (!name) return undefined;
 
+    const barcodes = Array.from(document.querySelectorAll("#main-food-editor-advanced-area table.crono-table input.gwt-TextBox"))
+      .filter((element): element is HTMLInputElement => element instanceof HTMLInputElement)
+      .map((element) => normalize(element.value).replace(/[\s-]+/g, ""))
+      .filter((value) => /^\d+$/.test(value));
+
     let servingSize: string | undefined;
     const servingRows = Array.from(document.querySelectorAll("#main-food-editor-info-area table.crono-table tr"));
     for (const row of servingRows) {
@@ -5943,6 +6363,7 @@ async function extractCustomFoodDetail(page: Page): Promise<CustomFoodDetail | u
       foodId,
       name,
       servingSize,
+      barcodes,
       energy: nutrients.Energy ? { value: nutrients.Energy.value, unit: nutrients.Energy.unit } : undefined,
       macros,
       nutrients,
@@ -6082,8 +6503,8 @@ async function retireOpenCustomRecipe(page: Page, target: CustomRecipeDetail, re
   };
 }
 
-function retiredItemName(name: string, id?: string) {
-  const today = new Date().toISOString().slice(0, 10);
+export function retiredItemName(name: string, id: string | undefined, timeZone: string, now = new Date()) {
+  const today = isoDateInTimeZone(timeZone, now);
   const suffix = id ? ` #${id}` : "";
   const base = name.replace(/^Retired\s+-\s+/i, "").trim();
   return `Retired - ${base}${suffix} - ${today}`;
@@ -6961,7 +7382,10 @@ export function rankFoodResults(query: string, results: SearchResult[], selected
     .sort((a, b) => {
       const aScore = foodResultScore(a, normalizedQuery, normalizedSelected, normalizedSelectedSource);
       const bScore = foodResultScore(b, normalizedQuery, normalizedSelected, normalizedSelectedSource);
-      return bScore - aScore;
+      return bScore - aScore
+        || compareStringsOrdinal(normalizeFoodName(a.name), normalizeFoodName(b.name))
+        || compareStringsOrdinal(normalizeSource(a.source), normalizeSource(b.source))
+        || compareStringsOrdinal(a.raw, b.raw);
     });
 }
 

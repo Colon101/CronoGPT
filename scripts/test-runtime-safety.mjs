@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import {
   BrowserCronometerProvider,
   __resetBrowserQueueForTests,
@@ -12,11 +12,12 @@ import {
   __setActiveBrowserJobForTests,
   releaseAndSnapshotBrowserQueue,
 } from "../dist/providers/browser.js";
-import { STABLE_MODEL_VISIBLE_TOOLS } from "../dist/mcp.js";
+import { createCronoServer, STABLE_MODEL_VISIBLE_TOOLS } from "../dist/mcp.js";
+import { runCooldownCommand } from "./cronometer-login-cooldown.mjs";
 
-const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const tempDir = mkdtempSync(join(tmpdir(), "cronogpt-runtime-safety-"));
 const cooldownFile = join(tempDir, "cooldown.json");
+const fixedNow = Date.parse("2200-05-18T03:33:20.000Z");
 
 try {
   let status = runCooldown(["status"]);
@@ -26,7 +27,8 @@ try {
   status = runCooldown(["set", "120", "Too", "Many", "Attempts"]);
   assert.equal(status.active, true);
   assert.equal(status.reason, "Too Many Attempts");
-  assert.ok(status.secondsRemaining > 0 && status.secondsRemaining <= 120);
+  assert.equal(status.secondsRemaining, 120);
+  assert.equal(status.updatedAt, fixedNow);
   assert.equal(statSync(cooldownFile).mode & 0o777, 0o600);
 
   status = runCooldown(["clear"]);
@@ -36,7 +38,7 @@ try {
 
   status = runCooldown(["set"], { CRONOMETER_LOGIN_BACKOFF_MS: "900000" });
   assert.equal(status.active, true);
-  assert.ok(status.secondsRemaining > 0 && status.secondsRemaining <= 900);
+  assert.equal(status.secondsRemaining, 900);
 
   for (const toolName of [
     "get_daily_summary",
@@ -54,6 +56,32 @@ try {
   ]) {
     assert.ok(STABLE_MODEL_VISIBLE_TOOLS.includes(toolName), `${toolName} should be ChatGPT-visible by default`);
   }
+
+  const scopedServer = createCronoServer({ grantedScopes: ["cronometer:read"] });
+  const scopedClient = new Client({ name: "cronogpt-test", version: "1.0.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await scopedServer.connect(serverTransport);
+  await scopedClient.connect(clientTransport);
+  const listedTools = await scopedClient.listTools();
+  const preferredCustomFoodTool = listedTools.tools.find((tool) => tool.name === "create_and_log_custom_food");
+  assert.ok(preferredCustomFoodTool);
+  assert.match(preferredCustomFoodTool.description ?? "", /preferred one-call workflow/i);
+  assert.ok(preferredCustomFoodTool.inputSchema?.properties?.barcode);
+  assert.match(scopedClient.getInstructions() ?? "", /barcode links the private custom food/i);
+  const rejectedWrite = await scopedClient.callTool({
+    name: "create_custom_food",
+    arguments: {
+      name: "scope test",
+      servingSize: "1 serving",
+      nutrients: { calories: 1 },
+      barcode: "4006381333931",
+      dryRun: true,
+    },
+  });
+  assert.equal(rejectedWrite.structuredContent?.status, "error");
+  assert.equal(rejectedWrite.structuredContent?.source, "oauth-scope-enforcement");
+  await scopedClient.close();
+  await scopedServer.close();
 
   const provider = new BrowserCronometerProvider({
     email: "test@example.com",
@@ -130,24 +158,33 @@ try {
   assert.match(status.reason, /Unreadable cooldown file/);
 
   __resetBrowserQueueForTests();
-  __setActiveBrowserJobForTests("log_food", Date.now() - 10_000);
-  let queue = releaseAndSnapshotBrowserQueue(60_000);
+  __setActiveBrowserJobForTests("log_food", fixedNow - 10_000);
+  let queue = releaseAndSnapshotBrowserQueue(60_000, fixedNow);
   assert.equal(queue.activeBrowserJobs, 1);
   assert.equal(queue.activeBrowserJob.feature, "log_food");
 
-  queue = releaseAndSnapshotBrowserQueue(1);
+  queue = releaseAndSnapshotBrowserQueue(1, fixedNow);
   assert.equal(queue.activeBrowserJobs, 0);
   assert.equal(queue.activeBrowserJob, undefined);
   assert.equal(queue.staleActiveJob.feature, "log_food");
   __resetBrowserQueueForTests();
 
   const starts = [];
+  let signalFirstStarted;
+  let releaseFirst;
+  const firstStarted = new Promise((resolve) => {
+    signalFirstStarted = resolve;
+  });
+  const firstCanFinish = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
   const first = __runBrowserQueueJobForTests("first", async () => {
     starts.push("first");
-    await sleep(30);
+    signalFirstStarted();
+    await firstCanFinish;
     return "first";
   });
-  await sleep(5);
+  await firstStarted;
   const second = __runBrowserQueueJobForTests("second", async () => {
     starts.push("second");
     return "second";
@@ -155,6 +192,7 @@ try {
   queue = releaseAndSnapshotBrowserQueue(1000);
   assert.equal(queue.activeBrowserJobs, 1);
   assert.equal(queue.queuedBrowserJobs, 1);
+  releaseFirst();
   assert.deepEqual(await Promise.all([first, second]), ["first", "second"]);
   assert.deepEqual(starts, ["first", "second"]);
   __resetBrowserQueueForTests();
@@ -164,20 +202,12 @@ try {
   rmSync(tempDir, { force: true, recursive: true });
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function runCooldown(args, env = {}) {
-  const result = spawnSync(process.execPath, ["scripts/cronometer-login-cooldown.mjs", ...args], {
-    cwd: repoRoot,
+  return runCooldownCommand(args, {
     env: {
-      ...process.env,
       ...env,
       CRONOMETER_LOGIN_BACKOFF_FILE: cooldownFile,
     },
-    encoding: "utf8",
+    now: fixedNow,
   });
-  assert.equal(result.status, 0, result.stderr || result.stdout);
-  return JSON.parse(result.stdout);
 }

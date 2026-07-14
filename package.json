@@ -3,13 +3,20 @@
   "version": "0.1.4",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22.7.5 <23"
+  },
   "scripts": {
-    "build": "tsc",
+    "clean": "node scripts/clean.mjs",
+    "build": "npm run clean && tsc -p tsconfig.json",
     "dev": "tsx src/server.ts",
     "start": "node dist/server.js",
-    "test": "npm run test:food-logic && npm run test:runtime-safety",
+    "test": "npm run build && npm run test:compiled",
+    "test:compiled": "node scripts/test-food-logic.mjs && node scripts/test-runtime-safety.mjs && node scripts/test-determinism.mjs && node scripts/test-oauth.mjs",
     "test:food-logic": "npm run build && node scripts/test-food-logic.mjs",
-    "test:runtime-safety": "node scripts/test-runtime-safety.mjs",
+    "test:runtime-safety": "npm run build && node scripts/test-runtime-safety.mjs",
+    "test:determinism": "npm run build && node scripts/test-determinism.mjs",
+    "test:oauth": "npm run build && node scripts/test-oauth.mjs",
     "cronometer:cooldown": "node scripts/cronometer-login-cooldown.mjs",
     "storage:cronometer": "node scripts/generate-cronometer-storage-state.mjs",
     "smoke:production": "node scripts/smoke-production.mjs",
@@ -17,18 +24,19 @@
     "smoke:live-custom-food": "npm run build && node scripts/smoke-live-custom-food.mjs",
     "oracle:deploy": "bash scripts/oracle/deploy.sh",
     "oracle:wipe-local-env": "bash scripts/oracle/wipe-local-env-preserve-cronometer.sh",
-    "inspect": "npx @modelcontextprotocol/inspector@latest --server-url http://localhost:${PORT:-8787}/mcp --transport http"
+    "inspect": "mcp-inspector --server-url http://localhost:${PORT:-8787}/mcp --transport http"
   },
   "dependencies": {
-    "@modelcontextprotocol/ext-apps": "^1.0.1",
-    "@modelcontextprotocol/sdk": "^1.20.2",
-    "dotenv": "^17.2.3",
-    "playwright-core": "^1.60.0",
-    "zod": "^3.25.76"
+    "@modelcontextprotocol/ext-apps": "1.7.3",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "dotenv": "17.4.2",
+    "playwright-core": "1.60.0",
+    "zod": "3.25.76"
   },
   "devDependencies": {
-    "@types/node": "^22.18.0",
-    "tsx": "^4.20.6",
-    "typescript": "^5.9.3"
+    "@modelcontextprotocol/inspector": "0.22.0",
+    "@types/node": "22.19.19",
+    "tsx": "4.22.5",
+    "typescript": "5.9.3"
   }
 }

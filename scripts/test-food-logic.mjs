@@ -3,13 +3,16 @@ import assert from "node:assert/strict";
 import {
   chooseFoodLogResult,
   customFoodNutrientEntries,
+  customFoodUpdatePreview,
   customFoodWritePreview,
   foodSearchTabAttempts,
   parseServingSize,
   rankFoodResults,
   servingSizeRowMatches,
+  verifyCustomFoodWrite,
 } from "../dist/providers/browser.js";
 import { customFoodNutrientLabelForKey } from "../dist/nutrients.js";
+import { gtinCheckDigit, validateBarcode } from "../dist/barcode.js";
 import {
   foodLogBatchIdempotencyKey,
   foodLogIdempotencyKey,
@@ -38,6 +41,18 @@ assert.equal(customFoodNutrientLabelForKey("available carbohydrates"), "Total Ca
 assert.equal(customFoodNutrientLabelForKey("fat_g"), "Fat");
 assert.equal(customFoodNutrientLabelForKey("fiber_g"), "Fiber");
 assert.equal(customFoodNutrientLabelForKey("caffeine"), "Caffeine");
+assert.equal(customFoodNutrientLabelForKey("retinol activity equivalent"), "Vitamin A");
+assert.equal(customFoodNutrientLabelForKey("alpha tocopherol"), "Vitamin E");
+assert.equal(customFoodNutrientLabelForKey("molybdenum"), "Molybdenum");
+
+assert.equal(validateBarcode("4006 3813-3393 1").normalized, "4006381333931");
+assert.equal(validateBarcode("4006 3813-3393 1").valid, true);
+assert.equal(validateBarcode("036000291452").valid, true);
+// UPC-E encodes the UPC-A payload 042000001007.
+assert.equal(validateBarcode("04210007").valid, true);
+assert.equal(validateBarcode("96385074").valid, true);
+assert.equal(validateBarcode("4006381333932").valid, false);
+assert.equal(gtinCheckDigit("400638133393"), 1);
 
 assert.deepEqual(parseServingSize("1 serving"), { amount: 1, amountText: "1", unit: "serving" });
 assert.deepEqual(parseServingSize("250 ml"), { amount: 250, amountText: "250", unit: "ml" });
@@ -58,11 +73,11 @@ const nutrientEntries = customFoodNutrientEntries({
 });
 assert.deepEqual(nutrientEntries.map((entry) => [entry.sourceKey, entry.label, entry.value]), [
   ["calories", "Energy", 10],
-  ["net_carbs", "Total Carbs", 4],
-  ["protein_g", "Protein", 7],
   ["caffeine", "Caffeine", 80],
+  ["net_carbs", "Total Carbs", 4],
   ["omega-3 dha", "DHA", 0.2],
   ["20:5n3", "EPA", 0.1],
+  ["protein_g", "Protein", 7],
   ["vitamin_c", "Vitamin C", 12],
 ]);
 
@@ -72,7 +87,72 @@ const preview = customFoodWritePreview({
 });
 assert.equal(preview.servingSize.parsed.unit, "serving");
 assert.equal(preview.nutrientCount, 2);
-assert.deepEqual(preview.ignoredNutrients, [{ sourceKey: "invalid_number", value: "NaN" }]);
+assert.deepEqual(preview.ignoredNutrients, [{
+  sourceKey: "invalid_number",
+  value: "NaN",
+  warning: "Nutrient value must be a finite number.",
+}]);
+
+const barcodePreview = customFoodWritePreview({
+  name: "Barcode food",
+  servingSize: "250 ml",
+  barcode: "4006 3813-3393 1",
+  nutrients: { calories: 10, vitamin_a: 25, chromium: 3 },
+});
+assert.equal(barcodePreview.valid, true);
+assert.equal(barcodePreview.barcode.normalized, "4006381333931");
+assert.deepEqual(barcodePreview.nutrients.map((entry) => entry.label), ["Energy", "Vitamin A", "Chromium"]);
+
+const invalidPreview = customFoodWritePreview({
+  name: "Invalid barcode food",
+  servingSize: "not a serving",
+  barcode: "4006381333932",
+  nutrients: { sodium: -1 },
+});
+assert.equal(invalidPreview.valid, false);
+assert.equal(invalidPreview.issues.length, 3);
+assert.equal(customFoodWritePreview({ name: "Food", servingSize: "" }).valid, false);
+
+const invalidUpdate = customFoodUpdatePreview({ name: "Barcode food" });
+assert.equal(invalidUpdate.valid, false);
+assert.match(invalidUpdate.issues.join(" "), /at least one changed field/i);
+assert.equal(customFoodUpdatePreview({ name: "Barcode food", barcode: "4006381333931" }).valid, true);
+assert.equal(customFoodUpdatePreview({ newName: "Renamed food" }).valid, false);
+assert.match(customFoodUpdatePreview({ newName: "Renamed food" }).issues.join(" "), /exact current custom food name/i);
+
+const verifiedCustomFood = verifyCustomFoodWrite({
+  name: "Barcode food",
+  servingSize: "250 ml",
+  barcodes: ["4006381333931"],
+  nutrients: {
+    Energy: { value: 10, unit: "kcal" },
+    "Vitamin A": { value: 25, unit: "µg" },
+    Chromium: { value: 3, unit: "µg" },
+  },
+}, {
+  name: "Barcode food",
+  servingSize: "250 ml",
+  barcode: "4006381333931",
+  nutrients: { calories: 10, vitamin_a: 25, chromium: 3 },
+});
+assert.equal(verifiedCustomFood.verified, true);
+assert.equal(verifiedCustomFood.barcodeVerified, true);
+assert.equal(verifiedCustomFood.nutrientsVerified, true);
+
+const mismatchedCustomFood = verifyCustomFoodWrite({
+  name: "Barcode food",
+  servingSize: "250 ml",
+  barcodes: [],
+  nutrients: { Energy: { value: 9, unit: "kcal" } },
+}, {
+  name: "Barcode food",
+  servingSize: "250 ml",
+  barcode: "4006381333931",
+  nutrients: { calories: 10 },
+});
+assert.equal(mismatchedCustomFood.verified, false);
+assert.match(mismatchedCustomFood.issues.join(" "), /barcode/i);
+assert.match(mismatchedCustomFood.issues.join(" "), /Energy/);
 
 assert.deepEqual(foodSearchTabAttempts(undefined, undefined).slice(0, 3), ["All", "Custom", "Favorites"]);
 assert.deepEqual(foodSearchTabAttempts("custom", undefined), ["Custom"]);

@@ -13,6 +13,7 @@ import { z } from "zod";
 import { createProviderFromEnv } from "./providers/index.js";
 import { toMcpToolResponse } from "./tool-response.js";
 import { CUSTOM_FOOD_NUTRIENT_SCHEMA, customFoodNutrientSchemaSummary } from "./nutrients.js";
+import { validateBarcode } from "./barcode.js";
 import {
   authorizeMcpRequest,
   getAuthToken,
@@ -43,6 +44,17 @@ const commonOutputSchema = {
   source: z.string().optional(),
   data: z.unknown().optional(),
 };
+
+const nutrientRecordSchema = z.record(
+  z.number().finite().nonnegative(),
+).describe("Numeric nutrient values in the units returned by custom_food_nutrient_schema. Values must be finite and non-negative.");
+const barcodeInputSchema = z.string()
+  .min(1)
+  .max(64)
+  .refine((value) => validateBarcode(value).valid, {
+    message: "Use a valid 8-digit UPC-E/EAN-8, 12-digit UPC-A, 13-digit EAN-13, or 14-digit GTIN-14 barcode, including its check digit.",
+  })
+  .describe("Barcode printed on the package. Spaces and hyphens are normalized away; the check digit is validated before Cronometer opens.");
 
 export const MCP_PATH = "/mcp";
 const readToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read"] }];
@@ -76,8 +88,19 @@ export const STABLE_MODEL_VISIBLE_TOOLS = [
 ] as const;
 const stableModelVisibleTools = new Set<string>(STABLE_MODEL_VISIBLE_TOOLS);
 
-export function createCronoServer() {
-  const server = new McpServer({ name: "cronogpt", version: "0.1.4" });
+const MCP_SERVER_INSTRUCTIONS = [
+  "Use create_and_log_custom_food as the preferred single-step workflow when a packaged food is missing from Cronometer and the user wants it logged.",
+  "For custom foods, use Cronometer's detailed #/custom-foods editor: pass the package serving size, every nutrient available on the label, and the UPC/EAN/GTIN barcode whenever it is visible. The barcode links the private custom food to future barcode searches/scans.",
+  "Do not call duplicate-list tools before create_custom_food or create_and_log_custom_food; those tools resolve exact same-name foods themselves and default to updating one exact match.",
+  "Use dryRun=true when nutrition facts or barcode data are uncertain. For a confirmed background write, do not retry while it is accepted or running; poll cronometer_runtime_status until completion.",
+  "Treat possibly_written_verify_failed as an ambiguous write: inspect the custom-food list or diary before retrying so a duplicate is not created.",
+].join("\n");
+
+export function createCronoServer(options: { grantedScopes?: readonly string[] } = {}) {
+  const server = new McpServer(
+    { name: "cronogpt", version: "0.1.4" },
+    { instructions: MCP_SERVER_INSTRUCTIONS },
+  );
 
   registerAppResource(
     server,
@@ -132,7 +155,19 @@ export function createCronoServer() {
       },
     };
 
-    const toolHandler = async (args: unknown) => handler((args ?? {}) as Record<string, unknown>);
+    const toolHandler = async (args: unknown) => {
+      if (securitySchemes === writeToolSecuritySchemes && options.grantedScopes && !options.grantedScopes.includes("cronometer:write")) {
+        return toMcpToolResponse({
+          provider: provider.name,
+          mode: provider.mode,
+          feature: name,
+          status: "error",
+          warning: "This OAuth access token does not include the required cronometer:write scope. Relink cronogpt with write access before calling this tool.",
+          source: "oauth-scope-enforcement",
+        });
+      }
+      return handler((args ?? {}) as Record<string, unknown>);
+    };
     if (modelVisible) {
       server.registerTool(name, baseToolConfig, toolHandler);
       return;
@@ -641,13 +676,13 @@ export function createCronoServer() {
 
   register(
     "create_custom_food",
-    "Create custom food",
-    "Creates or updates a custom Cronometer food after validation and confirmation. This tool performs its own same-name duplicate handling; do not call list_custom_foods or find_duplicate_custom_foods first. nutrients accepts keys from custom_food_nutrient_schema, aliases such as calories/carbs/net_carbs/caffeine/valine/glycine/vitamin_c, or exact Cronometer display labels. For Israeli labels, treat listed carbohydrates as net/available carbs: pass them as total_carbs or net_carbs and pass fiber/sugar_alcohol separately if listed.",
+    "Create detailed barcode-linked custom food",
+    "Use this when the user wants a private Cronometer custom food created or safely updated without immediately logging it. This is the preferred custom-food path: use the package serving size, include every nutrient available from the label, and pass the UPC/EAN/GTIN barcode whenever visible so later barcode searches/scans resolve to this food. It handles same-name duplicates internally; do not call list_custom_foods first. For Israeli labels, pass listed available carbohydrates as total_carbs or net_carbs and pass fiber/sugar_alcohol separately.",
     {
       name: z.string().min(1),
       servingSize: z.string().optional(),
-      nutrients: z.record(z.number()).optional().describe("Numeric nutrient values. Keys may be canonical schema keys, aliases, or exact Cronometer labels; call custom_food_nutrient_schema for supported macronutrients, micronutrients, amino acids, fatty acids, vitamins, and minerals. Include caffeine in mg when relevant. For Israeli labels, use total_carbs/net_carbs for available carbohydrates and record fiber/sugar_alcohol separately when provided."),
-      barcode: z.string().optional(),
+      nutrients: nutrientRecordSchema.optional().describe("Use custom_food_nutrient_schema keys, aliases, or exact Cronometer labels. Prefer every value present on the package label, including caffeine, vitamins, minerals, amino acids, or fatty acids when available."),
+      barcode: barcodeInputSchema.optional(),
       duplicatePolicy: z.enum(["fail", "update_existing", "create_new"]).optional().describe("Defaults to update_existing for exactly one same-named food, fails on multiple matches, and creates only when no match exists. Use create_new only when a duplicate is intentional."),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
@@ -659,14 +694,14 @@ export function createCronoServer() {
 
   register(
     "create_and_log_custom_food",
-    "Create and log custom food",
-    "End-to-end workflow for packaged foods missing from Cronometer: after ChatGPT researches nutrition facts on the web and calculates the serving macros, call this tool directly. It performs same-name duplicate handling internally, creates or updates the Cronometer custom food, then logs that exact custom food to the diary meal, defaulting to Snacks. Do not call list_custom_foods or find_duplicate_custom_foods first. Use dryRun=true only when nutrition facts are uncertain. Requires confirmed=true for real writes.",
+    "Create and log detailed barcode-linked custom food",
+    "Use this as the preferred one-call workflow when a packaged food is missing from Cronometer and the user wants to log it now. Supply the package serving size, every available label nutrient, and the UPC/EAN/GTIN barcode whenever visible. The tool validates the detailed editor, handles same-name foods internally, verifies the saved barcode and nutrients, then logs that exact custom food to the diary (default Snacks). Do not call list_custom_foods first. Use dryRun=true when facts are uncertain; confirmed=true is required for writes.",
     {
       name: z.string().min(1).describe("Exact custom food name to create/update and then log."),
       servingSize: z.string().optional().describe("Serving size for the custom food, for example '100 g', '1 serving', '250 ml', or '1 oz'."),
-      nutrients: z.record(z.number()).optional().describe("Researched numeric nutrient values using custom_food_nutrient_schema keys, aliases, or exact Cronometer labels. Include calories, protein, total_carbs/net_carbs, fat, fiber, sugars, sodium, caffeine, vitamins, etc. when available."),
+      nutrients: nutrientRecordSchema.optional().describe("Numeric package-label values using custom_food_nutrient_schema keys, aliases, or exact Cronometer labels. Include every available value, not only calories and macros."),
       nutritionSource: z.string().optional().describe("Short citation or URL/title summary of where ChatGPT found the nutrition facts. Stored in the tool result for audit; not written as a secret."),
-      barcode: z.string().optional(),
+      barcode: barcodeInputSchema.optional(),
       duplicatePolicy: z.enum(["fail", "update_existing", "create_new"]).optional().describe("Defaults to update_existing so an existing same-named custom food is updated rather than duplicated."),
       date: z.string().optional(),
       meal: z.string().optional().describe("Diary meal to log to. Defaults to Snacks."),
@@ -708,14 +743,15 @@ export function createCronoServer() {
 
   register(
     "update_custom_food",
-    "Update custom food",
-    "Updates one existing Cronometer custom food by exact foodId or unique exact name. Never creates a new custom food.",
+    "Update detailed barcode-linked custom food",
+    "Use this when one existing Cronometer custom food must be edited by its exact current name; include foodId to disambiguate duplicate names. It can add a verified package barcode and update detailed nutrients, and it never creates a new food.",
     {
       foodId: z.string().optional(),
-      name: z.string().optional().describe("Current exact custom food name. If multiple foods match, foodId is required."),
+      name: z.string().min(1).describe("Current exact custom food name. If multiple foods match, also pass foodId from list_custom_foods."),
       newName: z.string().optional(),
       servingSize: z.string().optional(),
-      nutrients: z.record(z.number()).optional().describe("Numeric nutrient values using custom_food_nutrient_schema keys, aliases, or exact Cronometer labels."),
+      nutrients: nutrientRecordSchema.optional().describe("Replacement values for only the provided detailed nutrient fields; omitted fields are left unchanged."),
+      barcode: barcodeInputSchema.optional().describe("Barcode to add if it is not already linked to this custom food."),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
       waitForCompletionSeconds: z.number().int().min(0).max(600).optional().describe("Defaults to a server-chosen wait window for confirmed updates. Use 0 to return immediately after accepting the background job."),
@@ -727,10 +763,10 @@ export function createCronoServer() {
   register(
     "delete_custom_food",
     "Delete custom food",
-    "Deletes one existing Cronometer custom food by exact foodId or unique exact name. Requires confirmed=true and confirmName matching the selected food name.",
+    "Deletes one existing Cronometer custom food by exact name; include foodId to disambiguate duplicate names. Requires confirmed=true and confirmName matching the selected food name.",
     {
       foodId: z.string().optional(),
-      name: z.string().optional(),
+      name: z.string().min(1).describe("Exact current custom food name. If duplicate names exist, also pass foodId from list_custom_foods."),
       confirmName: z.string().optional(),
       ifUsed: z.enum(["stop", "retire", "force"]).optional().describe("Defaults to stop. Use retire to rename instead if Cronometer warns that old diary entries use this food; use force only after explicit user approval."),
       dryRun: z.boolean().optional(),
@@ -744,10 +780,10 @@ export function createCronoServer() {
   register(
     "retire_custom_food",
     "Retire custom food",
-    "Renames one existing Cronometer custom food instead of deleting it. Use when old diary entries may depend on the food.",
+    "Renames one existing Cronometer custom food instead of deleting it. Pass the exact current name and include foodId to disambiguate duplicates. Use when old diary entries may depend on the food.",
     {
       foodId: z.string().optional(),
-      name: z.string().optional(),
+      name: z.string().min(1).describe("Exact current custom food name. If duplicate names exist, also pass foodId from list_custom_foods."),
       retiredName: z.string().optional().describe("Optional exact replacement name. Defaults to 'Retired - <name> - YYYY-MM-DD'."),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
@@ -1316,7 +1352,7 @@ export async function handleMcpHttpRequest(req: IncomingMessage, res: ServerResp
       return;
     }
 
-    const server = createCronoServer();
+    const server = createCronoServer({ grantedScopes: auth.scopes });
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,

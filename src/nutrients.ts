@@ -101,12 +101,8 @@ export const CUSTOM_FOOD_NUTRIENT_SCHEMA: CustomFoodNutrientGroup[] = [
       { key: "biotin", label: "Biotin", unit: "mcg" },
       { key: "choline", label: "Choline", unit: "mg" },
       { key: "folate", label: "Folate", unit: "mcg" },
-      { key: "folate_dfe", label: "Folate DFE", unit: "mcg" },
-      { key: "folate_food", label: "Folate food", unit: "mcg" },
-      { key: "folic_acid", label: "Folic acid", unit: "mcg" },
-      { key: "vitamin_a", label: "Vitamin A", unit: "IU" },
+      { key: "vitamin_a", label: "Vitamin A", unit: "mcg", aliases: ["retinol activity equivalent", "rae"] },
       { key: "retinol", label: "Retinol", unit: "mcg" },
-      { key: "retinol_activity_equivalent", label: "Retinol Activity Equivalent", unit: "mcg", aliases: ["rae"] },
       { key: "alpha_carotene", label: "Alpha-Carotene", unit: "mcg" },
       { key: "beta_carotene", label: "Beta-Carotene", unit: "mcg" },
       { key: "beta_cryptoxanthin", label: "Beta-Cryptoxanthin", unit: "mcg" },
@@ -114,11 +110,10 @@ export const CUSTOM_FOOD_NUTRIENT_SCHEMA: CustomFoodNutrientGroup[] = [
       { key: "lutein_zeaxanthin", label: "Lutein+Zeaxanthin", unit: "mcg", aliases: ["lutein", "zeaxanthin", "lutein zeaxanthin"] },
       { key: "vitamin_c", label: "Vitamin C", unit: "mg", aliases: ["ascorbic acid"] },
       { key: "vitamin_d", label: "Vitamin D", unit: "IU" },
-      { key: "vitamin_e", label: "Vitamin E", unit: "mg" },
-      { key: "alpha_tocopherol", label: "Alpha-Tocopherol", unit: "mg" },
-      { key: "beta_tocopherol", label: "Beta-Tocopherol", unit: "mg" },
-      { key: "delta_tocopherol", label: "Delta-Tocopherol", unit: "mg" },
-      { key: "gamma_tocopherol", label: "Gamma-Tocopherol", unit: "mg" },
+      { key: "vitamin_e", label: "Vitamin E", unit: "mg", aliases: ["alpha tocopherol", "alpha-tocopherol"] },
+      { key: "beta_tocopherol", label: "Beta Tocopherol", unit: "mg" },
+      { key: "delta_tocopherol", label: "Delta Tocopherol", unit: "mg" },
+      { key: "gamma_tocopherol", label: "Gamma Tocopherol", unit: "mg" },
       { key: "vitamin_k", label: "Vitamin K", unit: "mcg" },
     ],
   },
@@ -126,10 +121,14 @@ export const CUSTOM_FOOD_NUTRIENT_SCHEMA: CustomFoodNutrientGroup[] = [
     group: "minerals",
     nutrients: [
       { key: "calcium", label: "Calcium", unit: "mg" },
+      { key: "chromium", label: "Chromium", unit: "mcg" },
       { key: "copper", label: "Copper", unit: "mg" },
+      { key: "fluoride", label: "Fluoride", unit: "mcg" },
+      { key: "iodine", label: "Iodine", unit: "mcg" },
       { key: "iron", label: "Iron", unit: "mg" },
       { key: "magnesium", label: "Magnesium", unit: "mg" },
       { key: "manganese", label: "Manganese", unit: "mg" },
+      { key: "molybdenum", label: "Molybdenum", unit: "mcg" },
       { key: "phosphorus", label: "Phosphorus", unit: "mg" },
       { key: "potassium", label: "Potassium", unit: "mg" },
       { key: "selenium", label: "Selenium", unit: "mcg" },
@@ -140,9 +139,17 @@ export const CUSTOM_FOOD_NUTRIENT_SCHEMA: CustomFoodNutrientGroup[] = [
 ];
 
 const NUTRIENT_LOOKUP = new Map<string, string>();
+const NUTRIENT_ORDER = new Map<string, number>();
+const NUTRIENT_UNITS = new Map<string, string | undefined>();
+const CANONICAL_NUTRIENT_KEYS = new Set<string>();
 
+let nutrientOrder = 0;
 for (const group of CUSTOM_FOOD_NUTRIENT_SCHEMA) {
   for (const nutrient of group.nutrients) {
+    NUTRIENT_ORDER.set(nutrient.label, nutrientOrder);
+    NUTRIENT_UNITS.set(nutrient.label, nutrient.unit);
+    nutrientOrder += 1;
+    CANONICAL_NUTRIENT_KEYS.add(normalizeNutrientKey(nutrient.key));
     for (const alias of [nutrient.key, nutrient.label, ...(nutrient.aliases ?? [])]) {
       NUTRIENT_LOOKUP.set(normalizeNutrientKey(alias), nutrient.label);
     }
@@ -154,6 +161,17 @@ export function customFoodNutrientLabelForKey(key: string) {
   const normalized = normalizeNutrientKey(trimmed);
   if (!normalized) return undefined;
   return NUTRIENT_LOOKUP.get(normalized) ?? titleCaseNutrientLabel(trimmed);
+}
+
+export function customFoodNutrientMetadataForKey(key: string) {
+  const normalized = normalizeNutrientKey(key);
+  const label = customFoodNutrientLabelForKey(key);
+  return {
+    label,
+    unit: label === undefined ? undefined : NUTRIENT_UNITS.get(label),
+    order: label === undefined ? Number.MAX_SAFE_INTEGER : NUTRIENT_ORDER.get(label) ?? Number.MAX_SAFE_INTEGER,
+    aliasPriority: CANONICAL_NUTRIENT_KEYS.has(normalized) ? 0 : 1,
+  };
 }
 
 export function customFoodNutrientSchemaSummary() {

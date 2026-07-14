@@ -1,29 +1,51 @@
 #!/usr/bin/env node
-import "dotenv/config";
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const defaultFile = ".cronometer-login-backoff.json";
-const filePath = process.env.CRONOMETER_LOGIN_BACKOFF_FILE?.trim() || defaultFile;
-const command = process.argv[2] ?? "status";
 
-if (command === "status") {
-  printStatus();
-} else if (command === "clear") {
-  clearCooldown();
-} else if (command === "set") {
-  setCooldown(process.argv.slice(3));
-} else {
-  usage(1);
+if (isMainModule()) {
+  await import("dotenv/config");
+  try {
+    console.log(JSON.stringify(runCooldownCommand(process.argv.slice(2)), null, 2));
+  } catch (error) {
+    if (error instanceof CooldownUsageError) usage(error.exitCode);
+    throw error;
+  }
 }
 
-function printStatus() {
-  const state = readCooldown();
-  if (!state) {
-    console.log(JSON.stringify({ filePath, active: false }, null, 2));
-    return;
+export function runCooldownCommand(
+  args,
+  { env = process.env, now = Date.now() } = {},
+) {
+  const filePath = env.CRONOMETER_LOGIN_BACKOFF_FILE?.trim() || defaultFile;
+  const command = args[0] ?? "status";
+
+  if (command === "status") return cooldownStatus(filePath, now);
+  if (command === "clear") {
+    if (existsSync(filePath)) unlinkSync(filePath);
+    return { filePath, active: false, cleared: true };
+  }
+  if (command === "set") {
+    const commandArgs = args.slice(1);
+    const seconds = commandArgs[0] === undefined
+      ? defaultCooldownSeconds(env)
+      : parsePositiveSeconds(commandArgs[0]);
+    const reason = commandArgs.slice(1).join(" ").trim() || "Manual Cronometer login cooldown.";
+    const state = { until: now + seconds * 1000, reason, updatedAt: now };
+    writeFileSync(filePath, JSON.stringify(state, null, 2), { mode: 0o600 });
+    chmodSync(filePath, 0o600);
+    return cooldownStatus(filePath, now);
   }
 
-  const now = Date.now();
+  throw new CooldownUsageError(1);
+}
+
+function cooldownStatus(filePath, now) {
+  const state = readCooldown(filePath);
+  if (!state) return { filePath, active: false };
+
   const active = state.until > now;
   const output = {
     filePath,
@@ -36,23 +58,10 @@ function printStatus() {
   if (state.until > 0) output.untilIso = new Date(state.until).toISOString();
   if (state.updatedAt) output.updatedAtIso = new Date(state.updatedAt).toISOString();
   if (state.malformed) output.malformed = true;
-  console.log(JSON.stringify(output, null, 2));
+  return output;
 }
 
-function setCooldown(args) {
-  const seconds = args[0] === undefined ? defaultCooldownSeconds() : parsePositiveSeconds(args[0]);
-  const reason = args.slice(1).join(" ").trim() || "Manual Cronometer login cooldown.";
-  const until = Date.now() + seconds * 1000;
-  writeFileSync(filePath, JSON.stringify({ until, reason, updatedAt: Date.now() }, null, 2), { mode: 0o600 });
-  printStatus();
-}
-
-function clearCooldown() {
-  if (existsSync(filePath)) unlinkSync(filePath);
-  console.log(JSON.stringify({ filePath, active: false, cleared: true }, null, 2));
-}
-
-function readCooldown() {
+function readCooldown(filePath) {
   if (!existsSync(filePath)) return undefined;
   try {
     const parsed = JSON.parse(readFileSync(filePath, "utf8"));
@@ -71,17 +80,28 @@ function readCooldown() {
   }
 }
 
-function defaultCooldownSeconds() {
-  const value = process.env.CRONOMETER_LOGIN_BACKOFF_MS?.trim() || "900000";
+function defaultCooldownSeconds(env) {
+  const value = env.CRONOMETER_LOGIN_BACKOFF_MS?.trim() || "900000";
   const ms = Number(value);
-  if (!Number.isFinite(ms) || ms <= 0) usage(1);
+  if (!Number.isFinite(ms) || ms <= 0) throw new CooldownUsageError(1);
   return Math.ceil(ms / 1000);
 }
 
 function parsePositiveSeconds(value) {
   const number = Number(value);
-  if (!Number.isFinite(number) || number <= 0) usage(1);
+  if (!Number.isFinite(number) || number <= 0) throw new CooldownUsageError(1);
   return Math.ceil(number);
+}
+
+function isMainModule() {
+  return process.argv[1] !== undefined && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
+}
+
+class CooldownUsageError extends Error {
+  constructor(exitCode) {
+    super("Invalid cooldown command or duration.");
+    this.exitCode = exitCode;
+  }
 }
 
 function usage(exitCode) {

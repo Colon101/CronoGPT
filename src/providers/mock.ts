@@ -21,19 +21,26 @@ import type {
   SearchFoodsInput,
   TargetsInput,
 } from "../domain.js";
+import { isoDateInTimeZone, systemClock, type Clock } from "../determinism.js";
 import { BaseCronometerProvider } from "./base.js";
 
-function requestedDate(input: DateRangeInput): string {
-  return input.date ?? input.startDate ?? new Date().toISOString().slice(0, 10);
+export interface MockConfig {
+  clock?: Clock;
+  timeZone?: string;
 }
 
 export class MockCronometerProvider extends BaseCronometerProvider {
-  constructor() {
+  private readonly clock: Clock;
+  private readonly timeZone: string;
+
+  constructor(config: MockConfig = {}) {
     super("mock", "mock");
+    this.clock = config.clock ?? systemClock;
+    this.timeZone = config.timeZone ?? "UTC";
   }
 
   async getDailySummary(input: DateRangeInput) {
-    const date = requestedDate(input);
+    const date = this.requestedDate(input);
     return this.result("get_daily_summary", "dry_run", {
       date,
       calories: { consumed: 2140, burned: 640, net: 1500 },
@@ -46,7 +53,7 @@ export class MockCronometerProvider extends BaseCronometerProvider {
   }
 
   async listFoodEntries(input: DateRangeInput) {
-    const date = requestedDate(input);
+    const date = this.requestedDate(input);
     return this.result("list_food_entries", "dry_run", {
       date,
       entries: [
@@ -57,7 +64,7 @@ export class MockCronometerProvider extends BaseCronometerProvider {
   }
 
   async listBiometrics(input: DateRangeInput) {
-    const date = requestedDate(input);
+    const date = this.requestedDate(input);
     return this.result("list_biometrics", "dry_run", {
       date,
       entries: [{ id: "sample-bio-1", metric: "Weight", value: 78.4, unit: "kg" }],
@@ -65,7 +72,7 @@ export class MockCronometerProvider extends BaseCronometerProvider {
   }
 
   async listExercises(input: DateRangeInput) {
-    const date = requestedDate(input);
+    const date = this.requestedDate(input);
     return this.result("list_exercises", "dry_run", {
       date,
       entries: [{ id: "sample-exercise-1", name: "Walking", minutes: 45, calories: 210 }],
@@ -73,7 +80,7 @@ export class MockCronometerProvider extends BaseCronometerProvider {
   }
 
   async listNotes(input: DateRangeInput) {
-    const date = requestedDate(input);
+    const date = this.requestedDate(input);
     return this.result("list_notes", "dry_run", {
       date,
       entries: [{ id: "sample-note-1", note: "Energy felt steady after lunch." }],
@@ -175,7 +182,7 @@ export class MockCronometerProvider extends BaseCronometerProvider {
 
   async getTargets(input: DateRangeInput) {
     return this.result("get_targets", "dry_run", {
-      date: requestedDate(input),
+      date: this.requestedDate(input),
       targets: { calories: 2300, protein_g: 150, carbs_g: 230, fat_g: 75 },
     });
   }
@@ -210,5 +217,9 @@ export class MockCronometerProvider extends BaseCronometerProvider {
       { input },
       "Mock backend did not write to Cronometer. Configure Terra or browser automation for real data.",
     );
+  }
+
+  private requestedDate(input: DateRangeInput) {
+    return input.date ?? input.startDate ?? isoDateInTimeZone(this.timeZone, this.clock());
   }
 }

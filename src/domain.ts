@@ -202,6 +202,7 @@ export interface CustomFoodUpdateInput extends CustomFoodSelectorInput {
   newName?: string;
   servingSize?: string;
   nutrients?: Record<string, number>;
+  barcode?: string;
   dryRun?: boolean;
   confirmed?: boolean;
   waitForCompletionSeconds?: number;

@@ -181,10 +181,18 @@ export const FEATURE_DEFINITIONS: FeatureDefinition[] = [
   {
     id: "create_custom_food",
     group: "foods",
-    title: "Create custom food",
+    title: "Create detailed barcode-linked custom food",
     preferredBackend: "browser",
     supportedModes: ["mock"],
-    notes: "Requires careful nutrition validation before writing. Defaults to refusing duplicate names.",
+    notes: "Preferred custom-food path. Writes the detailed #/custom-foods editor, validates UPC/EAN/GTIN barcodes, verifies serving size and every supplied nutrient, and handles exact-name duplicates safely.",
+  },
+  {
+    id: "create_and_log_custom_food",
+    group: "foods",
+    title: "Create and log detailed barcode-linked custom food",
+    preferredBackend: "browser",
+    supportedModes: ["mock"],
+    notes: "Preferred one-call workflow for a packaged food missing from Cronometer: create or update the detailed barcode-linked food, verify it, then log that exact custom food to the diary.",
   },
   {
     id: "list_custom_foods",
@@ -208,7 +216,7 @@ export const FEATURE_DEFINITIONS: FeatureDefinition[] = [
     title: "Update custom food",
     preferredBackend: "browser",
     supportedModes: ["mock"],
-    notes: "Updates one exact existing custom food and never creates a new one.",
+    notes: "Updates one exact existing custom food, can add a barcode, verifies supplied detail fields after save, and never creates a new one.",
   },
   {
     id: "delete_custom_food",
@@ -504,6 +512,7 @@ const BROWSER_FEATURE_STATUS: Record<string, ProviderStatus> = {
   log_biometric: "needs_manual_step",
   log_note: "needs_manual_step",
   create_custom_food: "needs_manual_step",
+  create_and_log_custom_food: "needs_manual_step",
   list_custom_foods: "ok",
   find_duplicate_custom_foods: "ok",
   update_custom_food: "needs_manual_step",

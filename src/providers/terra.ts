@@ -1,4 +1,5 @@
 import type { DateRangeInput } from "../domain.js";
+import { compareStringsOrdinal, isoDateInTimeZone, systemClock, type Clock } from "../determinism.js";
 import { BaseCronometerProvider } from "./base.js";
 
 export interface TerraConfig {
@@ -6,6 +7,9 @@ export interface TerraConfig {
   apiKey: string;
   devId: string;
   userId: string;
+  timeZone?: string;
+  clock?: Clock;
+  fetchImpl?: typeof fetch;
 }
 
 export class TerraCronometerProvider extends BaseCronometerProvider {
@@ -35,10 +39,11 @@ export class TerraCronometerProvider extends BaseCronometerProvider {
 
   private async requestFeature(feature: string, path: string, input: DateRangeInput) {
     try {
+      const today = isoDateInTimeZone(this.config.timeZone ?? "UTC", (this.config.clock ?? systemClock)());
       const data = await this.request(path, {
         user_id: this.config.userId,
-        start_date: input.startDate ?? input.date ?? new Date().toISOString().slice(0, 10),
-        end_date: input.endDate ?? input.date ?? new Date().toISOString().slice(0, 10),
+        start_date: input.startDate ?? input.date ?? today,
+        end_date: input.endDate ?? input.date ?? today,
         to_webhook: "false",
       });
       return this.result(feature, "ok", data, undefined, "terra");
@@ -51,11 +56,11 @@ export class TerraCronometerProvider extends BaseCronometerProvider {
   private async request(path: string, query: Record<string, string>) {
     const base = this.config.apiBaseUrl.replace(/\/$/, "");
     const url = new URL(`${base}${path.startsWith("/") ? path : `/${path}`}`);
-    for (const [key, value] of Object.entries(query)) {
+    for (const [key, value] of Object.entries(query).sort(([left], [right]) => compareStringsOrdinal(left, right))) {
       url.searchParams.set(key, value);
     }
 
-    const response = await fetch(url, {
+    const response = await (this.config.fetchImpl ?? fetch)(url, {
       headers: {
         Accept: "application/json",
         "dev-id": this.config.devId,

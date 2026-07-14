@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import "dotenv/config";
 import { createProviderFromEnv } from "../dist/providers/index.js";
+import { gtinCheckDigit } from "../dist/barcode.js";
 
 const confirmValue = "create-and-delete-custom-food";
 
@@ -15,6 +16,8 @@ if (process.env.CRONOMETER_ENABLE_WRITES !== "true") {
 const provider = createProviderFromEnv();
 const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
 const foodName = `Codex live custom food smoke ${stamp}`;
+const barcodeData = `20${stamp.slice(-10)}`;
+const barcode = `${barcodeData}${gtinCheckDigit(barcodeData)}`;
 const nutrients = {
   calories: 12,
   protein_g: 1.2,
@@ -35,6 +38,7 @@ try {
     name: foodName,
     servingSize: "1 serving",
     nutrients,
+    barcode,
     duplicatePolicy: "create_new",
     confirmed: true,
     dryRun: false,
@@ -48,6 +52,9 @@ try {
   emit("listedAfterCreate", listedAfterCreate);
   const createdTarget = exactCustomFoodTarget(listedAfterCreate, foodName);
   if (!createdTarget) throw new Error("Created custom food was not found in the Custom Foods list.");
+  if (!Array.isArray(createdTarget.barcodes) || !createdTarget.barcodes.includes(barcode)) {
+    throw new Error(`Created custom food did not read back barcode ${barcode}.`);
+  }
 
   const deleteResult = await provider.deleteCustomFood({
     foodId: createdTarget.foodId,
@@ -70,6 +77,7 @@ try {
   console.log(JSON.stringify({
     ok: true,
     foodName,
+    barcode,
     created: true,
     deleted: true,
   }, null, 2));
@@ -128,6 +136,7 @@ function summarizeData(data) {
           foodId: food.foodId,
           name: food.name,
           servingSize: food.servingSize,
+          barcodes: food.barcodes,
           nutrientCount: Array.isArray(food.nutrients) ? food.nutrients.length : undefined,
         }))
       : undefined,

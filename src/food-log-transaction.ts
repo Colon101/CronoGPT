@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { FoodLogInput } from "./domain.js";
+import { isoDateInTimeZone } from "./determinism.js";
 
 const KNOWN_MEALS = ["Breakfast", "Lunch", "Dinner", "Snacks", "Supplements"] as const;
 const DEFAULT_MEAL = "Breakfast";
@@ -113,14 +114,7 @@ export function normalizeFoodLogDate(date: string | undefined, timeZone: string,
 }
 
 export function todayIsoInTimeZone(timeZone: string, now = new Date()) {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(now);
-  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-  return `${values.year}-${values.month}-${values.day}`;
+  return isoDateInTimeZone(timeZone, now);
 }
 
 export function foodLogIdempotencyKey(input: {

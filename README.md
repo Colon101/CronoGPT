@@ -26,7 +26,7 @@ ChatGPT connects to an Apps SDK app by calling an HTTPS MCP endpoint, usually `/
 ## Local setup
 
 ```bash
-npm install
+npm ci
 npm run build
 npm start
 ```
@@ -133,7 +133,13 @@ npm run test:runtime-safety
 npm run smoke:oracle
 ```
 
-To prove the real custom-food write path, run the gated live smoke. It creates one uniquely named custom food, verifies it exists, deletes it, and verifies it is gone:
+### Preferred barcode-linked custom-food workflow
+
+For a packaged food that is missing from Cronometer, prefer `create_and_log_custom_food`. It opens Foods > Custom Foods, fills the detailed editor and Advanced Info barcode row, saves only after every requested field was filled, reads back the exact name, serving size, barcode, and nutrient values, and only then logs that exact private food. Use `create_custom_food` for the same verified workflow without the diary-log step. Both tools handle exact-name duplicates internally, so ChatGPT should not call `list_custom_foods` first.
+
+Pass the package serving size, the UPC/EAN/GTIN printed below the barcode, and every nutrient present on the label. Call `custom_food_nutrient_schema` for the current accepted keys and units. Barcode check digits, serving syntax, finite/non-negative nutrient values, and OAuth write scope are validated before Chromium opens. An invalid or incomplete form is reverted rather than partially saved. A `possibly_written_verify_failed` result is deliberately ambiguous: inspect the custom-food list before retrying to avoid a duplicate.
+
+To prove the real custom-food write path, run the gated live smoke. It creates one uniquely named food with a generated valid barcode and detailed nutrients, verifies all saved values and the barcode on read-back, deletes it, and verifies it is gone:
 
 ```bash
 CRONOMETER_ENABLE_WRITES=true CRONOGPT_LIVE_WRITE_CONFIRM=create-and-delete-custom-food npm run smoke:live-custom-food
