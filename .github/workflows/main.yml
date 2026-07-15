@@ -119,10 +119,4 @@ jobs:
       - name: Smoke test production
         env:
           CRONOGPT_SMOKE_SKIP_BROWSER: ${{ vars.CRONOGPT_SMOKE_SKIP_BROWSER || 'false' }}
-        run: |
-          if npm run smoke:oracle; then
-            exit 0
-          fi
-          echo "::warning::Initial production smoke failed during the cold browser start; retrying the complete smoke once."
-          sleep 5
-          npm run smoke:oracle
+        run: npm run smoke:oracle

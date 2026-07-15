@@ -2968,7 +2968,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     await gotoAllowingAbort(page, `${CRONOMETER_ORIGIN}/#account`, timeout);
     await page.waitForLoadState("domcontentloaded", { timeout }).catch(() => undefined);
     await page.waitForTimeout(1200);
-    const text = await this.visibleText(page).catch(() => "");
+    const text = await waitForAccountIdentityText(page, Math.min(timeout, 8000));
     if (returnHash && returnHash !== "#account") {
       await gotoAllowingAbort(page, `${CRONOMETER_ORIGIN}/${returnHash}`, timeout).catch(() => undefined);
       await page.waitForLoadState("domcontentloaded", { timeout }).catch(() => undefined);
@@ -4673,6 +4673,43 @@ async function waitForVisibleText(page: Page, isReady: (text: string) => boolean
   }
 
   return lastText || page.locator("body").innerText({ timeout: 3000 }).catch(() => "");
+}
+
+async function waitForAccountIdentityText(page: Page, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  let lastText = "";
+
+  while (Date.now() < deadline) {
+    lastText = await accountIdentityText(page);
+    if (extractEmails(lastText).length > 0) return lastText;
+    await page.waitForTimeout(Math.min(400, Math.max(50, deadline - Date.now())));
+  }
+
+  return lastText || accountIdentityText(page);
+}
+
+async function accountIdentityText(page: Page) {
+  const visibleText = await page.locator("body").innerText({ timeout: 3000 }).catch(() => "");
+  const controlValues = await page.locator("input, textarea, [contenteditable=true], [data-email], [aria-label], [title]")
+    .evaluateAll((elements) => {
+      const values = new Set<string>();
+      const emailPattern = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i;
+      for (const element of elements) {
+        const candidates = [
+          "value" in element ? String((element as HTMLInputElement | HTMLTextAreaElement).value ?? "") : "",
+          element.textContent ?? "",
+          element.getAttribute("data-email") ?? "",
+          element.getAttribute("aria-label") ?? "",
+          element.getAttribute("title") ?? "",
+        ];
+        for (const candidate of candidates) {
+          if (emailPattern.test(candidate)) values.add(candidate);
+        }
+      }
+      return Array.from(values);
+    })
+    .catch(() => [] as string[]);
+  return [visibleText, ...controlValues].filter(Boolean).join("\n");
 }
 
 function hasDiaryMealSections(text: string) {
