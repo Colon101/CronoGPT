@@ -294,6 +294,7 @@ await withClient(async (client) => {
           Boolean(diaryWarmup.structuredContent?.data?.summary),
         data: {
           status: diaryWarmup.structuredContent?.status,
+          warning: diaryWarmup.structuredContent?.warning,
           date: diaryWarmup.structuredContent?.data?.date,
           dateStatus: diaryWarmup.structuredContent?.data?.dateStatus,
           summary: diaryWarmup.structuredContent?.data?.summary,
@@ -319,7 +320,11 @@ await withClient(async (client) => {
               stability.structuredContent?.data?.ready === true &&
               stability.structuredContent?.data?.checks?.hasMealSections === true,
           skipped: stabilityLoginPaused,
-          data: stability.structuredContent?.data,
+          data: {
+            status: stability.structuredContent?.status,
+            warning: stability.structuredContent?.warning,
+            ...(stability.structuredContent?.data ?? {}),
+          },
         });
   }
 

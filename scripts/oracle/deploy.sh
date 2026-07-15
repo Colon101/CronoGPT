@@ -154,9 +154,15 @@ exit 1
 EOF_REMOTE_HEALTH
 
 if [[ "${ORACLE_SKIP_SMOKE:-false}" != "true" ]]; then
-  CRONOGPT_SMOKE_URL="https://${ORACLE_DOMAIN}/mcp" \
+  if ! CRONOGPT_SMOKE_URL="https://${ORACLE_DOMAIN}/mcp" \
     CRONOGPT_API_TOKEN="$API_TOKEN" \
-    npm run smoke:production
+    npm run smoke:production; then
+    echo "Initial production smoke failed during the cold browser start; retrying the complete smoke once." >&2
+    sleep 5
+    CRONOGPT_SMOKE_URL="https://${ORACLE_DOMAIN}/mcp" \
+      CRONOGPT_API_TOKEN="$API_TOKEN" \
+      npm run smoke:production
+  fi
 fi
 
 echo "Deployed cronogpt to https://${ORACLE_DOMAIN}/mcp"
