@@ -968,6 +968,8 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
             stage: "preview",
             existed: false,
             created: false,
+            browserOpened: false,
+            writeAttempted: false,
           },
         });
       }
