@@ -126,6 +126,7 @@ const stableModelVisibleTools = new Set<string>(STABLE_MODEL_VISIBLE_TOOLS);
 
 const MCP_SERVER_INSTRUCTIONS = [
   "Use create_and_log_custom_food as the preferred single-step workflow when a packaged food is missing from Cronometer and the user wants it logged.",
+  "Use ensure_private_recipe as the preferred private recipe workflow. Unconfirmed calls preview without opening Cronometer; confirmed calls verify an exact existing name before creating anything.",
   "For custom foods, use Cronometer's detailed #/custom-foods editor: pass the package serving size, every nutrient available on the label, and the UPC/EAN/GTIN barcode whenever it is visible. The barcode links the private custom food to future barcode searches/scans.",
   "Do not call duplicate-list tools before create_custom_food or create_and_log_custom_food; those tools resolve exact same-name foods themselves and default to updating one exact match.",
   "For every diary food write or delete, pass the user's exact meal section explicitly. A write is not attempted unless the requested date, meal, optional time, amount, and unit can be verified before Save.",

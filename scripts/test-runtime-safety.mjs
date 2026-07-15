@@ -124,6 +124,30 @@ try {
   await scopedClient.close();
   await scopedServer.close();
 
+  const recipePreviewServer = createCronoServer({ grantedScopes: ["cronometer:read", "cronometer:write"] });
+  const recipePreviewClient = new Client({ name: "cronogpt-recipe-preview-test", version: "1.0.0" });
+  const [recipePreviewClientTransport, recipePreviewServerTransport] = InMemoryTransport.createLinkedPair();
+  await recipePreviewServer.connect(recipePreviewServerTransport);
+  await recipePreviewClient.connect(recipePreviewClientTransport);
+  const recipePreview = await recipePreviewClient.callTool({
+    name: "ensure_private_recipe",
+    arguments: {
+      name: "browser-free preview",
+      ingredients: [{ query: "Banana", amount: 100, unit: "g" }],
+      servings: 1,
+      servingName: "serving",
+      dryRun: true,
+      confirmed: false,
+    },
+  });
+  assert.equal(recipePreview.structuredContent?.feature, "ensure_private_recipe");
+  assert.equal(recipePreview.structuredContent?.status, "dry_run");
+  assert.equal(recipePreview.structuredContent?.data?.stage, "preview");
+  assert.equal(recipePreview.structuredContent?.data?.browserOpened, false);
+  assert.equal(recipePreview.structuredContent?.data?.writeAttempted, false);
+  await recipePreviewClient.close();
+  await recipePreviewServer.close();
+
   const provider = new BrowserCronometerProvider({
     email: "test@example.com",
     password: "secret",

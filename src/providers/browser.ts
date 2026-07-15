@@ -2113,6 +2113,8 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       return this.result("create_recipe", "dry_run", {
         input: safeInput(input),
         preview,
+        browserOpened: false,
+        writeAttempted: false,
         reason: writeGateReason(input, this.config.writeEnabled),
         nextStep: this.config.writeEnabled
           ? "Call again with confirmed=true after reviewing exact Cronometer ingredient matches. Leave dryRun unset, or set dryRun=false."

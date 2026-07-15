@@ -199,7 +199,7 @@ await withClient(async (client) => {
   });
 
   const recipeDryRun = await client.callTool({
-    name: "create_recipe",
+    name: "ensure_private_recipe",
     arguments: {
       name: "cronogpt smoke test recipe dry run",
       ingredients: [
@@ -220,11 +220,18 @@ await withClient(async (client) => {
   checks.push({
     name: "recipe_dry_run",
     ok: recipeDryRun.structuredContent?.status === "dry_run" &&
+      recipeDryRun.structuredContent?.feature === "ensure_private_recipe" &&
+      recipeDryRun.structuredContent?.data?.stage === "preview" &&
+      recipeDryRun.structuredContent?.data?.browserOpened === false &&
+      recipeDryRun.structuredContent?.data?.writeAttempted === false &&
       recipeDryRun.structuredContent?.data?.preview?.recipeName === "cronogpt smoke test recipe dry run" &&
       Array.isArray(recipeDryRun.structuredContent?.data?.preview?.ingredients),
     data: {
       status: recipeDryRun.structuredContent?.status,
       feature: recipeDryRun.structuredContent?.feature,
+      stage: recipeDryRun.structuredContent?.data?.stage,
+      browserOpened: recipeDryRun.structuredContent?.data?.browserOpened,
+      writeAttempted: recipeDryRun.structuredContent?.data?.writeAttempted,
       preview: recipeDryRun.structuredContent?.data?.preview,
     },
   });

@@ -234,7 +234,7 @@ Set `CRONOMETER_BACKEND` in `.env`:
 
 The existing lowercase `email` and `password` keys are supported only for local browser-framework detection. Prefer `CRONOMETER_EMAIL` and `CRONOMETER_PASSWORD`.
 
-`resolve_recipe_ingredients` reuses a single Cronometer food-search dialog and stops before the hosted operation budget expires. If a large recipe returns skipped or unresolved ingredients, call it again with only those remaining ingredients. For recipe writes, pass the chosen `selectedName` and `selectedSource` from `resolve_recipe_ingredients` into each `create_recipe` ingredient. Ambiguous matches return candidates instead of writing the wrong food.
+`resolve_recipe_ingredients` reuses a single Cronometer food-search dialog and stops before the hosted operation budget expires. If a large recipe returns skipped or unresolved ingredients, call it again with only those remaining ingredients. For model-initiated recipe writes, pass the chosen `selectedName` and `selectedSource` from `resolve_recipe_ingredients` into each `ensure_private_recipe` ingredient. Ambiguous matches return candidates instead of writing the wrong food; the lower-level `create_recipe` tool remains available only to the app and direct MCP clients.
 
 ## Current tool map
 
