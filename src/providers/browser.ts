@@ -7147,34 +7147,44 @@ function parseDailySummary(rawText: string) {
   };
 }
 
-function parseFoodSearchResults(rawText: string, limit: number): SearchResult[] {
+export function parseFoodSearchResults(rawText: string, limit: number): SearchResult[] {
   const markerIndex = foodSearchResultMarkerIndex(rawText);
-  const searchText = markerIndex >= 0 ? rawText.slice(markerIndex) : rawText;
+  if (markerIndex < 0) return [];
+
+  const searchText = rawText.slice(markerIndex);
   const stopMarkers = ["Energy Summary", "Nutrient Targets", "DAILY TARGET EDITOR"];
   const stop = stopMarkers
     .map((markerText) => searchText.indexOf(markerText))
     .filter((index) => index > 0)
     .sort((a, b) => a - b)[0];
-  const relevantText = stop ? searchText.slice(0, stop) : searchText;
-
-  return relevantText
+  const relevantText = stop === undefined ? searchText : searchText.slice(0, stop);
+  const lines = relevantText
     .split(/\r?\n/)
     .map((line) => line.replace(/\s+/g, " ").trim())
     .filter((line) => line.length > 2)
-    .filter((line) => !/^(SEARCH|All|Favorites|Common Foods|Beverages|Supplements|Brands|Restaurants|Custom|Recipes)$/i.test(line))
-    .map((line) => {
-      const sourceMatch = line.match(foodSourcePattern());
-      return {
-        name: sourceMatch ? line.slice(0, sourceMatch.index).trim() : line,
-        source: sourceMatch?.[1],
-        raw: line,
-      };
-    })
-    .filter((item, index, items) => items.findIndex((candidate) =>
-      normalizeFoodName(candidate.name) === normalizeFoodName(item.name) &&
-      normalizeSource(candidate.source) === normalizeSource(item.source)
-    ) === index)
-    .slice(0, limit);
+    .filter((line) => !/^(SEARCH|All|Favorites|Common Foods|Beverages|Supplements|Brands|Restaurants|Custom|Foods|Recipes|Meals|Add Food to Diary)$/i.test(line))
+    .filter((line) => !/^Can't find what you're looking for\?/i.test(line));
+
+  const results: SearchResult[] = [];
+  let pendingName: string | undefined;
+  for (const line of lines) {
+    const sourceMatch = line.match(foodSourcePattern());
+    if (!sourceMatch) {
+      pendingName = line;
+      continue;
+    }
+
+    const name = sourceMatch.index === 0
+      ? pendingName
+      : line.slice(0, sourceMatch.index).trim();
+    pendingName = undefined;
+    const source = sourceMatch[1]?.trim();
+    if (!name || !source) continue;
+    results.push({ name, source, raw: `${name} ${source}` });
+    if (results.length >= limit) break;
+  }
+
+  return mergeFoodResults(results).slice(0, limit);
 }
 
 function foodSearchResultMarkerIndex(rawText: string) {
@@ -7193,19 +7203,19 @@ function foodSearchResultMarkerIndex(rawText: string) {
 async function extractFoodSearchResults(page: Page, limit: number): Promise<SearchResult[]> {
   const dialog = activeDialog(page);
   return dialog
-    .locator("tr")
+    .locator(".results-container table.crono-table:visible tr:visible")
     .evaluateAll((rows, max) => {
       const results = [];
       for (const row of rows) {
         if (row.classList.contains("table-header")) continue;
-        const cells = Array.from(row.querySelectorAll("td")).map((cell) => cell.textContent?.replace(/\s+/g, " ").trim() ?? "").filter(Boolean);
+        const cells = Array.from(row.querySelectorAll(":scope > td")).map((cell) => cell.textContent?.replace(/\s+/g, " ").trim() ?? "").filter(Boolean);
         const name = row.querySelector(".gwt-HTML")?.textContent?.replace(/\s+/g, " ").trim() || cells[0];
         const source = row.querySelector(".source")?.textContent?.replace(/\s+/g, " ").trim() || cells[1];
-        if (!name || /^Description$/i.test(name)) continue;
+        if (!name || !source || /^Description$/i.test(name)) continue;
         results.push({
           name,
-          source: source || undefined,
-          raw: `${name}${source ? ` ${source}` : ""}`,
+          source,
+          raw: `${name} ${source}`,
         });
         if (results.length >= Number(max)) break;
       }
@@ -7362,11 +7372,13 @@ export function foodLogConfidence(query: string, top: SearchResult, next?: Searc
   const nextScore = next ? foodResultScore(next, normalizedQuery) : undefined;
   const scoreGap = nextScore === undefined ? Number.POSITIVE_INFINITY : topScore - nextScore;
   const exactName = normalizedName === normalizedQuery;
+  const sameWords = foodNameWordKey(normalizedName) === foodNameWordKey(normalizedQuery);
   const plainName = normalizedName === `${normalizedQuery} plain`;
-  const highConfidence = exactName || plainName || !next || (topScore >= 85 && scoreGap >= 30) || (topScore >= 70 && scoreGap >= 45);
+  const highConfidence = exactName || sameWords || plainName || !next || (topScore >= 85 && scoreGap >= 30) || (topScore >= 70 && scoreGap >= 45);
   return {
     highConfidence,
     exactName,
+    sameWords,
     plainName,
     topScore,
     nextScore,
@@ -7399,6 +7411,7 @@ export function foodResultScore(result: SearchResult, normalizedQuery: string, n
   }
   if (normalizedSelectedSource && normalizeSource(result.source) === normalizedSelectedSource) score += 70;
   if (normalizedName === normalizedQuery) score += 100;
+  else if (foodNameWordKey(normalizedName) === foodNameWordKey(normalizedQuery)) score += 90;
   else if (normalizedName === `${normalizedQuery} plain`) score += 65;
   else if (normalizedName.startsWith(normalizedQuery)) score += 45;
   else if (normalizedName.includes(normalizedQuery)) score += 25;
@@ -7429,7 +7442,7 @@ function hasExactFoodResult(query: string, results: SearchResult[]) {
 }
 
 function foodSourcePattern() {
-  return /\b(Custom Recipe|Custom Food|Custom Meal|Recipe|NCCDB|USDA|CNF|CRDB|Restaurant|Brand|Common Food|Survey|Label)$/i;
+  return /\b(Custom Recipe|Custom Food|Custom Meal|Recipe|NCCDB|USDA|FDC UPC|CRDB|CNF|Nutritionix|CoFID|NEVO|NUTTAB|CFCD|Restaurant|Brand|Common Food|Survey|Label)$/i;
 }
 
 function pickFoodResult(query: string, results: SearchResult[], selectedName?: string) {
@@ -7454,6 +7467,14 @@ export function normalizeFoodName(value: string) {
     .replace(/[,()[\]{}]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function foodNameWordKey(value: string) {
+  return normalizeFoodName(value)
+    .split(" ")
+    .filter(Boolean)
+    .sort(compareStringsOrdinal)
+    .join(" ");
 }
 
 function parseTime(value: string) {

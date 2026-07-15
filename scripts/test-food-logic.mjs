@@ -6,6 +6,7 @@ import {
   customFoodUpdatePreview,
   customFoodWritePreview,
   foodSearchTabAttempts,
+  parseFoodSearchResults,
   parseServingSize,
   rankFoodResults,
   servingSizeRowMatches,
@@ -29,6 +30,60 @@ const bananaResults = [
   { name: "Banana", source: "CRDB", raw: "Banana CRDB" },
   { name: "Banana, dried", source: "USDA", raw: "Banana, dried USDA" },
 ];
+
+const emptyCustomSearch = `Add Food to Diary
+SEARCH
+All
+Favorites
+Common Foods
+Beverages
+Supplements
+Brands
+Restaurants
+Custom
+All
+Foods
+Recipes
+Meals
+Can't find what you're looking for? Check your spelling, try alternatives, or create a Custom Food`;
+assert.deepEqual(parseFoodSearchResults(emptyCustomSearch, 10), []);
+
+const orangeSearch = `Add Food to Diary
+SEARCH
+Description
+Source
+Orange Juice, Fresh
+NCCDB
+Fresh Squeezed Orange Juice
+FDC UPC
+Orange Juice, Fresh Squeezed
+CFCD`;
+assert.deepEqual(parseFoodSearchResults(orangeSearch, 10), [
+  { name: "Orange Juice, Fresh", source: "NCCDB", raw: "Orange Juice, Fresh NCCDB" },
+  { name: "Fresh Squeezed Orange Juice", source: "FDC UPC", raw: "Fresh Squeezed Orange Juice FDC UPC" },
+  { name: "Orange Juice, Fresh Squeezed", source: "CFCD", raw: "Orange Juice, Fresh Squeezed CFCD" },
+]);
+
+assert.deepEqual(parseFoodSearchResults(
+  "Add Food to Diary\nDescription Source\nThe Cheesecake Factory, Fresh Orange Juice CRDB\nFoods\nMeals",
+  10,
+), [
+  {
+    name: "The Cheesecake Factory, Fresh Orange Juice",
+    source: "CRDB",
+    raw: "The Cheesecake Factory, Fresh Orange Juice CRDB",
+  },
+]);
+
+const orangeSelection = chooseFoodLogResult({ query: "fresh orange juice" }, [
+  { name: "Albert Heijn, Fresh Orange Juice", source: "CRDB", raw: "Albert Heijn, Fresh Orange Juice CRDB" },
+  { name: "Orange Juice, Fresh", source: "NCCDB", raw: "Orange Juice, Fresh NCCDB" },
+  { name: "Fresh Squeezed Orange Juice", source: "FDC UPC", raw: "Fresh Squeezed Orange Juice FDC UPC" },
+]);
+assert.equal(orangeSelection.status, "ok");
+assert.equal(orangeSelection.result?.name, "Orange Juice, Fresh");
+assert.equal(orangeSelection.result?.source, "NCCDB");
+assert.equal(orangeSelection.confidence?.sameWords, true);
 
 assert.equal(customFoodNutrientLabelForKey("omega-3 dha"), "DHA");
 assert.equal(customFoodNutrientLabelForKey("20:5n3"), "EPA");
