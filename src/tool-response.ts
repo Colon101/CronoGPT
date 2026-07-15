@@ -10,16 +10,24 @@ export function toMcpToolResponse(result: ProviderResult) {
     "needs_manual_step",
     "not_configured",
   ].includes(result.status);
-  const ok = ["ok", "dry_run", "accepted", "written", "already_exists"].includes(result.status) || softFailure;
+  const completed = ["ok", "written", "already_exists"].includes(result.status);
+  const intentSatisfied = completed;
+  const ok = completed;
   const text = result.status === "accepted"
-    ? `${result.feature} accepted a background job on ${result.provider}. Poll cronometer_runtime_status until it completes before retrying.`
-    : ok
+    ? `${result.feature} is not complete. ${result.provider} accepted a background job; poll cronometer_runtime_status until it reaches a terminal status before retrying.`
+    : result.status === "dry_run"
+      ? `${result.feature} returned a preview only from ${result.provider}; no requested write was completed.`
+    : softFailure
+      ? `${result.feature} did not complete on ${result.provider} (${result.status}): ${result.warning ?? "Follow the structured retry guidance."}`
+      : ok
       ? `${result.feature} returned ${result.status} from ${result.provider}.`
       : `${result.feature} is ${result.status} on ${result.provider}: ${result.warning ?? "No details."}`;
 
   return {
     structuredContent: {
       ok,
+      completed,
+      intentSatisfied,
       provider: result.provider,
       mode: result.mode,
       feature: result.feature,

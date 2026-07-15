@@ -14,6 +14,6 @@ RUN npm prune --omit=dev
 
 ENV NODE_ENV=production
 
-EXPOSE 10000
+EXPOSE 8787
 
 CMD ["npm", "start"]

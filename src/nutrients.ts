@@ -157,10 +157,9 @@ for (const group of CUSTOM_FOOD_NUTRIENT_SCHEMA) {
 }
 
 export function customFoodNutrientLabelForKey(key: string) {
-  const trimmed = key.trim();
-  const normalized = normalizeNutrientKey(trimmed);
+  const normalized = normalizeNutrientKey(key.trim());
   if (!normalized) return undefined;
-  return NUTRIENT_LOOKUP.get(normalized) ?? titleCaseNutrientLabel(trimmed);
+  return NUTRIENT_LOOKUP.get(normalized);
 }
 
 export function customFoodNutrientMetadataForKey(key: string) {
@@ -192,19 +191,4 @@ function normalizeNutrientKey(value: string) {
     .replace(/[_/-]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-}
-
-function titleCaseNutrientLabel(value: string) {
-  return value
-    .replace(/[_-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .split(" ")
-    .map((word) => {
-      const lower = word.toLowerCase();
-      if (/^(ala|dha|epa|aa|la|dfe|b\d+|iu|kcal|kj)$/i.test(word)) return word.toUpperCase();
-      if (lower === "and") return "+";
-      return `${lower.slice(0, 1).toUpperCase()}${lower.slice(1)}`;
-    })
-    .join(" ");
 }

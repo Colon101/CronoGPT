@@ -8,8 +8,8 @@ else
 fi
 
 $SUDO mkdir -p /opt/cronogpt/app /opt/cronogpt/config /opt/cronogpt/secrets /opt/cronogpt/state
-$SUDO chmod 755 /opt/cronogpt /opt/cronogpt/app /opt/cronogpt/config /opt/cronogpt/state
-$SUDO chmod 700 /opt/cronogpt/secrets
+$SUDO chmod 755 /opt/cronogpt /opt/cronogpt/app /opt/cronogpt/config
+$SUDO chmod 700 /opt/cronogpt/secrets /opt/cronogpt/state
 
 if ! command -v docker >/dev/null 2>&1; then
   $SUDO apt-get update

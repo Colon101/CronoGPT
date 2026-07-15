@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import {
   chooseFoodLogResult,
+  customFoodCreatePreview,
   customFoodNutrientEntries,
   customFoodUpdatePreview,
   customFoodWritePreview,
@@ -15,12 +16,16 @@ import {
 import { customFoodNutrientLabelForKey } from "../dist/nutrients.js";
 import { gtinCheckDigit, validateBarcode } from "../dist/barcode.js";
 import {
+  FOOD_LOG_MEALS,
   foodLogBatchIdempotencyKey,
   foodLogIdempotencyKey,
+  isValidFoodLogDate,
   normalizeFoodLogInput,
   normalizeFoodLogQuery,
   normalizeFoodLogUnit,
+  parseFoodLogTimestamp,
   retryGuidanceForFoodLog,
+  verifyFoodLogInDiaryEntries,
   verifyFoodLogInDiaryText,
 } from "../dist/food-log-transaction.js";
 
@@ -99,6 +104,7 @@ assert.equal(customFoodNutrientLabelForKey("caffeine"), "Caffeine");
 assert.equal(customFoodNutrientLabelForKey("retinol activity equivalent"), "Vitamin A");
 assert.equal(customFoodNutrientLabelForKey("alpha tocopherol"), "Vitamin E");
 assert.equal(customFoodNutrientLabelForKey("molybdenum"), "Molybdenum");
+assert.equal(customFoodNutrientLabelForKey("imaginary nutrient"), undefined);
 
 assert.equal(validateBarcode("4006 3813-3393 1").normalized, "4006381333931");
 assert.equal(validateBarcode("4006 3813-3393 1").valid, true);
@@ -147,6 +153,25 @@ assert.deepEqual(preview.ignoredNutrients, [{
   value: "NaN",
   warning: "Nutrient value must be a finite number.",
 }]);
+
+const unknownNutrientPreview = customFoodWritePreview({
+  servingSize: "1 serving",
+  nutrients: { imaginary_nutrient: 4 },
+});
+assert.equal(unknownNutrientPreview.valid, false);
+assert.match(unknownNutrientPreview.issues.join(" "), /Unknown nutrient key/);
+
+const duplicateNutrientPreview = customFoodWritePreview({
+  servingSize: "1 serving",
+  nutrients: { total_carbs: 10, net_carbs: 9 },
+});
+assert.equal(duplicateNutrientPreview.valid, false);
+assert.match(duplicateNutrientPreview.issues.join(" "), /supplied more than once/);
+
+const incompleteCreatePreview = customFoodCreatePreview({ name: "Incomplete" });
+assert.equal(incompleteCreatePreview.valid, false);
+assert.match(incompleteCreatePreview.issues.join(" "), /servingSize is required/);
+assert.match(incompleteCreatePreview.issues.join(" "), /At least one package-label nutrient/);
 
 const barcodePreview = customFoodWritePreview({
   name: "Barcode food",
@@ -246,11 +271,31 @@ assert.equal(staleLookingOnly.status, "needs_manual_step");
 const bestEffort = chooseFoodLogResult({ query: "Banana", matchPolicy: "best_effort" }, [
   { name: "Banana cream", source: "Custom Recipe", raw: "Banana cream Custom Recipe" },
 ]);
-assert.equal(bestEffort.status, "ok");
+assert.equal(bestEffort.status, "needs_manual_step");
+assert.match(bestEffort.warning ?? "", /disabled/i);
 
 assert.equal(normalizeFoodLogQuery("1% fat milk"), "milk 1%");
 assert.equal(normalizeFoodLogQuery("Add one percent low fat milk"), "milk 1%");
+assert.equal(normalizeFoodLogQuery("low fat milk"), "low fat milk");
 assert.equal(normalizeFoodLogUnit("grams"), "g");
+assert.equal(normalizeFoodLogUnit("micrograms"), "mcg");
+assert.equal(normalizeFoodLogUnit("tablespoons"), "tbsp");
+assert.equal(normalizeFoodLogUnit("servings"), "serving");
+assert.deepEqual(FOOD_LOG_MEALS, ["Breakfast", "Lunch", "Dinner", "Snacks", "Supplements"]);
+assert.equal(normalizeFoodLogInput({ query: "Banana" }, "Asia/Jerusalem").validationIssues.some((issue) => issue.includes("Unsupported meal")), true);
+assert.equal(isValidFoodLogDate("2026-02-28"), true);
+assert.equal(isValidFoodLogDate("2026-02-29"), false);
+assert.deepEqual(parseFoodLogTimestamp("13:05"), { normalized: "13:05", hour12: 1, minute: 5, period: "PM" });
+assert.deepEqual(parseFoodLogTimestamp("1:05 pm"), { normalized: "1:05 PM", hour12: 1, minute: 5, period: "PM" });
+assert.equal(parseFoodLogTimestamp("13 PM"), undefined);
+assert.equal(parseFoodLogTimestamp("1"), undefined);
+
+const unsafePolicyLog = normalizeFoodLogInput(
+  { query: "Banana", meal: "Lunch", matchPolicy: "best_effort" },
+  "Asia/Jerusalem",
+  new Date("2026-06-06T08:00:00.000Z"),
+);
+assert.match(unsafePolicyLog.validationIssues.join(" "), /Unsupported food match policy/);
 
 const milkLog = normalizeFoodLogInput(
   { query: "1% fat milk", meal: "dinner", amount: 301, unit: "grams" },
@@ -262,6 +307,7 @@ assert.equal(milkLog.meal, "Dinner");
 assert.equal(milkLog.date, "2026-06-06");
 assert.equal(milkLog.amount, 301);
 assert.equal(milkLog.unit, "g");
+assert.deepEqual(milkLog.validationIssues, []);
 assert.deepEqual(milkLog.searchQueries.slice(0, 2), ["Milk, 1% Fat", "Milk, Lowfat, 1%"]);
 
 const sameMilkKey = foodLogIdempotencyKey({
@@ -291,6 +337,23 @@ const sameBatchKey = foodLogBatchIdempotencyKey([
 ]);
 assert.equal(batchKey, sameBatchKey);
 
+const invalidDestination = normalizeFoodLogInput(
+  { query: "Banana", meal: "Brunch", date: "2026-02-29", timestamp: "13 PM" },
+  "Asia/Jerusalem",
+  new Date("2026-06-06T08:00:00.000Z"),
+);
+assert.equal(invalidDestination.validationIssues.length, 3);
+assert.match(invalidDestination.validationIssues.join(" "), /Unsupported meal/);
+assert.match(invalidDestination.validationIssues.join(" "), /Invalid diary date/);
+assert.match(invalidDestination.validationIssues.join(" "), /Invalid food time/);
+
+const timedMilk = normalizeFoodLogInput(
+  { query: "1% fat milk", meal: "Dinner", amount: 301, unit: "g", timestamp: "13:05" },
+  "Asia/Jerusalem",
+  new Date("2026-06-06T08:00:00.000Z"),
+);
+assert.notEqual(timedMilk.idempotencyKey, milkLog.idempotencyKey);
+
 const verifiedMilk = verifyFoodLogInDiaryText("Dinner\nMilk, 1% Fat\n301 g", milkLog);
 assert.equal(verifiedMilk.status, "verified");
 assert.equal(verifyFoodLogInDiaryText("Dinner\nMilk, 1% Fat\n250 g", milkLog).status, "not_verified");
@@ -307,6 +370,32 @@ assert.equal(wrongBananaUnit.matchedUnit, false);
 const rightBananaUnit = verifyFoodLogInDiaryText("Dinner\nBananas, Raw\n1\ng\n0.89\nkcal", bananaGramLog);
 assert.equal(rightBananaUnit.status, "verified");
 assert.equal(rightBananaUnit.matchedUnit, true);
+
+const structuredBanana = verifyFoodLogInDiaryEntries([
+  { meal: "Breakfast", name: "Bananas, Raw", amount: 1, unit: "g", energyKcal: 0.89 },
+  { meal: "Dinner", name: "Other food", amount: 1, unit: "g" },
+], bananaGramLog);
+assert.equal(structuredBanana.status, "not_verified");
+assert.equal(structuredBanana.matchedMeal, true);
+assert.equal(structuredBanana.matchedFood, false);
+assert.equal(verifyFoodLogInDiaryEntries([
+  { meal: "Dinner", name: "Bananas, Raw", amount: 1, unit: "gram" },
+], bananaGramLog).status, "verified");
+const bananaByHundredGrams = normalizeFoodLogInput(
+  { query: "Bananas, Raw", meal: "Dinner", amount: 273, unit: "g", selectedName: "Bananas, Raw" },
+  "Asia/Jerusalem",
+  new Date("2026-06-09T08:00:00.000Z"),
+);
+assert.equal(verifyFoodLogInDiaryEntries([
+  { meal: "Dinner", name: "Bananas, Raw", amount: 2.73, unit: "× 100 g" },
+], bananaByHundredGrams).status, "verified");
+assert.equal(verifyFoodLogInDiaryEntries([
+  { meal: "Dinner", name: "Bananas, Raw", amount: 1, unit: "bar — 46g" },
+], normalizeFoodLogInput(
+  { query: "Bananas, Raw", meal: "Dinner", amount: 46, unit: "g", selectedName: "Bananas, Raw" },
+  "Asia/Jerusalem",
+  new Date("2026-06-09T08:00:00.000Z"),
+)).status, "verified");
 
 const breakfastOnlyMilk = verifyFoodLogInDiaryText(
   "Breakfast\nMilk, 1% Fat\n301\ng\n107.5\nkcal\nLunch\nDinner\nSnacks",

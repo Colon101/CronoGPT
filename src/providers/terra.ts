@@ -1,6 +1,7 @@
 import type { DateRangeInput } from "../domain.js";
-import { compareStringsOrdinal, isoDateInTimeZone, systemClock, type Clock } from "../determinism.js";
+import { compareStringsOrdinal, systemClock, type Clock } from "../determinism.js";
 import { BaseCronometerProvider } from "./base.js";
+import { normalizeDateRange } from "../date-range.js";
 
 export interface TerraConfig {
   apiBaseUrl: string;
@@ -10,6 +11,7 @@ export interface TerraConfig {
   timeZone?: string;
   clock?: Clock;
   fetchImpl?: typeof fetch;
+  requestTimeoutMs?: number;
 }
 
 export class TerraCronometerProvider extends BaseCronometerProvider {
@@ -39,11 +41,15 @@ export class TerraCronometerProvider extends BaseCronometerProvider {
 
   private async requestFeature(feature: string, path: string, input: DateRangeInput) {
     try {
-      const today = isoDateInTimeZone(this.config.timeZone ?? "UTC", (this.config.clock ?? systemClock)());
+      const now = (this.config.clock ?? systemClock)();
+      const range = normalizeDateRange(input, this.config.timeZone ?? "UTC", now, 366);
+      if (range.issues.length > 0) {
+        return this.result(feature, "needs_manual_step", { input, range }, range.issues.join(" "), "terra");
+      }
       const data = await this.request(path, {
         user_id: this.config.userId,
-        start_date: input.startDate ?? input.date ?? today,
-        end_date: input.endDate ?? input.date ?? today,
+        start_date: range.startDate,
+        end_date: range.endDate,
         to_webhook: "false",
       });
       return this.result(feature, "ok", data, undefined, "terra");
@@ -61,6 +67,7 @@ export class TerraCronometerProvider extends BaseCronometerProvider {
     }
 
     const response = await (this.config.fetchImpl ?? fetch)(url, {
+      signal: AbortSignal.timeout(this.config.requestTimeoutMs ?? 30000),
       headers: {
         Accept: "application/json",
         "dev-id": this.config.devId,

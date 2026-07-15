@@ -41,7 +41,7 @@ export interface FoodLogInput {
   amount?: number;
   unit?: string;
   timestamp?: string;
-  matchPolicy?: "high_confidence" | "selected_only" | "best_effort";
+  matchPolicy?: "high_confidence" | "selected_only";
   searchScope?: "auto" | "all" | "custom" | "favorites";
   dryRun?: boolean;
   confirmed?: boolean;
@@ -180,7 +180,7 @@ export interface CustomFoodInput {
 
 export interface CustomFoodAndLogInput extends CustomFoodInput {
   date?: string;
-  meal?: string;
+  meal: string;
   amount?: number;
   unit?: string;
   timestamp?: string;

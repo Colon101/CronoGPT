@@ -12,6 +12,11 @@ function env(source: Environment, name: string): string | undefined {
   return value && value.trim() ? value.trim() : undefined;
 }
 
+function secretEnv(source: Environment, name: string): string | undefined {
+  const value = source[name];
+  return value && value.trim() ? value : undefined;
+}
+
 export function createProviderFromEnv(source: Environment = process.env): CronometerProvider {
   const requestedValue = env(source, "CRONOMETER_BACKEND");
   if (requestedValue && !BACKEND_MODES.includes(requestedValue as BackendMode)) {
@@ -21,7 +26,7 @@ export function createProviderFromEnv(source: Environment = process.env): Cronom
   const hasTerra = Boolean(env(source, "TERRA_API_KEY") && env(source, "TERRA_DEV_ID") && env(source, "TERRA_USER_ID"));
   const hasBrowserCredentials = Boolean(
     (env(source, "CRONOMETER_EMAIL") || env(source, "email"))
-      && (env(source, "CRONOMETER_PASSWORD") || env(source, "password")),
+      && (secretEnv(source, "CRONOMETER_PASSWORD") || secretEnv(source, "password")),
   );
   const timeZone = validatedTimeZone(env(source, "CRONOMETER_TIME_ZONE") ?? "Asia/Jerusalem");
 
@@ -37,6 +42,7 @@ export function createProviderFromEnv(source: Environment = process.env): Cronom
       devId: env(source, "TERRA_DEV_ID") ?? "",
       userId: env(source, "TERRA_USER_ID") ?? "",
       timeZone,
+      requestTimeoutMs: numberEnv(source, "TERRA_REQUEST_TIMEOUT_MS", 30000, 1),
     });
   }
 
@@ -45,7 +51,7 @@ export function createProviderFromEnv(source: Environment = process.env): Cronom
       ?? env(source, "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH");
     return new BrowserCronometerProvider({
       email: env(source, "CRONOMETER_EMAIL") ?? env(source, "email"),
-      password: env(source, "CRONOMETER_PASSWORD") ?? env(source, "password"),
+      password: secretEnv(source, "CRONOMETER_PASSWORD") ?? secretEnv(source, "password"),
       remoteWsEndpoint: env(source, "REMOTE_CHROME_WS_ENDPOINT") ?? env(source, "BROWSERLESS_WS_ENDPOINT"),
       storageState: env(source, "CRONOMETER_STORAGE_STATE_BASE64") ?? env(source, "CRONOMETER_STORAGE_STATE"),
       localChromium: booleanEnv(source, "CRONOMETER_LOCAL_CHROMIUM", false) || Boolean(chromiumExecutablePath),
@@ -61,7 +67,7 @@ export function createProviderFromEnv(source: Environment = process.env): Cronom
       browserProfileDir: env(source, "CRONOMETER_BROWSER_PROFILE_DIR"),
       reuseRemoteContext: booleanEnv(source, "CRONOMETER_REUSE_REMOTE_CONTEXT", false),
       reuseLocalBrowser: booleanEnv(source, "CRONOMETER_REUSE_LOCAL_BROWSER", false),
-      strictAccountVerification: booleanEnv(source, "CRONOMETER_STRICT_ACCOUNT_VERIFICATION", false),
+      strictAccountVerification: booleanEnv(source, "CRONOMETER_STRICT_ACCOUNT_VERIFICATION", true),
     });
   }
 

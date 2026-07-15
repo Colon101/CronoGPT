@@ -92,19 +92,21 @@ fi
 BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 ssh "${SSH_ARGS[@]}" "$SSH_TARGET" "bash -s" < scripts/oracle/bootstrap-host.sh
-ssh "${SSH_ARGS[@]}" "$SSH_TARGET" "sudo chown -R $ORACLE_USER:$ORACLE_USER /opt/cronogpt/app /opt/cronogpt/config /opt/cronogpt/secrets /opt/cronogpt/state && chmod 700 /opt/cronogpt/secrets"
+ssh "${SSH_ARGS[@]}" "$SSH_TARGET" "sudo chown -R $ORACLE_USER:$ORACLE_USER /opt/cronogpt/app /opt/cronogpt/config /opt/cronogpt/secrets /opt/cronogpt/state && chmod 700 /opt/cronogpt/secrets /opt/cronogpt/state"
 
 sync_app_source
 
 ssh "${SSH_ARGS[@]}" "$SSH_TARGET" "cat > /opt/cronogpt/config/oracle.env" <<EOF_REMOTE_CONFIG
 CRONOGPT_DOMAIN=${ORACLE_DOMAIN}
 APP_PUBLIC_ORIGIN=https://${ORACLE_DOMAIN}
+CRONOGPT_OAUTH_STATE_FILE=/opt/cronogpt/state/oauth-state.json
 CRONOMETER_BACKEND=browser
 CRONOMETER_ENABLE_WRITES=true
 CRONOMETER_REQUIRE_FOOD_CONFIRMATION=false
 CRONOMETER_LOCAL_CHROMIUM=true
 CRONOMETER_REUSE_REMOTE_CONTEXT=false
 CRONOMETER_REUSE_LOCAL_BROWSER=true
+CRONOMETER_STRICT_ACCOUNT_VERIFICATION=true
 CRONOMETER_BROWSER_PROFILE_DIR=/opt/cronogpt/state/chromium-profile
 CRONOMETER_NAVIGATION_TIMEOUT_MS=60000
 CRONOMETER_OPERATION_TIMEOUT_MS=180000
@@ -126,6 +128,36 @@ CRONOMETER_STORAGE_STATE_BASE64=${CRONOMETER_STORAGE_STATE_VALUE}
 EOF_REMOTE_SECRETS
 
 ssh "${SSH_ARGS[@]}" "$SSH_TARGET" "cd /opt/cronogpt/app && sudo docker compose -f deploy/oracle/docker-compose.yml --env-file /opt/cronogpt/config/oracle.env up -d --build"
+
+ssh "${SSH_ARGS[@]}" "$SSH_TARGET" "bash -s" <<'EOF_REMOTE_HEALTH'
+set -euo pipefail
+cd /opt/cronogpt/app
+container="$(sudo docker compose -f deploy/oracle/docker-compose.yml --env-file /opt/cronogpt/config/oracle.env ps -q app)"
+if [[ -z "$container" ]]; then
+  echo "cronogpt app container was not created." >&2
+  exit 1
+fi
+for _ in $(seq 1 60); do
+  status="$(sudo docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$container")"
+  if [[ "$status" == "healthy" ]]; then
+    exit 0
+  fi
+  if [[ "$status" == "unhealthy" ]]; then
+    sudo docker logs --tail 200 "$container" >&2
+    exit 1
+  fi
+  sleep 2
+done
+sudo docker logs --tail 200 "$container" >&2
+echo "cronogpt app did not become healthy within 120 seconds." >&2
+exit 1
+EOF_REMOTE_HEALTH
+
+if [[ "${ORACLE_SKIP_SMOKE:-false}" != "true" ]]; then
+  CRONOGPT_SMOKE_URL="https://${ORACLE_DOMAIN}/mcp" \
+    CRONOGPT_API_TOKEN="$API_TOKEN" \
+    npm run smoke:production
+fi
 
 echo "Deployed cronogpt to https://${ORACLE_DOMAIN}/mcp"
 echo "Use the CRONOGPT_API_TOKEN and CRONOGPT_LINK_SECRET values from the remote secret file; they were not printed."

@@ -1,5 +1,7 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { dirname } from "node:path";
 
 const AUTH_REALM = "cronogpt MCP";
 const MCP_PATH = "/mcp";
@@ -552,13 +554,62 @@ function isAllowedResource(resource: string, req: IncomingMessage) {
 
 function consumeAuthorizationCode(code: string, expiresAt: number) {
   const now = Math.floor(Date.now() / 1000);
+  const persisted = readPersistedAuthorizationCodes();
+  if (persisted === null) return false;
+  for (const [digest, expiry] of persisted) {
+    const current = consumedAuthorizationCodes.get(digest) ?? 0;
+    if (expiry > current) consumedAuthorizationCodes.set(digest, expiry);
+  }
   for (const [digest, expiry] of consumedAuthorizationCodes) {
     if (expiry < now) consumedAuthorizationCodes.delete(digest);
   }
   const digest = createHash("sha256").update(code).digest("base64url");
   if (consumedAuthorizationCodes.has(digest)) return false;
   consumedAuthorizationCodes.set(digest, expiresAt);
-  return true;
+  return writePersistedAuthorizationCodes();
+}
+
+function oauthStateFile() {
+  return process.env.CRONOGPT_OAUTH_STATE_FILE?.trim() || undefined;
+}
+
+function readPersistedAuthorizationCodes(): Map<string, number> | null {
+  const file = oauthStateFile();
+  if (!file) return new Map();
+  try {
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as { consumedAuthorizationCodes?: Record<string, unknown> };
+    const entries = Object.entries(parsed.consumedAuthorizationCodes ?? {})
+      .filter(([digest, expiry]) => /^[A-Za-z0-9_-]{43}$/.test(digest) && typeof expiry === "number" && Number.isSafeInteger(expiry) && expiry > 0)
+      .map(([digest, expiry]) => [digest, expiry as number] as [string, number]);
+    return new Map(entries);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Map();
+    console.error("Could not read CRONOGPT_OAUTH_STATE_FILE; refusing authorization-code exchange:", error instanceof Error ? error.message : error);
+    return null;
+  }
+}
+
+function writePersistedAuthorizationCodes() {
+  const file = oauthStateFile();
+  if (!file) return true;
+  const temporary = `${file}.${process.pid}.tmp`;
+  try {
+    mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+    const entries = Array.from(consumedAuthorizationCodes.entries())
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+    writeFileSync(temporary, `${JSON.stringify({ consumedAuthorizationCodes: Object.fromEntries(entries) })}\n`, { mode: 0o600 });
+    chmodSync(temporary, 0o600);
+    renameSync(temporary, file);
+    chmodSync(file, 0o600);
+    return true;
+  } catch (error) {
+    console.error("Could not persist consumed OAuth authorization code; refusing exchange:", error instanceof Error ? error.message : error);
+    return false;
+  }
+}
+
+export function __resetConsumedAuthorizationCodesForTests() {
+  consumedAuthorizationCodes.clear();
 }
 
 function isOAuthPath(pathname: string) {

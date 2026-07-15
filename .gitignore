@@ -9,3 +9,5 @@ coverage/
 exports/
 .cronometer-storage-state.*
 .cronometer-login-backoff.json
+.cronogpt-oauth-state.json
+.cronogpt-oauth-state.json.*.tmp

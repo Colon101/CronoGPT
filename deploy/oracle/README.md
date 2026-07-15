@@ -17,6 +17,8 @@ Files on the VM:
 - Secrets: `/opt/cronogpt/secrets/cronogpt.env`
 - Runtime state: `/opt/cronogpt/state`
 
+The state directory is mode `0700` and stores the persistent Chromium profile, login cooldown, and OAuth authorization-code replay ledger. Production startup fails closed if HTTPS `APP_PUBLIC_ORIGIN`, strong separate API/link secrets, or `CRONOGPT_OAUTH_STATE_FILE` are missing.
+
 Public URL:
 
 ```text
@@ -64,8 +66,8 @@ High-level flow:
 1. Create the VM and reserved public IP in Oracle Cloud.
 2. SSH to the VM and run `scripts/oracle/bootstrap-host.sh`.
 3. From this repo, export `ORACLE_HOST`, `ORACLE_DOMAIN`, and optionally `ORACLE_USER`/`ORACLE_SSH_KEY`.
-4. Run `npm run oracle:deploy`.
-5. Run `npm run smoke:oracle`.
+4. Run `npm run oracle:deploy`; it waits for the app container to become healthy and runs the production smoke unless `ORACLE_SKIP_SMOKE=true` is explicitly set.
+5. Optionally rerun `npm run smoke:oracle` for an independent read-only check.
 6. Reconnect ChatGPT to the Oracle `/mcp` URL.
 7. Only after smoke and one live canary pass, run `npm run oracle:wipe-local-env`.
 

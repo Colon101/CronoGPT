@@ -93,6 +93,8 @@ jobs:
 
       - name: Deploy to Oracle
         env:
+          # The workflow runs one explicit smoke after loading the preserved remote token.
+          ORACLE_SKIP_SMOKE: "true"
           CRONOGPT_API_TOKEN: ${{ secrets.CRONOGPT_API_TOKEN }}
           CRONOGPT_LINK_SECRET: ${{ secrets.CRONOGPT_LINK_SECRET }}
           CRONOMETER_EMAIL: ${{ secrets.CRONOMETER_EMAIL }}

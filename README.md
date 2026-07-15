@@ -81,12 +81,14 @@ Hosted browser config:
 APP_PUBLIC_ORIGIN=https://cronogpt.129-159-156-186.sslip.io
 CRONOGPT_API_TOKEN=generate-a-long-random-token
 CRONOGPT_LINK_SECRET=optional-separate-chatgpt-link-code
+CRONOGPT_OAUTH_STATE_FILE=/opt/cronogpt/state/oauth-state.json
 CRONOMETER_BACKEND=browser
 CRONOMETER_EMAIL=...
 CRONOMETER_PASSWORD=...
 CRONOMETER_STORAGE_STATE_BASE64=optional-playwright-storage-state
 CRONOMETER_LOCAL_CHROMIUM=true
 CRONOMETER_REUSE_LOCAL_BROWSER=true
+CRONOMETER_STRICT_ACCOUNT_VERIFICATION=true
 CRONOMETER_BROWSER_PROFILE_DIR=/opt/cronogpt/state/chromium-profile
 REMOTE_CHROME_WS_ENDPOINT=optional-remote-chrome-endpoint
 CRONOMETER_ENABLE_WRITES=true
@@ -99,11 +101,11 @@ CRONOMETER_BROWSER_RETRY_COUNT=1
 CRONOGPT_FULL_TOOL_SURFACE=false
 ```
 
-The Oracle Docker image includes local Chromium through the Playwright base image. Keep `CRONOMETER_REUSE_LOCAL_BROWSER=true` and `CRONOMETER_BROWSER_PROFILE_DIR=/opt/cronogpt/state/chromium-profile` so the hosted process reuses one warm Chromium session and persists Cronometer cookies across deploys. `REMOTE_CHROME_WS_ENDPOINT` is optional if you want Browserless or another remote Chrome provider instead. `CRONOMETER_STORAGE_STATE_BASE64` seeds the hosted browser with a valid Cronometer session when the persistent profile is empty or stale. `CRONOMETER_LOGIN_BACKOFF_MS` pauses new login attempts after a rate-limit, challenge, or ambiguous login-page failure, and `CRONOMETER_LOGIN_BACKOFF_FILE` persists that cooldown across server restarts.
+The Oracle Docker image includes local Chromium through the Playwright base image. Keep `CRONOMETER_REUSE_LOCAL_BROWSER=true` and `CRONOMETER_BROWSER_PROFILE_DIR=/opt/cronogpt/state/chromium-profile` so the hosted process reuses one warm Chromium session and persists Cronometer cookies across deploys. `REMOTE_CHROME_WS_ENDPOINT` is optional if you want Browserless or another remote Chrome provider instead. `CRONOMETER_STORAGE_STATE_BASE64` seeds the hosted browser with a valid Cronometer session when the persistent profile is empty or stale. `CRONOMETER_STRICT_ACCOUNT_VERIFICATION=true` refuses browser work when the authenticated account cannot be verified as the configured email. `CRONOMETER_LOGIN_BACKOFF_MS` pauses new login attempts after a rate-limit, challenge, or ambiguous login-page failure, and `CRONOMETER_LOGIN_BACKOFF_FILE` persists that cooldown across server restarts. `CRONOGPT_OAUTH_STATE_FILE` persists consumed authorization-code digests so a code cannot be replayed after a restart.
 
 Food logs write directly when `CRONOMETER_ENABLE_WRITES=true` unless the tool call sets `dryRun=true`. Set `CRONOMETER_REQUIRE_FOOD_CONFIRMATION=true` to restore the older second-step confirmation behavior. Other write tools require `confirmed=true` and will write as long as `dryRun` is not `true`. Dry-run write previews return without opening Cronometer, so recipe/custom-food validation does not burn browser login attempts. Set `CRONOMETER_ENABLE_WRITES=false` for read-only dry-run mode.
 
-Browser-backed tools are serialized inside the hosted process to reduce Chromium contention. Confirmed `log_food` writes are accepted as background jobs and deduped by idempotency key, so slow Cronometer UI work can finish after the caller returns. `CRONOMETER_OPERATION_TIMEOUT_MS` bounds individual browser attempts, and `CRONOMETER_BROWSER_RETRY_COUNT` retries transient automation failures without retrying login/CAPTCHA/credential failures.
+Browser-backed tools are serialized inside the hosted process to reduce Chromium contention. Confirmed `log_food` writes are accepted as background jobs and deduped by idempotency key, so slow Cronometer UI work can finish after the caller returns. `CRONOMETER_OPERATION_TIMEOUT_MS` bounds individual browser attempts, and `CRONOMETER_BROWSER_RETRY_COUNT` retries transient pre-write automation failures without retrying login/CAPTCHA/credential failures. Once a commit control has been reached, any browser exception becomes `possibly_written_verify_failed`; it is never retried automatically.
 
 For multi-ingredient meals, use `log_foods` instead of several separate `log_food` calls. It accepts an `items` array, derives one batch idempotency key, logs the foods sequentially in one browser job, verifies each item, and returns a per-item status table. By default it waits briefly for the batch to finish; if Cronometer is slow, poll `cronometer_runtime_status` for the returned background job instead of submitting the same batch again.
 
@@ -137,12 +139,12 @@ npm run smoke:oracle
 
 For a packaged food that is missing from Cronometer, prefer `create_and_log_custom_food`. It opens Foods > Custom Foods, fills the detailed editor and Advanced Info barcode row, saves only after every requested field was filled, reads back the exact name, serving size, barcode, and nutrient values, and only then logs that exact private food. Use `create_custom_food` for the same verified workflow without the diary-log step. Both tools handle exact-name duplicates internally, so ChatGPT should not call `list_custom_foods` first.
 
-Pass the package serving size, the UPC/EAN/GTIN printed below the barcode, and every nutrient present on the label. Call `custom_food_nutrient_schema` for the current accepted keys and units. Barcode check digits, serving syntax, finite/non-negative nutrient values, and OAuth write scope are validated before Chromium opens. An invalid or incomplete form is reverted rather than partially saved. A `possibly_written_verify_failed` result is deliberately ambiguous: inspect the custom-food list before retrying to avoid a duplicate.
+Pass the package serving size, the UPC/EAN/GTIN printed below the barcode, and every nutrient present on the label. Call `custom_food_nutrient_schema` for the current accepted keys and units. Create tools require an explicit serving size and at least one recognized nutrient. Unknown nutrient names, conflicting aliases for the same Cronometer field, invalid barcode check digits, invalid serving syntax, non-finite/negative values, and missing OAuth write scope are rejected before Chromium opens. An invalid or incomplete form is reverted rather than partially saved. A `possibly_written_verify_failed` result is deliberately ambiguous: inspect the custom-food list before retrying to avoid a duplicate.
 
-To prove the real custom-food write path, run the gated live smoke. It creates one uniquely named food with a generated valid barcode and detailed nutrients, verifies all saved values and the barcode on read-back, deletes it, and verifies it is gone:
+To prove the real custom-food write path, run the gated live smoke. It creates one uniquely named food with a generated valid barcode and detailed nutrients, logs exactly one serving to Lunch, verifies the exact structured Lunch row and barcode, deletes the diary row and custom food, and verifies both are gone:
 
 ```bash
-CRONOMETER_ENABLE_WRITES=true CRONOGPT_LIVE_WRITE_CONFIRM=create-and-delete-custom-food npm run smoke:live-custom-food
+CRONOMETER_ENABLE_WRITES=true CRONOGPT_LIVE_WRITE_CONFIRM=create-log-lunch-and-cleanup-custom-food npm run smoke:live-custom-food
 ```
 
 To create a durable Cronometer session for Oracle, run this locally after confirming `.env` has the Cronometer credentials:
@@ -173,7 +175,7 @@ The deployed `/mcp` endpoint supports ChatGPT OAuth discovery. In ChatGPT, creat
 https://cronogpt.129-159-156-186.sslip.io/mcp
 ```
 
-When ChatGPT opens the cronogpt linking page, enter `CRONOGPT_LINK_SECRET`. If that env var is empty, enter `CRONOGPT_API_TOKEN`. On 2026-06-09, Chrome verified this connector through ChatGPT's website with App ID `asdk_app_6a2811e26a8481918d4596e042f50718`.
+When ChatGPT opens the cronogpt linking page, enter `CRONOGPT_LINK_SECRET`. Production requires a separate strong link secret, a strong API token, HTTPS `APP_PUBLIC_ORIGIN`, and a persistent OAuth state file. On 2026-06-09, Chrome verified this connector through ChatGPT's website with App ID `asdk_app_6a2811e26a8481918d4596e042f50718`.
 
 Direct MCP clients can still use:
 
@@ -212,14 +214,13 @@ By default, only these tools are model-visible:
 - `find_private_recipe`
 - `resolve_recipe_ingredients`
 - `ensure_private_recipe`
-- `get_targets`
 - `cronometer_runtime_status`
 - `cronometer_stability_check`
 - `refresh_cronometer_session`
 
-The rest remain app-callable for rollback and direct testing. Set `CRONOGPT_FULL_TOOL_SURFACE=true` only when deliberately exposing the legacy broad surface.
+The rest—including unstructured targets/profile readers—remain app-callable for rollback and direct testing. Set `CRONOGPT_FULL_TOOL_SURFACE=true` only when deliberately exposing the legacy broad surface.
 
-`log_food` is transactional. `dryRun=true` does not open Chromium. Confirmed real writes run in the browser queue, write once, and read back the target diary entry. Single-food writes wait briefly for verified completion by default; confirmed custom-food writes and deletes wait up to the hosted operation window. If the result is still `accepted`, poll `cronometer_runtime_status` for the final background result before retrying. Final states include `written`, `already_exists`, `busy`, `not_written_login_paused`, `not_written_ambiguous`, `not_written_not_found`, and `possibly_written_verify_failed`. For a whole meal, prefer `log_foods`; it reduces ChatGPT/tool-call drift by keeping all ingredients in one server-side transaction and returns exact per-item results.
+`log_food` is transactional and requires an explicit `Breakfast`, `Lunch`, `Dinner`, `Snacks`, or `Supplements` destination. There is no silent Breakfast/Snacks fallback. `dryRun=true` does not open Chromium and returns `ok=false`, `completed=false`, and `intentSatisfied=false`. Confirmed real writes run in the browser queue, verify date/meal/time/amount/unit before Save, write once, and read back the structured target diary row. Single-food writes wait briefly for verified completion by default; confirmed custom-food writes and deletes wait up to the hosted operation window. If the result is still `accepted`, poll `cronometer_runtime_status` for the final background result before retrying. Final states include `written`, `already_exists`, `busy`, `not_written_login_paused`, `not_written_ambiguous`, `not_written_not_found`, and `possibly_written_verify_failed`. For a whole meal, prefer `log_foods`; it reduces ChatGPT/tool-call drift by keeping all ingredients in one server-side transaction and returns exact per-item results.
 
 ## Backends
 

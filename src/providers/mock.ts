@@ -1,6 +1,7 @@
 import type {
   BiometricLogInput,
   CustomFoodDeleteInput,
+  CustomFoodAndLogInput,
   CustomFoodDuplicateInput,
   CustomFoodInput,
   CustomFoodListInput,
@@ -143,6 +144,10 @@ export class MockCronometerProvider extends BaseCronometerProvider {
 
   async createCustomFood(input: CustomFoodInput) {
     return this.dryRunWrite("create_custom_food", input);
+  }
+
+  async createAndLogCustomFood(input: CustomFoodAndLogInput) {
+    return this.dryRunWrite("create_and_log_custom_food", input);
   }
 
   async updateCustomFood(input: CustomFoodUpdateInput) {

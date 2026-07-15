@@ -15,6 +15,12 @@ services:
       CRONOGPT_BUILD_TIMESTAMP: ${CRONOGPT_BUILD_TIMESTAMP:-unknown}
     expose:
       - "8787"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
     shm_size: "1gb"
     volumes:
       - /opt/cronogpt/state:/opt/cronogpt/state
@@ -23,7 +29,8 @@ services:
     image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
     restart: unless-stopped
     depends_on:
-      - app
+      app:
+        condition: service_healthy
     env_file:
       - /opt/cronogpt/config/oracle.env
     ports:

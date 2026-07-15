@@ -6,9 +6,9 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 const defaultOracleDomain = process.env.ORACLE_DOMAIN ?? "cronogpt.129-159-156-186.sslip.io";
 const serverUrl = process.env.CRONOGPT_SMOKE_URL ?? `https://${defaultOracleDomain}/mcp`;
 const token = process.env.CRONOGPT_API_TOKEN;
-const browserWarmupTimeoutMs = Number(process.env.CRONOGPT_SMOKE_BROWSER_WARMUP_TIMEOUT_MS ?? 240000);
-const browserProbeTimeoutMs = Number(process.env.CRONOGPT_SMOKE_BROWSER_TIMEOUT_MS ?? 180000);
-const browserQueueWaitMs = Number(process.env.CRONOGPT_SMOKE_BROWSER_QUEUE_WAIT_MS ?? 240000);
+const browserWarmupTimeoutMs = positiveIntegerEnv("CRONOGPT_SMOKE_BROWSER_WARMUP_TIMEOUT_MS", 240000);
+const browserProbeTimeoutMs = positiveIntegerEnv("CRONOGPT_SMOKE_BROWSER_TIMEOUT_MS", 180000);
+const browserQueueWaitMs = positiveIntegerEnv("CRONOGPT_SMOKE_BROWSER_QUEUE_WAIT_MS", 240000);
 
 if (!token) {
   throw new Error("Missing CRONOGPT_API_TOKEN.");
@@ -37,7 +37,6 @@ const chatGptActionToolNames = [
   "find_private_recipe",
   "resolve_recipe_ingredients",
   "ensure_private_recipe",
-  "get_targets",
   "cronometer_runtime_status",
   "cronometer_stability_check",
   "refresh_cronometer_session",
@@ -224,7 +223,7 @@ await withClient(async (client) => {
   checks.push({
     name: "dangerous_ui_block",
     ok: dangerous.structuredContent?.status === "needs_manual_step" &&
-      /refuses dangerous/i.test(dangerous.structuredContent?.warning ?? ""),
+      /refuses (?:dangerous|commit-like)/i.test(dangerous.structuredContent?.warning ?? ""),
     data: {
       status: dangerous.structuredContent?.status,
       warning: dangerous.structuredContent?.warning,
@@ -448,4 +447,14 @@ function hasOutputTemplate(tool) {
     tool?._meta?.["ui/resourceUri"] ||
     tool?._meta?.ui?.resourceUri
   );
+}
+
+function positiveIntegerEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive safe integer; received ${JSON.stringify(raw)}.`);
+  }
+  return value;
 }

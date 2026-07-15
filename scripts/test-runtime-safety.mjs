@@ -13,6 +13,8 @@ import {
   releaseAndSnapshotBrowserQueue,
 } from "../dist/providers/browser.js";
 import { createCronoServer, STABLE_MODEL_VISIBLE_TOOLS } from "../dist/mcp.js";
+import { capabilitiesForMode } from "../dist/features.js";
+import { toMcpToolResponse } from "../dist/tool-response.js";
 import { runCooldownCommand } from "./cronometer-login-cooldown.mjs";
 
 const tempDir = mkdtempSync(join(tmpdir(), "cronogpt-runtime-safety-"));
@@ -52,10 +54,14 @@ try {
     "find_private_recipe",
     "resolve_recipe_ingredients",
     "ensure_private_recipe",
-    "get_targets",
   ]) {
     assert.ok(STABLE_MODEL_VISIBLE_TOOLS.includes(toolName), `${toolName} should be ChatGPT-visible by default`);
   }
+  assert.equal(STABLE_MODEL_VISIBLE_TOOLS.includes("get_targets"), false, "unstructured target scraping must not be ChatGPT-visible by default");
+  const browserCapabilities = new Map(capabilitiesForMode("browser").map((capability) => [capability.id, capability.currentBackendStatus]));
+  assert.equal(browserCapabilities.get("create_and_log_custom_food"), "ok");
+  assert.equal(browserCapabilities.get("delete_diary_food_entry"), "ok");
+  assert.equal(browserCapabilities.get("get_targets"), "needs_manual_step");
 
   const scopedServer = createCronoServer({ grantedScopes: ["cronometer:read"] });
   const scopedClient = new Client({ name: "cronogpt-test", version: "1.0.0" });
@@ -67,6 +73,23 @@ try {
   assert.ok(preferredCustomFoodTool);
   assert.match(preferredCustomFoodTool.description ?? "", /preferred one-call workflow/i);
   assert.ok(preferredCustomFoodTool.inputSchema?.properties?.barcode);
+  assert.ok(preferredCustomFoodTool.inputSchema?.required?.includes("meal"));
+  assert.equal(preferredCustomFoodTool.annotations?.openWorldHint, false);
+  assert.equal(preferredCustomFoodTool.annotations?.idempotentHint, true);
+  const logFoodTool = listedTools.tools.find((tool) => tool.name === "log_food");
+  assert.ok(logFoodTool?.inputSchema?.required?.includes("meal"));
+  assert.deepEqual(logFoodTool?.inputSchema?.properties?.meal?.enum, ["Breakfast", "Lunch", "Dinner", "Snacks", "Supplements"]);
+  assert.deepEqual(logFoodTool?.inputSchema?.properties?.matchPolicy?.enum, ["high_confidence", "selected_only"]);
+  const createCustomFoodTool = listedTools.tools.find((tool) => tool.name === "create_custom_food");
+  assert.ok(createCustomFoodTool?.inputSchema?.required?.includes("servingSize"));
+  assert.ok(createCustomFoodTool?.inputSchema?.required?.includes("nutrients"));
+  const createAndLogTool = listedTools.tools.find((tool) => tool.name === "create_and_log_custom_food");
+  assert.ok(createAndLogTool?.inputSchema?.required?.includes("meal"));
+  assert.ok(createAndLogTool?.inputSchema?.required?.includes("servingSize"));
+  assert.ok(createAndLogTool?.inputSchema?.required?.includes("nutrients"));
+  assert.deepEqual(createAndLogTool?.inputSchema?.properties?.duplicatePolicy?.enum, ["fail", "update_existing"]);
+  assert.equal(logFoodTool?.annotations?.openWorldHint, false);
+  assert.equal(logFoodTool?.annotations?.idempotentHint, true);
   assert.match(scopedClient.getInstructions() ?? "", /barcode links the private custom food/i);
   const rejectedWrite = await scopedClient.callTool({
     name: "create_custom_food",
@@ -99,11 +122,43 @@ try {
     reuseRemoteContext: false,
     reuseLocalBrowser: false,
   });
-  const pausedWrite = await provider.logFood({ query: "banana", amount: 1, unit: "g" });
+  const missingMealWrite = await provider.logFood({ query: "banana", amount: 1, unit: "g" });
+  assert.equal(missingMealWrite.status, "needs_manual_step");
+  assert.equal(missingMealWrite.data.browserOpened, false);
+  assert.match(missingMealWrite.warning, /Unsupported meal/);
+
+  const pausedWrite = await provider.logFood({ query: "banana", meal: "Lunch", amount: 1, unit: "g" });
   assert.equal(pausedWrite.status, "not_written_login_paused");
   assert.equal(pausedWrite.data.browserOpened, false);
   assert.equal(pausedWrite.data.writeAttempted, false);
   assert.ok(pausedWrite.data.loginPauseSecondsRemaining > 0);
+
+  const invalidWrite = await provider.logFood({
+    query: "banana",
+    meal: "Brunch",
+    date: "2026-02-29",
+    timestamp: "13 PM",
+  });
+  assert.equal(invalidWrite.status, "needs_manual_step");
+  assert.equal(invalidWrite.data.browserOpened, false);
+  assert.equal(invalidWrite.data.writeAttempted, false);
+  assert.match(invalidWrite.warning, /Unsupported meal/);
+
+  const invalidRangeRead = await provider.listFoodEntries({ startDate: "2026-01-01" });
+  assert.equal(invalidRangeRead.status, "needs_manual_step");
+  assert.equal(invalidRangeRead.data.browserOpened, false);
+  assert.match(invalidRangeRead.warning, /both startDate and endDate/);
+
+  const invalidCustomFood = await provider.createCustomFood({
+    name: "invalid nutrient food",
+    servingSize: "1 serving",
+    nutrients: { imaginary_nutrient: 1 },
+    confirmed: true,
+    dryRun: false,
+  });
+  assert.equal(invalidCustomFood.status, "needs_manual_step");
+  assert.equal(invalidCustomFood.data.browserOpened, false);
+  assert.match(invalidCustomFood.warning, /Unknown nutrient key/);
 
   const pausedBatchWrite = await provider.logFoods({
     meal: "Lunch",
@@ -136,6 +191,49 @@ try {
   assert.equal(batchDryRun.data.items[1].normalized.query, "milk 1%");
   assert.equal(batchDryRun.data.items[1].normalized.unit, "g");
 
+  const duplicateBatch = await provider.logFoods({
+    meal: "Lunch",
+    items: [
+      { query: "Banana", amount: 1, unit: "serving" },
+      { query: "banana", amount: 1, unit: "servings" },
+    ],
+    dryRun: true,
+  });
+  assert.equal(duplicateBatch.status, "needs_manual_step");
+  assert.equal(duplicateBatch.data.browserOpened, false);
+  assert.deepEqual(duplicateBatch.data.duplicateItems[0].indices, [0, 1]);
+
+  const acceptedResponse = toMcpToolResponse({
+    provider: "browser",
+    mode: "browser",
+    feature: "log_food",
+    status: "accepted",
+  });
+  assert.equal(acceptedResponse.structuredContent.ok, false);
+  assert.equal(acceptedResponse.structuredContent.completed, false);
+  assert.equal(acceptedResponse.structuredContent.intentSatisfied, false);
+
+  const dryRunResponse = toMcpToolResponse({
+    provider: "mock",
+    mode: "mock",
+    feature: "log_food",
+    status: "dry_run",
+    data: { writeAttempted: false },
+  });
+  assert.equal(dryRunResponse.structuredContent.ok, false);
+  assert.equal(dryRunResponse.structuredContent.completed, false);
+  assert.equal(dryRunResponse.structuredContent.intentSatisfied, false);
+  assert.match(acceptedResponse.content[0].text, /not complete/i);
+  const ambiguousResponse = toMcpToolResponse({
+    provider: "browser",
+    mode: "browser",
+    feature: "log_food",
+    status: "not_written_ambiguous",
+    warning: "Pick an exact result.",
+  });
+  assert.equal(ambiguousResponse.structuredContent.ok, false);
+  assert.equal(ambiguousResponse.isError, false);
+
   assert.equal(provider.featureQueueWaitTimeoutMs("log_food"), 10000);
   assert.equal(provider.featureQueueWaitTimeoutMs("log_foods"), 10000);
   assert.equal(provider.featureQueueWaitTimeoutMs("search_foods"), 5000);
@@ -164,8 +262,8 @@ try {
   assert.equal(queue.activeBrowserJob.feature, "log_food");
 
   queue = releaseAndSnapshotBrowserQueue(1, fixedNow);
-  assert.equal(queue.activeBrowserJobs, 0);
-  assert.equal(queue.activeBrowserJob, undefined);
+  assert.equal(queue.activeBrowserJobs, 1);
+  assert.equal(queue.activeBrowserJob.feature, "log_food");
   assert.equal(queue.staleActiveJob.feature, "log_food");
   __resetBrowserQueueForTests();
 
@@ -196,6 +294,26 @@ try {
   assert.deepEqual(await Promise.all([first, second]), ["first", "second"]);
   assert.deepEqual(starts, ["first", "second"]);
   __resetBrowserQueueForTests();
+
+  let releaseResetFirst;
+  let signalResetFirstStarted;
+  const resetFirstStarted = new Promise((resolve) => {
+    signalResetFirstStarted = resolve;
+  });
+  const resetFirstCanFinish = new Promise((resolve) => {
+    releaseResetFirst = resolve;
+  });
+  const resetFirst = __runBrowserQueueJobForTests("reset-first", async () => {
+    signalResetFirstStarted();
+    await resetFirstCanFinish;
+    return "reset-first";
+  });
+  await resetFirstStarted;
+  const resetQueued = __runBrowserQueueJobForTests("reset-queued", async () => "must-not-run");
+  __resetBrowserQueueForTests();
+  releaseResetFirst();
+  assert.equal(await resetFirst, "reset-first");
+  await assert.rejects(resetQueued, /queue was reset/);
 
   console.log("runtime safety checks passed");
 } finally {

@@ -1,8 +1,12 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Readable } from "node:stream";
 import {
+  __resetConsumedAuthorizationCodesForTests,
   authorizeMcpRequest,
   handleOAuthRequest,
   isLocalRequest,
@@ -14,12 +18,15 @@ const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
 const clientId = "cronogpt-test-client";
 const verifier = "oauth-test-verifier-abcdefghijklmnopqrstuvwxyz-0123456789";
 const challenge = createHash("sha256").update(verifier).digest("base64url");
+const tempDir = mkdtempSync(join(tmpdir(), "cronogpt-oauth-"));
+const oauthStateFile = join(tempDir, "oauth-state.json");
 
 try {
   Object.assign(process.env, {
     APP_PUBLIC_ORIGIN: origin,
     CRONOGPT_API_TOKEN: "oauth-test-api-token",
     CRONOGPT_LINK_SECRET: "oauth-test-link-secret",
+    CRONOGPT_OAUTH_STATE_FILE: oauthStateFile,
     CRONOGPT_OAUTH_LOGGING: "0",
     NODE_ENV: "production",
   });
@@ -76,9 +83,11 @@ try {
     code_verifier: verifier,
   });
   assert.equal(exchanged.status, 200);
+  assert.equal(statSync(oauthStateFile).mode & 0o777, 0o600);
   const tokenBody = JSON.parse(exchanged.body);
   assert.equal(tokenBody.scope, "cronometer:read");
 
+  __resetConsumedAuthorizationCodesForTests();
   const replayed = await token({
     grant_type: "authorization_code",
     code,
@@ -127,6 +136,7 @@ try {
     if (!(key in originalEnv)) delete process.env[key];
   }
   Object.assign(process.env, originalEnv);
+  rmSync(tempDir, { force: true, recursive: true });
 }
 
 async function authorize(overrides) {

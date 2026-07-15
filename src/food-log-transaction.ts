@@ -2,8 +2,23 @@ import { createHash } from "node:crypto";
 import type { FoodLogInput } from "./domain.js";
 import { isoDateInTimeZone } from "./determinism.js";
 
-const KNOWN_MEALS = ["Breakfast", "Lunch", "Dinner", "Snacks", "Supplements"] as const;
-const DEFAULT_MEAL = "Breakfast";
+export const FOOD_LOG_MEALS = ["Breakfast", "Lunch", "Dinner", "Snacks", "Supplements"] as const;
+export type FoodLogMeal = typeof FOOD_LOG_MEALS[number];
+
+export interface NormalizedFoodLogTime {
+  normalized: string;
+  hour12: number;
+  minute: number;
+  period: "AM" | "PM";
+}
+
+export interface DiaryFoodEntry {
+  meal: string;
+  name: string;
+  amount?: number;
+  unit?: string;
+  energyKcal?: number;
+}
 
 export interface NormalizedFoodLog {
   original: FoodLogInput;
@@ -13,9 +28,11 @@ export interface NormalizedFoodLog {
   date: string;
   amount?: number;
   unit?: string;
+  timestamp?: string;
   selectedName?: string;
   selectedSource?: string;
   idempotencyKey: string;
+  validationIssues: string[];
 }
 
 export interface FoodLogVerification {
@@ -32,12 +49,15 @@ export function normalizeFoodLogInput(input: FoodLogInput, timeZone: string, now
   const meal = normalizeFoodLogMeal(input.meal);
   const date = normalizeFoodLogDate(input.date, timeZone, now);
   const unit = normalizeFoodLogUnit(input.unit);
+  const timestamp = parseFoodLogTimestamp(input.timestamp)?.normalized;
+  const validationIssues = foodLogValidationIssues(input, { query, meal, date, unit, timestamp });
   const idempotencyKey = input.idempotencyKey?.trim() || foodLogIdempotencyKey({
     date,
     meal,
     query,
     amount: input.amount,
     unit,
+    timestamp,
     selectedName: input.selectedName,
     selectedSource: input.selectedSource,
   });
@@ -50,9 +70,11 @@ export function normalizeFoodLogInput(input: FoodLogInput, timeZone: string, now
     date,
     amount: input.amount,
     unit,
+    timestamp,
     selectedName: input.selectedName?.trim() || undefined,
     selectedSource: input.selectedSource?.trim() || undefined,
     idempotencyKey,
+    validationIssues,
   };
 }
 
@@ -61,8 +83,7 @@ export function normalizeFoodLogQuery(query: string) {
   const lower = value.toLowerCase();
   const asksForMilk = /\bmilk\b/.test(lower);
   const asksForOnePercent = /(^|\s)(1\s*%|1\s*percent|one\s*percent)(\s|$)/.test(lower);
-  const asksForLowfat = /\b(lowfat|low-fat|low fat)\b/.test(lower);
-  if (asksForMilk && (asksForOnePercent || asksForLowfat)) return "milk 1%";
+  if (asksForMilk && asksForOnePercent) return "milk 1%";
   return value;
 }
 
@@ -86,11 +107,15 @@ export function foodLogSearchQueries(normalizedQuery: string, originalQuery?: st
 
 export function normalizeFoodLogMeal(meal?: string) {
   const value = meal?.replace(/\s+/g, " ").trim();
-  if (!value) return DEFAULT_MEAL;
+  if (!value) return "";
   const lower = value.toLowerCase();
   if (lower === "snack") return "Snacks";
-  const match = KNOWN_MEALS.find((candidate) => candidate.toLowerCase() === lower);
+  const match = FOOD_LOG_MEALS.find((candidate) => candidate.toLowerCase() === lower);
   return match ?? value.replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+export function isKnownFoodLogMeal(meal: string): meal is FoodLogMeal {
+  return FOOD_LOG_MEALS.some((candidate) => candidate === meal);
 }
 
 export function normalizeFoodLogUnit(unit?: string) {
@@ -99,8 +124,18 @@ export function normalizeFoodLogUnit(unit?: string) {
   const lower = value.toLowerCase();
   if (/^(g|gram|grams|grammes)$/.test(lower)) return "g";
   if (/^(kg|kilogram|kilograms)$/.test(lower)) return "kg";
+  if (/^(mg|milligram|milligrams)$/.test(lower)) return "mg";
+  if (/^(mcg|ug|µg|μg|microgram|micrograms)$/.test(lower)) return "mcg";
   if (/^(ml|milliliter|milliliters|millilitre|millilitres)$/.test(lower)) return "ml";
+  if (/^(l|liter|liters|litre|litres)$/.test(lower)) return "l";
   if (/^(oz|ounce|ounces)$/.test(lower)) return "oz";
+  if (/^(lb|lbs|pound|pounds)$/.test(lower)) return "lb";
+  if (/^(tsp|teaspoon|teaspoons)$/.test(lower)) return "tsp";
+  if (/^(tbsp|tbs|tablespoon|tablespoons)$/.test(lower)) return "tbsp";
+  if (/^(cup|cups)$/.test(lower)) return "cup";
+  if (/^(serving|servings)$/.test(lower)) return "serving";
+  if (/^(piece|pieces)$/.test(lower)) return "piece";
+  if (/^(slice|slices)$/.test(lower)) return "slice";
   return value;
 }
 
@@ -113,6 +148,79 @@ export function normalizeFoodLogDate(date: string | undefined, timeZone: string,
   return value;
 }
 
+export function isValidFoodLogDate(value: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const [year, month, day] = value.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+}
+
+export function parseFoodLogTimestamp(timestamp?: string): NormalizedFoodLogTime | undefined {
+  const value = timestamp?.trim();
+  if (!value) return undefined;
+
+  const twelveHour = value.match(/^(0?[1-9]|1[0-2])(?::([0-5]\d))?\s*(AM|PM)$/i);
+  if (twelveHour) {
+    const hour12 = Number(twelveHour[1]);
+    const minute = Number(twelveHour[2] ?? "0");
+    const period = twelveHour[3].toUpperCase() as "AM" | "PM";
+    return {
+      normalized: `${hour12}:${String(minute).padStart(2, "0")} ${period}`,
+      hour12,
+      minute,
+      period,
+    };
+  }
+
+  const twentyFourHour = value.match(/^([01]?\d|2[0-3]):([0-5]\d)$/);
+  if (!twentyFourHour) return undefined;
+  const hour24 = Number(twentyFourHour[1]);
+  const minute = Number(twentyFourHour[2]);
+  const period = hour24 >= 12 ? "PM" : "AM";
+  const hour12 = hour24 % 12 || 12;
+  return {
+    normalized: `${String(hour24).padStart(2, "0")}:${String(minute).padStart(2, "0")}`,
+    hour12,
+    minute,
+    period,
+  };
+}
+
+export function foodLogValidationIssues(
+  input: FoodLogInput,
+  normalized = {
+    query: normalizeFoodLogQuery(input.query ?? ""),
+    meal: normalizeFoodLogMeal(input.meal),
+    date: input.date ?? "",
+    unit: normalizeFoodLogUnit(input.unit),
+    timestamp: parseFoodLogTimestamp(input.timestamp)?.normalized,
+  },
+) {
+  const issues: string[] = [];
+  if (!normalized.query) issues.push("Food query must not be blank.");
+  if (!isKnownFoodLogMeal(normalized.meal)) {
+    issues.push(`Unsupported meal ${JSON.stringify(normalized.meal)}. Use one of: ${FOOD_LOG_MEALS.join(", ")}.`);
+  }
+  if (!isValidFoodLogDate(normalized.date)) {
+    issues.push(`Invalid diary date ${JSON.stringify(normalized.date)}. Use YYYY-MM-DD, today, yesterday, or tomorrow.`);
+  }
+  if (input.amount !== undefined && (!Number.isFinite(input.amount) || input.amount <= 0)) {
+    issues.push("Food amount must be a finite number greater than zero.");
+  }
+  if (input.unit !== undefined && !normalized.unit) issues.push("Food unit must not be blank when provided.");
+  if (input.timestamp !== undefined && !normalized.timestamp) {
+    issues.push("Invalid food time. Use 24-hour HH:MM (for example 13:05) or 12-hour h:mm AM/PM (for example 1:05 PM).");
+  }
+  const matchPolicy = (input as { matchPolicy?: string }).matchPolicy;
+  if (matchPolicy !== undefined && matchPolicy !== "high_confidence" && matchPolicy !== "selected_only") {
+    issues.push(`Unsupported food match policy ${JSON.stringify(matchPolicy)}. Use high_confidence or selected_only.`);
+  }
+  if (matchPolicy === "selected_only" && !input.selectedName?.trim()) {
+    issues.push("selected_only match policy requires selectedName.");
+  }
+  return issues;
+}
+
 export function todayIsoInTimeZone(timeZone: string, now = new Date()) {
   return isoDateInTimeZone(timeZone, now);
 }
@@ -123,6 +231,7 @@ export function foodLogIdempotencyKey(input: {
   query: string;
   amount?: number;
   unit?: string;
+  timestamp?: string;
   selectedName?: string;
   selectedSource?: string;
 }) {
@@ -132,6 +241,7 @@ export function foodLogIdempotencyKey(input: {
     query: normalizeComparable(input.query),
     amount: input.amount ?? null,
     unit: normalizeComparable(input.unit ?? ""),
+    timestamp: input.timestamp ?? null,
     selectedName: normalizeComparable(input.selectedName ?? ""),
     selectedSource: normalizeComparable(input.selectedSource ?? ""),
   });
@@ -147,6 +257,7 @@ export function foodLogBatchIdempotencyKey(items: NormalizedFoodLog[]) {
       query: normalizeComparable(item.query),
       amount: item.amount ?? null,
       unit: normalizeComparable(item.unit ?? ""),
+      timestamp: item.timestamp ?? null,
       selectedName: normalizeComparable(item.selectedName ?? ""),
       selectedSource: normalizeComparable(item.selectedSource ?? ""),
     })),
@@ -174,6 +285,30 @@ export function verifyFoodLogInDiaryText(text: string, normalized: NormalizedFoo
   };
 }
 
+export function verifyFoodLogInDiaryEntries(entries: DiaryFoodEntry[], normalized: NormalizedFoodLog): FoodLogVerification {
+  const mealEntries = entries.filter((entry) => normalizeComparable(entry.meal) === normalizeComparable(normalized.meal));
+  const nameEntries = mealEntries.filter((entry) => foodEntryNameMatches(entry.name, normalized));
+  const amountEntries = normalized.amount === undefined
+    ? nameEntries
+    : nameEntries.filter((entry) => foodEntryAmountMatches(entry, normalized.amount!, normalized.unit));
+  const requestedUnit = normalized.unit;
+  const unitEntries = requestedUnit === undefined
+    ? amountEntries
+    : amountEntries.filter((entry) => foodEntryUnitMatches(entry, normalized.amount, requestedUnit));
+  const matchedMeal = mealEntries.length > 0 || entries.some((entry) => normalizeComparable(entry.meal) === normalizeComparable(normalized.meal));
+  const matchedFood = nameEntries.length > 0;
+  const matchedAmount = normalized.amount === undefined || amountEntries.length > 0;
+  const matchedUnit = normalized.unit === undefined || unitEntries.length > 0;
+  return {
+    status: matchedFood && matchedAmount && matchedUnit && matchedMeal ? "verified" : "not_verified",
+    matchedFood,
+    matchedAmount,
+    matchedUnit,
+    matchedMeal,
+    textSample: compactText(JSON.stringify(mealEntries.slice(0, 30)), 2500),
+  };
+}
+
 export function retryGuidanceForFoodLog(status: string) {
   if (status === "busy") return "The browser queue did not free up in time. Check cronometer_runtime_status, then retry once after the active job finishes.";
   if (status === "not_written_login_paused") return "Do not retry until the login cooldown expires or storage state is refreshed.";
@@ -194,9 +329,11 @@ export function foodLogBrowserPreflightData(normalized: NormalizedFoodLog) {
       date: normalized.date,
       amount: normalized.amount,
       unit: normalized.unit,
+      timestamp: normalized.timestamp,
       selectedName: normalized.selectedName,
       selectedSource: normalized.selectedSource,
       idempotencyKey: normalized.idempotencyKey,
+      validationIssues: normalized.validationIssues,
     },
   };
 }
@@ -240,14 +377,79 @@ function unitAliases(unit: string) {
   if (normalized === "oz") return ["ounce", "ounces"];
   if (normalized === "tsp") return ["teaspoon", "teaspoons"];
   if (normalized === "tbsp") return ["tablespoon", "tablespoons", "tbs"];
+  if (normalized === "l") return ["liter", "liters", "litre", "litres"];
+  if (normalized === "lb") return ["lbs", "pound", "pounds"];
+  if (normalized === "cup") return ["cups"];
+  if (normalized === "serving") return ["servings"];
+  if (normalized === "piece") return ["pieces"];
+  if (normalized === "slice") return ["slices"];
   return [];
+}
+
+function foodEntryNameMatches(name: string, normalized: NormalizedFoodLog) {
+  const actual = normalizeComparable(name);
+  const expected = normalizeComparable(normalized.selectedName ?? normalized.query);
+  if (actual === expected) return true;
+  if (normalized.query.toLowerCase() === "milk 1%") return actual.includes("milk") && /(^|\s)1(\s|$)/.test(actual);
+  return false;
+}
+
+function foodLogUnitsMatch(actual: string | undefined, expected: string) {
+  if (!actual) return false;
+  const actualDisplay = normalizeDiaryUnitDisplay(actual);
+  const expectedDisplay = normalizeDiaryUnitDisplay(expected);
+  const normalizedActual = normalizeFoodLogUnit(actualDisplay)?.toLowerCase();
+  const normalizedExpected = normalizeFoodLogUnit(expectedDisplay)?.toLowerCase();
+  if (normalizedActual === normalizedExpected) return true;
+  const expectedLabels = new Set([normalizedExpected, ...unitAliases(normalizedExpected ?? "")].map((value) => normalizeComparable(value ?? "")));
+  return expectedLabels.has(normalizeComparable(actualDisplay));
+}
+
+function foodEntryAmountMatches(entry: DiaryFoodEntry, requestedAmount: number, requestedUnit?: string) {
+  if (entry.amount === undefined) return false;
+  if (numbersMatch(entry.amount, requestedAmount)) return true;
+  const multiplier = requestedUnit ? measurePerDiaryUnit(entry.unit, requestedUnit) : undefined;
+  return multiplier !== undefined && numbersMatch(entry.amount * multiplier, requestedAmount);
+}
+
+function foodEntryUnitMatches(entry: DiaryFoodEntry, requestedAmount: number | undefined, requestedUnit: string) {
+  if (foodLogUnitsMatch(entry.unit, requestedUnit)) return true;
+  if (requestedAmount === undefined || entry.amount === undefined) return false;
+  const multiplier = measurePerDiaryUnit(entry.unit, requestedUnit);
+  return multiplier !== undefined && numbersMatch(entry.amount * multiplier, requestedAmount);
+}
+
+function measurePerDiaryUnit(actualUnit: string | undefined, requestedUnit: string) {
+  if (!actualUnit) return undefined;
+  const baseUnit = normalizeFoodLogUnit(requestedUnit)?.toLowerCase();
+  if (!baseUnit || !["g", "ml", "mg", "mcg"].includes(baseUnit)) return undefined;
+  const escapedUnit = baseUnit === "mcg" ? "(?:mcg|ug|µg|μg)" : baseUnit;
+  const display = normalizeDiaryUnitDisplay(actualUnit);
+  const patterns = [
+    new RegExp(`^(?:×\\s*)?([0-9]+(?:\\.[0-9]+)?)\\s*${escapedUnit}$`, "i"),
+    new RegExp(`[—-]\\s*([0-9]+(?:\\.[0-9]+)?)\\s*${escapedUnit}\\b`, "i"),
+    new RegExp(`\\(\\s*([0-9]+(?:\\.[0-9]+)?)\\s*${escapedUnit}\\s*\\)`, "i"),
+  ];
+  for (const pattern of patterns) {
+    const match = display.match(pattern);
+    if (match?.[1]) return Number(match[1]);
+  }
+  return undefined;
+}
+
+function normalizeDiaryUnitDisplay(value: string) {
+  return value.replace(/^×\s*/, "").replace(/\s+/g, " ").trim();
+}
+
+function numbersMatch(actual: number, expected: number) {
+  return Math.abs(actual - expected) <= Math.max(0.000001, Math.abs(expected) * 0.000001);
 }
 
 function diaryMealSectionText(text: string, meal: string) {
   const lines = text.split(/\r?\n/);
   const mealIndex = lines.findIndex((line) => normalizeComparable(line) === normalizeComparable(meal));
   if (mealIndex < 0) return "";
-  const knownMealLabels = new Set([...KNOWN_MEALS.map((value) => normalizeComparable(value)), "health"]);
+  const knownMealLabels = new Set([...FOOD_LOG_MEALS.map((value) => normalizeComparable(value)), "health"]);
   let endIndex = lines.length;
   for (let index = mealIndex + 1; index < lines.length; index += 1) {
     const line = normalizeComparable(lines[index]);

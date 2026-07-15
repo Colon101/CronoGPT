@@ -1,7 +1,9 @@
 import { createServer } from "node:http";
 import { handleMcpHttpRequest, MCP_PATH } from "./mcp.js";
+import { validateRuntimeConfiguration } from "./runtime-config.js";
 
-const port = Number(process.env.PORT ?? 8787);
+validateRuntimeConfiguration();
+const port = parsePort(process.env.PORT);
 const host = process.env.HOST ?? (process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1");
 
 const server = createServer((req, res) => {
@@ -32,4 +34,14 @@ function hasValidRequestUrl(requestUrl: string | undefined, hostHeader: string |
   } catch {
     return false;
   }
+}
+
+export function parsePort(value: string | undefined) {
+  const normalized = value?.trim() || "8787";
+  if (!/^\d+$/.test(normalized)) throw new Error(`PORT must be an integer from 1 to 65535; received ${JSON.stringify(value)}.`);
+  const port = Number(normalized);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`PORT must be an integer from 1 to 65535; received ${JSON.stringify(value)}.`);
+  }
+  return port;
 }
