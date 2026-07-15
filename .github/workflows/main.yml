@@ -1,4 +1,4 @@
-name: Main
+name: OCI Production
 
 on:
   push:
@@ -38,7 +38,7 @@ jobs:
       group: oracle-production
       cancel-in-progress: false
     environment:
-      name: production
+      name: oracle-production
       url: https://cronogpt.129-159-156-186.sslip.io/mcp
     env:
       ORACLE_HOST: 129.159.156.186

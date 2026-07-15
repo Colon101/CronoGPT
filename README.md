@@ -57,7 +57,7 @@ The active hosted app is a single private Oracle Always Free A1 VM running Docke
 https://cronogpt.129-159-156-186.sslip.io/mcp
 ```
 
-The old Render connector is no longer the active app. The Render blueprint was removed so future deploys do not drift back to `https://cronogpt.onrender.com/mcp`.
+Oracle Cloud Infrastructure is the only supported hosted deployment target for this repository.
 
 See `deploy/oracle/README.md`. The short path is:
 

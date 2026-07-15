@@ -27,9 +27,10 @@ https://cronogpt.129-159-156-186.sslip.io/mcp
 
 ## Main Branch Deployment Contract
 
-Production is deployed by GitHub Actions from `main`. Future agents should push
-changes to `main` to test the production deployment path. The `Main` workflow
-builds, runs tests, deploys the exact pushed commit to the Oracle VM with
+Production is deployed exclusively to Oracle Cloud Infrastructure by GitHub
+Actions from `main`. Future agents should push changes to `main` to test the
+production deployment path. The `OCI Production` workflow builds, runs tests,
+deploys the exact pushed commit to the Oracle VM with
 `npm run oracle:deploy`, then runs `npm run smoke:oracle` against the public
 Oracle URL.
 
@@ -50,16 +51,11 @@ The deploy script preserves existing values from
 provided by GitHub Actions. This keeps routine deployments from requiring
 Cronometer credentials in GitHub.
 
-Vercel is not the production deploy target for this repo. `vercel.json` tells
-Vercel Git integration to skip builds so stale Vercel projects do not create
-misleading deployments.
-
 Current ChatGPT connector:
 
 - App name: `cronogpt`
 - App ID: `asdk_app_6a2811e26a8481918d4596e042f50718`
 - Status checked in Chrome on 2026-06-09: connected with OAuth
-- Old Render connector `https://cronogpt.onrender.com/mcp`: deleted from ChatGPT app settings
 
 High-level flow:
 

@@ -3046,7 +3046,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     if (!emailInput || !passwordInput) {
       const loginText = compactText(await this.visibleText(page).catch(() => ""), 2000);
       if (await this.isLoggedIn(page, loginText)) return;
-      const reason = `Cronometer login form did not render expected fields. Visible text: ${loginText}`;
+      const reason = `Cronometer login form did not show expected fields. Visible text: ${loginText}`;
       this.pauseLoginAttempts(reason);
       throw new Error(reason);
     }
