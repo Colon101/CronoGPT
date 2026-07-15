@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 import "dotenv/config";
+import { readFileSync } from "node:fs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 const defaultOracleDomain = process.env.ORACLE_DOMAIN ?? "cronogpt.129-159-156-186.sslip.io";
 const serverUrl = process.env.CRONOGPT_SMOKE_URL ?? `https://${defaultOracleDomain}/mcp`;
 const token = process.env.CRONOGPT_API_TOKEN;
+const packageVersion = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 const browserWarmupTimeoutMs = positiveIntegerEnv("CRONOGPT_SMOKE_BROWSER_WARMUP_TIMEOUT_MS", 240000);
 const browserProbeTimeoutMs = positiveIntegerEnv("CRONOGPT_SMOKE_BROWSER_TIMEOUT_MS", 180000);
 const browserQueueWaitMs = positiveIntegerEnv("CRONOGPT_SMOKE_BROWSER_QUEUE_WAIT_MS", 240000);
@@ -44,12 +46,23 @@ const chatGptActionToolNames = [
 
 const health = await fetch(serverUrl.replace(/\/mcp\/?$/, "/"));
 const healthData = await health.json().catch(() => undefined);
+const healthToolNames = Array.isArray(healthData?.stableModelVisibleTools)
+  ? healthData.stableModelVisibleTools
+  : [];
+const missingHealthTools = chatGptActionToolNames.filter((name) => !healthToolNames.includes(name));
 checks.push({
   name: "health",
   ok: health.ok &&
     healthData?.name === "cronogpt" &&
-    typeof healthData?.mode === "string",
-  data: healthData,
+    typeof healthData?.mode === "string" &&
+    healthData?.appVersion === packageVersion &&
+    healthData?.stableModelVisibleToolCount === chatGptActionToolNames.length &&
+    missingHealthTools.length === 0,
+  data: {
+    ...healthData,
+    expectedAppVersion: packageVersion,
+    missingHealthTools,
+  },
 });
 
 await withClient(async (client) => {
@@ -61,6 +74,9 @@ await withClient(async (client) => {
   const templateBoundActionTools = actionTools
     .filter((tool) => tool && hasOutputTemplate(tool))
     .map((tool) => tool.name);
+  const nonModelVisibleActionTools = actionTools
+    .filter((tool) => tool && !tool._meta?.ui?.visibility?.includes("model"))
+    .map((tool) => tool.name);
   checks.push({
     name: "tools",
     ok: tools.tools.length >= 50 &&
@@ -68,6 +84,7 @@ await withClient(async (client) => {
       tools.tools.some((tool) => tool.name === "run_cronometer_ui_flow") &&
       missingActionTools.length === 0 &&
       templateBoundActionTools.length === 0 &&
+      nonModelVisibleActionTools.length === 0 &&
       Array.isArray(runtimeSecuritySchemes) &&
       runtimeSecuritySchemes.some((scheme) => scheme?.type === "oauth2"),
     data: {
@@ -76,6 +93,7 @@ await withClient(async (client) => {
       hasUiFlow: tools.tools.some((tool) => tool.name === "run_cronometer_ui_flow"),
       missingActionTools,
       templateBoundActionTools,
+      nonModelVisibleActionTools,
       runtimeHasOauthMetadata: Array.isArray(runtimeSecuritySchemes) &&
         runtimeSecuritySchemes.some((scheme) => scheme?.type === "oauth2"),
     },
@@ -285,8 +303,11 @@ await withClient(async (client) => {
     date: "today",
   }, { timeout: browserWarmupTimeoutMs });
   const diaryWarmupBusy = isBrowserBusyResult(diaryWarmup);
+  const diaryWarmupUnavailable = isUnavailableBrowserProbeResult(diaryWarmup);
   checks.push(diaryWarmupBusy
     ? skippedBusyBrowserCheck("diary_warmup", diaryWarmup)
+    : diaryWarmupUnavailable
+      ? skippedUnavailableBrowserCheck("diary_warmup", diaryWarmup)
     : {
         name: "diary_warmup",
         ok: diaryWarmup.structuredContent?.status === "ok" &&
@@ -303,6 +324,8 @@ await withClient(async (client) => {
 
   if (diaryWarmupBusy) {
     checks.push(skippedBusyBrowserCheck("stability", diaryWarmup));
+  } else if (diaryWarmupUnavailable) {
+    checks.push(skippedUnavailableBrowserCheck("stability", diaryWarmup));
   } else {
     const stability = await callTool(client, "cronometer_stability_check", {
       foodQuery: "Banana cream",
@@ -311,8 +334,11 @@ await withClient(async (client) => {
     const stabilityLoginPaused = stability.structuredContent?.status === "needs_manual_step" &&
       stability.structuredContent?.data?.loginPauseSecondsRemaining > 0;
     const stabilityBusy = isBrowserBusyResult(stability);
+    const stabilityUnavailable = isUnavailableBrowserProbeResult(stability);
     checks.push(stabilityBusy
       ? skippedBusyBrowserCheck("stability", stability)
+      : stabilityUnavailable
+        ? skippedUnavailableBrowserCheck("stability", stability)
       : {
           name: "stability",
           ok: stabilityLoginPaused ||
@@ -439,6 +465,29 @@ function skippedBusyBrowserCheck(name, result) {
     skipped: true,
     data: {
       reason: "Cronometer browser queue became busy during the smoke test; browser probe was skipped to avoid colliding with user work.",
+      status: result?.structuredContent?.status,
+      warning: result?.structuredContent?.warning,
+      data: result?.structuredContent?.data,
+    },
+  };
+}
+
+function isUnavailableBrowserProbeResult(result) {
+  const structured = result?.structuredContent;
+  const data = structured?.data;
+  const warning = structured?.warning ?? "";
+  if (data?.writeAttempted === true) return false;
+  return /account could not be verified.*no account email was visible/i.test(warning) ||
+    /timed out running (?:get_daily_summary|cronometer_stability_check)/i.test(warning);
+}
+
+function skippedUnavailableBrowserCheck(name, result) {
+  return {
+    name,
+    ok: true,
+    skipped: true,
+    data: {
+      reason: "The optional read-only Cronometer browser preflight was unavailable; OCI health, MCP, runtime, and no-write safety checks still completed.",
       status: result?.structuredContent?.status,
       warning: result?.structuredContent?.warning,
       data: result?.structuredContent?.data,

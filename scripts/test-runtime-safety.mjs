@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -12,7 +12,7 @@ import {
   __setActiveBrowserJobForTests,
   releaseAndSnapshotBrowserQueue,
 } from "../dist/providers/browser.js";
-import { createCronoServer, STABLE_MODEL_VISIBLE_TOOLS } from "../dist/mcp.js";
+import { createCronoServer, MCP_SERVER_VERSION, STABLE_MODEL_VISIBLE_TOOLS } from "../dist/mcp.js";
 import { capabilitiesForMode } from "../dist/features.js";
 import { toMcpToolResponse } from "../dist/tool-response.js";
 import { runCooldownCommand } from "./cronometer-login-cooldown.mjs";
@@ -22,6 +22,9 @@ const cooldownFile = join(tempDir, "cooldown.json");
 const fixedNow = Date.parse("2200-05-18T03:33:20.000Z");
 
 try {
+  const packageVersion = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+  assert.equal(MCP_SERVER_VERSION, packageVersion, "MCP server identity must change whenever the app package version changes");
+
   let status = runCooldown(["status"]);
   assert.equal(status.active, false);
   assert.equal(status.filePath, cooldownFile);
@@ -68,7 +71,22 @@ try {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await scopedServer.connect(serverTransport);
   await scopedClient.connect(clientTransport);
+  assert.equal(scopedClient.getServerVersion()?.version, MCP_SERVER_VERSION);
   const listedTools = await scopedClient.listTools();
+  for (const toolName of STABLE_MODEL_VISIBLE_TOOLS) {
+    const tool = listedTools.tools.find((candidate) => candidate.name === toolName);
+    assert.ok(tool, `${toolName} must be present in tools/list`);
+    assert.deepEqual(tool._meta?.ui?.visibility, ["model"], `${toolName} must be explicitly model-visible`);
+  }
+  const ensureRecipeTool = listedTools.tools.find((tool) => tool.name === "ensure_private_recipe");
+  assert.ok(ensureRecipeTool?.inputSchema?.required?.includes("name"));
+  assert.ok(ensureRecipeTool?.inputSchema?.required?.includes("ingredients"));
+  assert.match(ensureRecipeTool?.description ?? "", /preferred recipe-writing workflow/i);
+  const resolveRecipeTool = listedTools.tools.find((tool) => tool.name === "resolve_recipe_ingredients");
+  assert.match(resolveRecipeTool?.description ?? "", /ensure_private_recipe/);
+  assert.doesNotMatch(resolveRecipeTool?.description ?? "", /\bcreate_recipe\b/);
+  const appOnlyCreateRecipeTool = listedTools.tools.find((tool) => tool.name === "create_recipe");
+  assert.deepEqual(appOnlyCreateRecipeTool?._meta?.ui?.visibility, ["app"]);
   const preferredCustomFoodTool = listedTools.tools.find((tool) => tool.name === "create_and_log_custom_food");
   assert.ok(preferredCustomFoodTool);
   assert.match(preferredCustomFoodTool.description ?? "", /preferred one-call workflow/i);

@@ -93,6 +93,7 @@ const foodTimestampInputSchema = z.string()
   .describe("Optional exact food time as 24-hour HH:MM (13:05) or 12-hour h:mm AM/PM (1:05 PM). Ambiguous values such as '1' are rejected.");
 
 export const MCP_PATH = "/mcp";
+export const MCP_SERVER_VERSION = "0.1.5";
 const readToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read"] }];
 const writeToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read", "cronometer:write"] }];
 export const STABLE_MODEL_VISIBLE_TOOLS = [
@@ -135,7 +136,7 @@ const MCP_SERVER_INSTRUCTIONS = [
 
 export function createCronoServer(options: { grantedScopes?: readonly string[] } = {}) {
   const server = new McpServer(
-    { name: "cronogpt", version: "0.1.4" },
+    { name: "cronogpt", version: MCP_SERVER_VERSION },
     { instructions: MCP_SERVER_INSTRUCTIONS },
   );
 
@@ -187,6 +188,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
       annotations,
       _meta: {
         securitySchemes,
+        ui: { visibility: ["model"] },
         "openai/toolInvocation/invoking": "Running Cronometer tool...",
         "openai/toolInvocation/invoked": "Cronometer tool complete.",
       },
@@ -561,7 +563,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
   register(
     "resolve_recipe_ingredients",
     "Resolve recipe ingredients",
-    "Optionally searches the bounded Cronometer food database for each recipe ingredient when the user wants to review exact food/source choices before creating a private custom Cronometer recipe. For a small straightforward recipe, create_recipe can be called directly with ingredient query, amount, unit, confirmed=true, and dryRun=false.",
+    "Optionally searches the bounded Cronometer food database for each recipe ingredient when the user wants to review exact food/source choices before ensuring a private custom Cronometer recipe. For a small straightforward recipe, ensure_private_recipe can be called directly with ingredient query, amount, unit, confirmed=true, and dryRun=false.",
     {
       recipeName: z.string().optional(),
       ingredients: z.array(
@@ -930,7 +932,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
   register(
     "ensure_private_recipe",
     "Ensure private recipe",
-    "Idempotently ensures one private custom Cronometer recipe exists in the authenticated user's account. If an exact recipe name already exists, it returns that private recipe summary without writing; otherwise it creates and verifies the private recipe after user confirmation. It does not publish, send, share, or write outside that private Cronometer account.",
+    "Preferred recipe-writing workflow. Idempotently ensures one private custom Cronometer recipe exists in the authenticated user's account. If an exact recipe name already exists, it returns that private recipe summary without writing; otherwise it creates and verifies the private recipe after user confirmation. Dry-run or unconfirmed calls return a browser-free creation preview. It does not publish, send, share, or write outside that private Cronometer account.",
     {
       name: z.string().min(1),
       ingredients: z.array(
@@ -951,22 +953,59 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     async (args) => {
+      if (args.dryRun === true || args.confirmed !== true) {
+        const preview = await provider.createRecipe({
+          ...args,
+          dryRun: true,
+          confirmed: false,
+        } as never);
+        return toMcpToolResponse({
+          ...preview,
+          feature: "ensure_private_recipe",
+          data: {
+            ...(preview.data && typeof preview.data === "object" ? preview.data as Record<string, unknown> : {}),
+            stage: "preview",
+            existed: false,
+            created: false,
+          },
+        });
+      }
+
       const name = String(args.name);
-      const existing = await provider.listCustomRecipes({ query: name, includeDetails: true, maxDetails: 1 });
-      const existingData = (existing.data ?? {}) as { recipes?: unknown };
-      const exactRecipe = Array.isArray(existingData.recipes)
+      const existing = await provider.listCustomRecipes({ query: name, includeDetails: false, maxDetails: 0 });
+      const existingData = (existing.data ?? {}) as { names?: unknown; recipes?: unknown };
+      if (existing.status !== "ok") {
+        return toMcpToolResponse({
+          ...existing,
+          feature: "ensure_private_recipe",
+          warning: existing.warning ?? "Could not verify the existing private recipe names, so no recipe creation was attempted.",
+          data: {
+            ...(existing.data && typeof existing.data === "object" ? existing.data as Record<string, unknown> : {}),
+            stage: "lookup",
+            existed: undefined,
+            created: false,
+          },
+        });
+      }
+
+      const exactRecipeFromSummaries = Array.isArray(existingData.recipes)
         ? existingData.recipes.find((recipe) => {
           const value = recipe && typeof recipe === "object" ? recipe as Record<string, unknown> : {};
           return typeof value.name === "string" && value.name.trim().toLowerCase() === name.trim().toLowerCase();
         })
         : undefined;
+      const exactName = Array.isArray(existingData.names)
+        ? existingData.names.find((candidate): candidate is string =>
+          typeof candidate === "string" && candidate.trim().toLowerCase() === name.trim().toLowerCase())
+        : undefined;
+      const exactRecipe = exactRecipeFromSummaries ?? (exactName ? { name: exactName } : undefined);
 
       if (exactRecipe) {
         return toMcpToolResponse({
           provider: existing.provider,
           mode: existing.mode,
           feature: "ensure_private_recipe",
-          status: "ok",
+          status: "already_exists",
           data: {
             existed: true,
             created: false,
@@ -982,7 +1021,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
         data: {
           ...(created.data && typeof created.data === "object" ? created.data as Record<string, unknown> : {}),
           existed: false,
-          created: created.status === "ok",
+          created: ["ok", "written", "already_exists"].includes(created.status),
         },
       });
     },
@@ -1367,10 +1406,12 @@ export async function handleMcpHttpRequest(req: IncomingMessage, res: ServerResp
         mcp: MCP_PATH,
         authConfigured: Boolean(getAuthToken()),
         publicOrigin: process.env.APP_PUBLIC_ORIGIN,
+        appVersion: MCP_SERVER_VERSION,
         gitCommit: process.env.CRONOGPT_GIT_COMMIT,
         buildTimestamp: process.env.CRONOGPT_BUILD_TIMESTAMP,
         stableToolSurface: process.env.CRONOGPT_FULL_TOOL_SURFACE !== "true",
         stableModelVisibleTools: STABLE_MODEL_VISIBLE_TOOLS,
+        stableModelVisibleToolCount: STABLE_MODEL_VISIBLE_TOOLS.length,
       }));
     return;
   }

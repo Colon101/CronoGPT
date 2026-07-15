@@ -104,7 +104,7 @@ export class BaseCronometerProvider implements CronometerProvider {
     return this.result("resolve_recipe_ingredients", "dry_run", {
       recipeName: input.recipeName,
       resolved,
-      nextStep: "Pick the matching Cronometer food for each ingredient, then call create_recipe with confirmed=true when ready to write.",
+      nextStep: "Pick the matching Cronometer food for each ingredient, then call ensure_private_recipe with confirmed=true when ready to write.",
     });
   }
 
