@@ -21,6 +21,10 @@ const barcodeData = `20${stamp.slice(-10)}`;
 const barcode = `${barcodeData}${gtinCheckDigit(barcodeData)}`;
 const meal = "Lunch";
 const date = "today";
+const portions = [
+  { name: "crisp", weightGrams: 10 },
+  { name: "bag", weightGrams: 100 },
+];
 const nutrients = {
   calories: 12,
   protein_g: 1.2,
@@ -40,14 +44,14 @@ let customFoodPresent = false;
 try {
   const createAndLog = await provider.createAndLogCustomFood({
     name: foodName,
-    servingSize: "1 serving",
+    servingSize: "1 g",
+    portions,
     nutrients,
     barcode,
     duplicatePolicy: "update_existing",
     date,
     meal,
-    amount: 1,
-    unit: "serving",
+    portion: { kind: "whole_package", portion: portions[1] },
     nutritionSource: "cronogpt deterministic live smoke fixture",
     confirmed: true,
     dryRun: false,
@@ -74,6 +78,34 @@ try {
   if (!Array.isArray(createdTarget.barcodes) || !createdTarget.barcodes.includes(barcode)) {
     throw new Error(`The custom food did not read back barcode ${barcode}.`);
   }
+  if (!Array.isArray(createdTarget.portions)
+    || portions.some((expected) => !createdTarget.portions.some((actual) => actual?.name === expected.name && actual?.weightGrams === expected.weightGrams))) {
+    throw new Error(`The custom food did not read back all requested portions: ${JSON.stringify(createdTarget.portions)}.`);
+  }
+  if (createdTarget.servingSize !== "1 g") {
+    throw new Error(`The custom food base serving was ${JSON.stringify(createdTarget.servingSize)}, expected 1 g.`);
+  }
+
+  const replay = await provider.createAndLogCustomFood({
+    name: foodName,
+    servingSize: "1 g",
+    portions,
+    nutrients,
+    barcode,
+    duplicatePolicy: "update_existing",
+    date,
+    meal,
+    portion: { kind: "whole_package", portion: portions[1] },
+    nutritionSource: "cronogpt deterministic live smoke fixture",
+    confirmed: true,
+    dryRun: false,
+    waitForCompletionSeconds: 600,
+  });
+  emit("replay", replay);
+  if (replay.status !== "written") throw new Error(`Identical replay returned ${replay.status}.`);
+  const diaryAfterReplay = await provider.listFoodEntries({ date });
+  const matchingAfterReplay = exactDiaryEntries(diaryAfterReplay, foodName, meal);
+  if (matchingAfterReplay.length !== 1) throw new Error(`Identical replay changed the exact diary row count to ${matchingAfterReplay.length}.`);
 
   const deleteDiary = await provider.deleteDiaryFoodEntry({
     date,
@@ -176,9 +208,13 @@ async function bestEffortCleanup() {
 }
 
 function exactDiaryEntry(result, name, requestedMeal) {
+  return exactDiaryEntries(result, name, requestedMeal)[0];
+}
+
+function exactDiaryEntries(result, name, requestedMeal) {
   const data = dataObject(result);
   const entries = Array.isArray(data.entries) ? data.entries : [];
-  return entries.find((entry) => entry && typeof entry === "object" && entry.name === name && entry.meal === requestedMeal);
+  return entries.filter((entry) => entry && typeof entry === "object" && entry.name === name && entry.meal === requestedMeal);
 }
 
 function exactCustomFoodTarget(result, name) {
