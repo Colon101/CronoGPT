@@ -9,6 +9,7 @@ import {
   foodSearchTabAttempts,
   parseFoodSearchResults,
   parseCustomRecipeIngredientTables,
+  parseCustomFoodServingTables,
   parseServingSize,
   rankFoodResults,
   recipeIngredientAmountMatches,
@@ -167,6 +168,23 @@ assert.deepEqual(parseServingSize("12 micrograms"), { amount: 12, amountText: "1
 assert.equal(parseServingSize("serving"), undefined);
 assert.equal(servingSizeRowMatches("1 serving", "1", "serving"), true);
 assert.equal(servingSizeRowMatches("250 milliliters", "250", "ml"), true);
+
+const servingTableFixture = parseCustomFoodServingTables([[
+  ["#", "Measure", "Grams", ""],
+  ["1", "g", "n/a", ""],
+  ["1", "crisp", "42.5", ""],
+  ["1", "bag", "130", "remove"],
+]]);
+assert.equal(servingTableFixture.tableFound, true);
+assert.deepEqual(servingTableFixture.rows, [
+  { amount: 1, amountText: "1", measure: "g", grams: undefined, gramsText: "n/a" },
+  { amount: 1, amountText: "1", measure: "crisp", grams: 42.5, gramsText: "42.5" },
+  { amount: 1, amountText: "1", measure: "bag", grams: 130, gramsText: "130" },
+]);
+assert.equal(parseCustomFoodServingTables([[['#', 'Measure', 'Grams', '']], [['#', 'Measure', 'Grams', '']]]).ambiguous, true);
+assert.deepEqual(parseCustomFoodServingTables([[['#', 'Measure', 'Grams', ''], ['1', 'crisp', 'n/a', '']]]).rows[0], {
+  amount: 1, amountText: '1', measure: 'crisp', grams: undefined, gramsText: 'n/a',
+});
 
 const gramPortionPreview = customFoodServingPreview({
   portions: [{ name: " bag ", weightGrams: 130 }, { name: "piece", weightGrams: 10 }],

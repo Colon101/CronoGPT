@@ -13,6 +13,7 @@ import type {
   CustomFoodSelectorInput,
   CustomFoodUpdateInput,
   CustomRecipeSelectorInput,
+  FoodPortionDefinition,
   DateRangeInput,
   DiaryFoodDeleteInput,
   ExerciseLogInput,
@@ -34,6 +35,7 @@ import type {
   UiFlowInput,
   UiFlowStep,
 } from "../domain.js";
+import { customFoodServingPreview } from "../domain.js";
 import { BaseCronometerProvider } from "./base.js";
 import { capabilitiesForMode } from "../features.js";
 import { compareStringsOrdinal, isoDateInTimeZone, stableJson } from "../determinism.js";
@@ -127,6 +129,7 @@ interface CustomFoodDetail {
   listIndex?: number;
   occurrence?: number;
   servingSize?: string;
+  portions?: FoodPortionDefinition[];
   barcodes?: string[];
   energy?: { value: number; unit: string };
   macros?: Record<string, { value: number; unit: string }>;
@@ -1588,6 +1591,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       const backgroundKey = backgroundBrowserJobKey("create_custom_food", {
         name: normalizedInput.name,
         servingSize: normalizedInput.servingSize,
+        portions: normalizedInput.portions,
         nutrients: normalizedInput.nutrients,
         barcode: normalizedInput.barcode,
         duplicatePolicy: normalizedInput.duplicatePolicy ?? "update_existing",
@@ -1684,7 +1688,8 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
     await page.waitForTimeout(1200);
     const nameFilled = await fillCustomFoodName(page, input.name);
-    const serving = await fillCustomFoodServing(page, input.servingSize);
+    const servingPreview = customFoodServingPreview(input);
+    const serving = await fillCustomFoodServing(page, servingPreview.servingSize, servingPreview.portions);
     const barcode = input.barcode ? await fillCustomFoodBarcode(page, input.barcode) : undefined;
     traceStep("basics_filled", { nameFilled, servingWarning: serving.warning, barcodeStatus: barcode?.status });
     const nutrients = await fillCustomFoodNutrients(page, input.nutrients ?? {});
@@ -1737,7 +1742,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     if (confirmationClicked) await page.waitForTimeout(1300);
     const afterSaveText = compactText(await this.visibleText(page).catch(() => ""), 12000);
     const finalDetail = await extractCustomFoodDetail(page);
-    const verification = verifyCustomFoodWrite(finalDetail, input);
+    const verification = verifyCustomFoodWrite(finalDetail, input, openedExisting ? existing.targets[0]?.foodId : undefined);
     await page.waitForTimeout(900);
     await this.openApp(page, "#custom-foods");
     const listText = await this.visibleText(page);
@@ -1824,6 +1829,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     const customFoodInput: CustomFoodInput & { confirmed?: boolean } = {
       name: normalizedInput.name,
       servingSize: normalizedInput.servingSize,
+      portions: normalizedInput.portions,
       nutrients: normalizedInput.nutrients,
       barcode: normalizedInput.barcode,
       duplicatePolicy: normalizedInput.duplicatePolicy ?? "update_existing",
@@ -1848,6 +1854,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     const backgroundKey = backgroundBrowserJobKey("create_and_log_custom_food", {
       name: normalizedInput.name,
       servingSize: normalizedInput.servingSize,
+      portions: normalizedInput.portions,
       nutrients: normalizedInput.nutrients,
       barcode: normalizedInput.barcode,
       duplicatePolicy: customFoodInput.duplicatePolicy,
@@ -1928,6 +1935,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         name: normalizedInput.name,
         newName: normalizedInput.newName,
         servingSize: normalizedInput.servingSize,
+        portions: normalizedInput.portions,
         nutrients: normalizedInput.nutrients,
         barcode: normalizedInput.barcode,
       });
@@ -1986,7 +1994,10 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       }
 
       const nameFilled = input.newName ? await fillCustomFoodName(page, input.newName) : true;
-      const serving = input.servingSize ? await fillCustomFoodServing(page, input.servingSize) : undefined;
+      const servingPreview = customFoodServingPreview(input);
+      const serving = input.servingSize !== undefined || input.portions !== undefined
+        ? await fillCustomFoodServing(page, servingPreview.servingSize, servingPreview.portions)
+        : undefined;
       const barcode = input.barcode ? await fillCustomFoodBarcode(page, input.barcode) : undefined;
       const nutrients = input.nutrients ? await fillCustomFoodNutrients(page, input.nutrients) : [];
       const formIssues = [
@@ -2030,10 +2041,11 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       const verificationInput: CustomFoodInput = {
         name: input.newName ?? before.name,
         servingSize: input.servingSize,
+        portions: input.portions,
         nutrients: input.nutrients,
         barcode: input.barcode,
       };
-      const verification = verifyCustomFoodWrite(finalDetail, verificationInput);
+      const verification = verifyCustomFoodWrite(finalDetail, verificationInput, before.foodId);
       return this.result("update_custom_food", verification.verified ? "ok" : "possibly_written_verify_failed", {
         updated: verification.verified,
         possiblyUpdated: !verification.verified,
@@ -6387,35 +6399,6 @@ async function fillCustomFoodBarcode(page: Page, requestedBarcode: string) {
   };
 }
 
-async function fillCustomFoodServing(page: Page, servingSize?: string) {
-  const parsed = parseServingSize(servingSize);
-  const result = {
-    requested: servingSize,
-    parsed,
-    amountFilled: false,
-    measureFilled: false,
-    warning: undefined as string | undefined,
-  };
-
-  if (!parsed) {
-    result.warning = servingSize ? "Could not parse servingSize. Expected values like '100 g'." : undefined;
-    return result;
-  }
-
-  result.amountFilled = await fillServingSizeCell(page, 0, parsed.amountText);
-  result.measureFilled = await fillServingSizeCell(page, 1, parsed.unit);
-
-  const rowText = await servingSizeRowText(page);
-  if (
-    !result.amountFilled ||
-    !result.measureFilled ||
-    !servingSizeRowMatches(rowText, parsed.amountText, parsed.unit)
-  ) {
-    result.warning = "Could not verify Cronometer serving size row after editing.";
-  }
-  return result;
-}
-
 export function parseServingSize(value?: string) {
   const match = value?.trim().match(/^([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z][a-zA-Z ]{0,40}|µg|mcg|mL|ml|oz|fl oz)$/i);
   if (!match) return undefined;
@@ -6431,22 +6414,9 @@ export function normalizeServingUnit(unit: string) {
   if (!normalized) return undefined;
   const lower = normalized.toLowerCase();
   const aliases: Record<string, string> = {
-    gram: "g",
-    grams: "g",
-    milligram: "mg",
-    milligrams: "mg",
-    microgram: "mcg",
-    micrograms: "mcg",
-    ug: "mcg",
-    "µg": "mcg",
-    milliliter: "ml",
-    milliliters: "ml",
-    millilitre: "ml",
-    millilitres: "ml",
-    ounce: "oz",
-    ounces: "oz",
-    serving: "serving",
-    servings: "serving",
+    gram: "g", grams: "g", milligram: "mg", milligrams: "mg", microgram: "mcg", micrograms: "mcg",
+    ug: "mcg", "µg": "mcg", milliliter: "ml", milliliters: "ml", millilitre: "ml", millilitres: "ml",
+    ounce: "oz", ounces: "oz", serving: "serving", servings: "serving",
   };
   return aliases[lower] ?? normalized;
 }
@@ -6469,75 +6439,214 @@ export function servingUnitAliases(unit: string) {
   return [];
 }
 
-async function fillServingSizeCell(page: Page, cellIndex: number, value: string) {
-  await scrollServingSizeRowIntoView(page);
+async function fillCustomFoodServing(page: Page, servingSize?: string, portions: FoodPortionDefinition[] = []) {
+  const parsed = parseServingSize(servingSize);
+  const expectedRows = parsed
+    ? [
+        { amount: parsed.amount, amountText: parsed.amountText, measure: parsed.unit, grams: parsed.unit.toLowerCase() === "g" ? undefined : undefined },
+        ...portions.map((portion) => ({ amount: 1, amountText: "1", measure: portion.name, grams: portion.weightGrams })),
+      ]
+    : [];
+  const result = {
+    requested: servingSize,
+    parsed,
+    requestedPortions: portions,
+    expectedRows,
+    actualRows: [] as CustomFoodServingRow[],
+    amountFilled: false,
+    measureFilled: false,
+    verified: false,
+    warning: undefined as string | undefined,
+  };
+
+  if (!parsed) {
+    result.warning = servingSize ? "Could not parse servingSize. Expected values like '100 g'." : undefined;
+    return result;
+  }
+
+  const initial = await customFoodServingTableSnapshot(page);
+  if (!initial.tableFound) {
+    result.warning = "Could not uniquely identify Cronometer's serving-size table by its #, Measure, and Grams headers.";
+    return result;
+  }
+
+  let snapshot = await customFoodServingTableSnapshot(page);
+  while (snapshot.rows.length < expectedRows.length) {
+    const beforeCount = snapshot.rows.length;
+    if (!await addCustomFoodServingRow(page, beforeCount)) {
+      result.warning = "Cronometer's Add Serving Size control did not create the required serving row.";
+      return result;
+    }
+    snapshot = await customFoodServingTableSnapshot(page);
+  }
+
+  while (snapshot.rows.length > expectedRows.length) {
+    if (!await removeLastCustomFoodServingRow(page, snapshot.rows.length)) {
+      result.warning = "Could not remove surplus Cronometer serving rows; refusing to save a partially replaced portion table.";
+      return result;
+    }
+    snapshot = await customFoodServingTableSnapshot(page);
+  }
+  if (snapshot.rows.length !== expectedRows.length) {
+    result.warning = `Expected ${expectedRows.length} serving rows but Cronometer exposed ${snapshot.rows.length}.`;
+    return result;
+  }
+
+  for (let rowIndex = 0; rowIndex < expectedRows.length; rowIndex += 1) {
+    const expected = expectedRows[rowIndex]!;
+    const values = [expected.amountText, expected.measure, ...(rowIndex > 0 ? [formatServingNumber(expected.grams!)] : [])];
+    for (let cellIndex = 0; cellIndex < values.length; cellIndex += 1) {
+      if (!await fillServingSizeCell(page, rowIndex, cellIndex, values[cellIndex]!)) {
+        result.warning = `Could not edit serving row ${rowIndex + 1}, column ${cellIndex + 1}.`;
+        return result;
+      }
+    }
+  }
+
+  snapshot = await customFoodServingTableSnapshot(page);
+  result.actualRows = snapshot.rows;
+  result.amountFilled = Boolean(snapshot.rows[0] && servingNumbersEqual(snapshot.rows[0].amount, parsed.amount));
+  result.measureFilled = normalizeServingMeasure(snapshot.rows[0]?.measure) === normalizeServingMeasure(parsed.unit);
+  result.verified = customFoodServingRowsMatch(snapshot.rows, expectedRows);
+  if (!result.verified) {
+    result.warning = "Could not verify the complete Cronometer serving-size table after editing.";
+  }
+  return result;
+}
+
+export interface CustomFoodServingRow {
+  amount: number;
+  amountText: string;
+  measure: string;
+  grams?: number;
+  gramsText?: string;
+}
+
+export function parseCustomFoodServingTables(tables: string[][][]) {
+  const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").replace(/ /g, " ").trim();
+  const matchingTables = tables.filter((rows) => rows.some((cells) => {
+    const headers = cells.map((cell) => normalize(cell).toLowerCase());
+    return headers[0] === "#" && headers[1] === "measure" && headers[2] === "grams";
+  }));
+  if (matchingTables.length !== 1) return { tableFound: false, ambiguous: matchingTables.length > 1, rows: [] as CustomFoodServingRow[] };
+  const rows = matchingTables[0]!;
+  const headerIndex = rows.findIndex((cells) => {
+    const headers = cells.map((cell) => normalize(cell).toLowerCase());
+    return headers[0] === "#" && headers[1] === "measure" && headers[2] === "grams";
+  });
+  const parsedRows = rows.slice(headerIndex + 1).flatMap((cells) => {
+    const amountText = normalize(cells[0]);
+    const measure = normalize(cells[1]);
+    const gramsText = normalize(cells[2]);
+    const amount = Number(amountText);
+    if (!Number.isFinite(amount) || amount <= 0 || !measure) return [];
+    const grams = /^(?:n\/?a|-)?$/i.test(gramsText) ? undefined : Number(gramsText);
+    return [{ amount, amountText, measure, grams: Number.isFinite(grams) && grams! > 0 ? grams : undefined, gramsText }];
+  });
+  return { tableFound: true, ambiguous: false, rows: parsedRows };
+}
+
+function customFoodServingRowsMatch(
+  actual: CustomFoodServingRow[],
+  expected: Array<{ amount: number; measure: string; grams?: number }>,
+) {
+  return actual.length === expected.length && actual.every((row, index) => {
+    const wanted = expected[index]!;
+    return servingNumbersEqual(row.amount, wanted.amount)
+      && normalizeServingMeasure(row.measure) === normalizeServingMeasure(wanted.measure)
+      && (wanted.grams === undefined ? row.grams === undefined : servingNumbersEqual(row.grams, wanted.grams));
+  });
+}
+
+function normalizeServingMeasure(value?: string) {
+  return normalizeServingUnit(value ?? "")?.toLowerCase();
+}
+
+function servingNumbersEqual(actual: number | undefined, expected: number | undefined) {
+  return actual !== undefined && expected !== undefined && Math.abs(actual - expected) <= 0.000001;
+}
+
+function formatServingNumber(value: number) {
+  return String(value);
+}
+
+async function customFoodServingTableSnapshot(page: Page) {
+  const tables = await page.evaluate(() => Array.from(document.querySelectorAll("#main-food-editor-info-area table.crono-table")).map((table) =>
+    Array.from(table.querySelectorAll("tr")).map((row) => Array.from(row.querySelectorAll("th,td")).map((cell) => {
+      const input = cell.querySelector("input");
+      return input instanceof HTMLInputElement && input.value ? input.value : cell.textContent ?? "";
+    }))))
+    .catch(() => [] as string[][][]);
+  return parseCustomFoodServingTables(tables);
+}
+
+async function servingTableElement(page: Page) {
+  const tables = page.locator("#main-food-editor-info-area table.crono-table");
+  const matches = [];
+  for (let index = 0; index < await tables.count().catch(() => 0); index += 1) {
+    const cells = await tables.nth(index).locator("tr").first().locator("th,td").allTextContents().catch(() => []);
+    const headers = cells.map((cell) => cell.replace(/\s+/g, " ").trim().toLowerCase());
+    if (headers[0] === "#" && headers[1] === "measure" && headers[2] === "grams") matches.push(tables.nth(index));
+  }
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+async function addCustomFoodServingRow(page: Page, previousCount: number) {
+  const table = await servingTableElement(page);
+  if (!table) return false;
+  const area = page.locator("#main-food-editor-info-area");
+  const controls = area.locator("[title]").filter({ has: page.locator(":scope") });
+  const titled = area.locator("[title*='Serving' i], [title*='Measure' i]");
+  const candidates = [];
+  for (let index = 0; index < await titled.count().catch(() => 0); index += 1) {
+    const candidate = titled.nth(index);
+    const title = await candidate.getAttribute("title").catch(() => "");
+    if (/\badd\b/i.test(title ?? "") && await candidate.isVisible().catch(() => false)) candidates.push(candidate);
+  }
+  void controls;
+  if (candidates.length !== 1) return false;
+  await candidates[0]!.click({ force: true, timeout: 3000 }).catch(() => undefined);
+  await page.waitForTimeout(350);
+  return (await customFoodServingTableSnapshot(page)).rows.length === previousCount + 1;
+}
+
+async function removeLastCustomFoodServingRow(page: Page, previousCount: number) {
+  const table = await servingTableElement(page);
+  if (!table) return false;
+  const rows = table.locator("tr");
+  const lastRow = rows.last();
+  const actionCell = lastRow.locator("td").last();
+  const action = actionCell.locator("button, [role='button'], [title], img, .gwt-Label").last();
+  if (await action.count().catch(() => 0) !== 1 || !await action.isVisible().catch(() => false)) return false;
+  await action.click({ force: true, timeout: 3000 }).catch(() => undefined);
+  await page.waitForTimeout(350);
+  return (await customFoodServingTableSnapshot(page)).rows.length === previousCount - 1;
+}
+
+async function fillServingSizeCell(page: Page, rowIndex: number, cellIndex: number, value: string) {
+  const table = await servingTableElement(page);
+  if (!table) return false;
+  const rows = table.locator("tr");
+  const row = rows.nth(rowIndex + 1);
+  const cell = row.locator("td").nth(cellIndex);
+  if (!await cell.isVisible().catch(() => false)) return false;
+  await cell.scrollIntoViewIfNeeded().catch(() => undefined);
+  await cell.click({ force: true, timeout: 3000 }).catch(() => undefined);
   await page.waitForTimeout(250);
-  const cellBox = await servingSizeCellBox(page, cellIndex);
-  if (!cellBox) return false;
-  await page.mouse.click(cellBox.x + cellBox.width / 2, cellBox.y + cellBox.height / 2);
-  await page.waitForTimeout(450);
-
-  const editor = await firstVisibleLocator(page, [
-    page.locator("#main-food-editor-info-area input.number-box:focus").first(),
-    page.locator("#main-food-editor-info-area input.text-box:focus").first(),
-    page.locator("#main-food-editor-info-area input.number-box:visible").last(),
-    page.locator("#main-food-editor-info-area input.text-box:visible").last(),
-  ]);
-  if (!editor) return false;
-  const filled = await editor.fill(value).then(() => true).catch(() => false);
-  if (!filled) return false;
-  await page.keyboard.press("Enter").catch(() => undefined);
-  await page.waitForTimeout(500);
-
-  const rowText = await servingSizeRowText(page);
-  return rowText.toLowerCase().includes(value.toLowerCase());
-}
-
-async function scrollServingSizeRowIntoView(page: Page) {
-  await page.evaluate(() => {
-    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
-    const rows = Array.from(document.querySelectorAll("#main-food-editor-info-area table.crono-table tr"));
-    for (const row of rows) {
-      const cells = Array.from(row.querySelectorAll("td"));
-      const rowText = normalize(row.textContent);
-      if (cells.length >= 3 && !row.classList.contains("table-header") && /^\d+(?:\.\d+)?\s+\S+/.test(rowText)) {
-        row.scrollIntoView({ block: "center" });
-        return;
-      }
-    }
-  }).catch(() => undefined);
-}
-
-async function servingSizeCellBox(page: Page, cellIndex: number) {
-  return page.evaluate((cellIndex) => {
-    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
-    const rows = Array.from(document.querySelectorAll("#main-food-editor-info-area table.crono-table tr"));
-    for (const row of rows) {
-      const cells = Array.from(row.querySelectorAll("td"));
-      const rowText = normalize(row.textContent);
-      if (cells.length >= 3 && !row.classList.contains("table-header") && /^\d+(?:\.\d+)?\s+\S+/.test(rowText)) {
-        const rect = (cells[cellIndex] ?? cells[0])?.getBoundingClientRect();
-        if (!rect || rect.width <= 0 || rect.height <= 0) continue;
-        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
-      }
-    }
-    return undefined;
-  }, cellIndex);
-}
-
-async function servingSizeRowText(page: Page) {
-  return page.evaluate(() => {
-    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
-    const rows = Array.from(document.querySelectorAll("#main-food-editor-info-area table.crono-table tr"));
-    for (const row of rows) {
-      const cells = Array.from(row.querySelectorAll("td"));
-      const rowText = normalize(row.textContent);
-      if (cells.length >= 3 && !row.classList.contains("table-header") && /^\d+(?:\.\d+)?\s+\S+/.test(rowText)) {
-        return rowText;
-      }
-    }
-    return "";
-  }).catch(() => "");
+  const editor = cell.locator("input:visible").first();
+  const activeEditor = await editor.count().catch(() => 0) === 1
+    ? editor
+    : page.locator("#main-food-editor-info-area input.number-box:focus, #main-food-editor-info-area input.text-box:focus").first();
+  if (await activeEditor.count().catch(() => 0) !== 1) return false;
+  if (!await activeEditor.fill(value).then(() => true).catch(() => false)) return false;
+  await activeEditor.press("Enter").catch(() => undefined);
+  await page.waitForTimeout(300);
+  const snapshot = await customFoodServingTableSnapshot(page);
+  const actual = snapshot.rows[rowIndex];
+  if (!actual) return false;
+  if (cellIndex === 0) return servingNumbersEqual(actual.amount, Number(value));
+  if (cellIndex === 1) return normalizeServingMeasure(actual.measure) === normalizeServingMeasure(value);
+  return servingNumbersEqual(actual.grams, Number(value));
 }
 
 async function fillCustomFoodNutrients(page: Page, nutrients: Record<string, number>) {
@@ -6568,8 +6677,9 @@ export function customFoodNutrientEntries(nutrients: Record<string, number>) {
   return Array.from(mapped.values()).map(({ label, value, sourceKey }) => ({ label, value, sourceKey }));
 }
 
-export function customFoodWritePreview(input: { name?: string; servingSize?: string; nutrients?: Record<string, number>; barcode?: string }) {
-  const parsedServingSize = parseServingSize(input.servingSize);
+export function customFoodWritePreview(input: { name?: string; servingSize?: string; portions?: FoodPortionDefinition[]; nutrients?: Record<string, number>; barcode?: string }) {
+  const servingPreview = customFoodServingPreview(input);
+  const parsedServingSize = parseServingSize(servingPreview.servingSize);
   const nutrientEntries = customFoodNutrientEntries(input.nutrients ?? {});
   const validNutrientValues = Object.entries(input.nutrients ?? {})
     .filter(([, value]) => Number.isFinite(value) && value >= 0);
@@ -6606,6 +6716,7 @@ export function customFoodWritePreview(input: { name?: string; servingSize?: str
   const barcode = validateBarcode(input.barcode);
   const issues = [
     ...(typeof input.name === "string" && !input.name.trim() ? ["Custom food name cannot be empty."] : []),
+    ...servingPreview.issues,
     ...(input.servingSize !== undefined && !parsedServingSize ? ["Could not parse servingSize. Use values like '100 g', '1 serving', '250 ml', or '1 oz'."] : []),
     ...(!barcode.valid && barcode.warning ? [barcode.warning] : []),
     ...ignoredNutrients.map((item) => `${item.sourceKey}: ${item.warning}`),
@@ -6616,9 +6727,9 @@ export function customFoodWritePreview(input: { name?: string; servingSize?: str
     valid: issues.length === 0,
     issues,
     servingSize: {
-      requested: input.servingSize,
+      requested: servingPreview.servingSize,
       parsed: parsedServingSize,
-      warning: input.servingSize !== undefined && !parsedServingSize
+      warning: servingPreview.servingSize !== undefined && !parsedServingSize
         ? "Could not parse servingSize. Use values like '100 g', '1 serving', '250 ml', or '1 oz'."
         : undefined,
     },
@@ -6631,12 +6742,12 @@ export function customFoodWritePreview(input: { name?: string; servingSize?: str
   };
 }
 
-export function customFoodCreatePreview(input: { name?: string; servingSize?: string; nutrients?: Record<string, number>; barcode?: string }) {
+export function customFoodCreatePreview(input: { name?: string; servingSize?: string; portions?: FoodPortionDefinition[]; nutrients?: Record<string, number>; barcode?: string }) {
   const preview = customFoodWritePreview(input);
   const issues = [
     ...preview.issues,
     ...(!input.name?.trim() ? ["Custom food name is required."] : []),
-    ...(!input.servingSize?.trim() ? ["Custom food servingSize is required."] : []),
+    ...(!customFoodServingPreview(input).servingSize ? ["Custom food servingSize is required unless portions are supplied."] : []),
     ...(Object.keys(input.nutrients ?? {}).length === 0 ? ["At least one package-label nutrient is required."] : []),
     ...(Object.keys(input.nutrients ?? {}).length > 0 && preview.nutrientCount === 0 ? ["No supplied nutrient could be mapped to a supported Cronometer field."] : []),
   ];
@@ -6651,17 +6762,19 @@ export function customFoodUpdatePreview(input: CustomFoodUpdateInput) {
   const writePreview = customFoodWritePreview({
     name: input.newName,
     servingSize: input.servingSize,
+    portions: input.portions,
     nutrients: input.nutrients,
     barcode: input.barcode,
   });
   const hasSelector = Boolean(input.name?.trim());
   const hasChange = input.newName !== undefined
     || input.servingSize !== undefined
+    || input.portions !== undefined
     || input.barcode !== undefined
     || Boolean(input.nutrients && Object.keys(input.nutrients).length > 0);
   const issues = [
     ...(!hasSelector ? ["Update requires the exact current custom food name and optionally its foodId."] : []),
-    ...(!hasChange ? ["Update requires at least one changed field: newName, servingSize, barcode, or a nutrient value."] : []),
+    ...(!hasChange ? ["Update requires at least one changed field: newName, servingSize, portions, barcode, or a nutrient value."] : []),
     ...writePreview.issues,
   ];
   return {
@@ -6675,14 +6788,19 @@ export function customFoodUpdatePreview(input: CustomFoodUpdateInput) {
 
 export function verifyCustomFoodWrite(
   detail: {
+    foodId?: string;
     name?: string;
     servingSize?: string;
+    portions?: FoodPortionDefinition[];
     barcodes?: string[];
     nutrients?: Record<string, { value: number; unit: string }>;
   } | undefined,
-  input: { name: string; servingSize?: string; barcode?: string; nutrients?: Record<string, number> },
+  input: { name: string; servingSize?: string; portions?: FoodPortionDefinition[]; barcode?: string; nutrients?: Record<string, number> },
+  expectedFoodId?: string,
 ) {
   const issues: string[] = [];
+  const foodIdVerified = !expectedFoodId || detail?.foodId === expectedFoodId;
+  if (!foodIdVerified) issues.push(`Expected foodId ${JSON.stringify(expectedFoodId)} but read back ${JSON.stringify(detail?.foodId)}.`);
   const nameVerified = Boolean(
     detail?.name
       && normalizeCustomFoodName(detail.name) === normalizeCustomFoodName(input.name),
@@ -6699,6 +6817,16 @@ export function verifyCustomFoodWrite(
   );
   if (!servingVerified) {
     issues.push(`Expected serving size ${JSON.stringify(input.servingSize)} but read back ${JSON.stringify(detail?.servingSize)}.`);
+  }
+
+  const expectedPortions = customFoodServingPreview(input).portions;
+  const actualPortions = detail?.portions ?? [];
+  const portionsVerified = input.portions === undefined || customFoodServingRowsMatch(
+    actualPortions.map((portion) => ({ amount: 1, amountText: "1", measure: portion.name, grams: portion.weightGrams })),
+    expectedPortions.map((portion) => ({ amount: 1, measure: portion.name, grams: portion.weightGrams })),
+  );
+  if (!portionsVerified) {
+    issues.push(`Expected portions ${JSON.stringify(expectedPortions)} but read back ${JSON.stringify(actualPortions)}.`);
   }
 
   const barcode = validateBarcode(input.barcode);
@@ -6734,8 +6862,10 @@ export function verifyCustomFoodWrite(
   return {
     verified: issues.length === 0,
     issues,
+    foodIdVerified,
     nameVerified,
     servingVerified,
+    portionsVerified,
     barcodeVerified,
     expectedBarcode: barcode.normalized,
     actualBarcodes,
@@ -7605,14 +7735,27 @@ async function extractCustomFoodDetail(page: Page): Promise<CustomFoodDetail | u
       .filter((value) => /^\d+$/.test(value));
 
     let servingSize: string | undefined;
-    const servingRows = Array.from(document.querySelectorAll("#main-food-editor-info-area table.crono-table tr"));
-    for (const row of servingRows) {
-      const cells = Array.from(row.querySelectorAll("td"));
-      const rowText = normalize(row.textContent);
-      if (cells.length >= 3 && !row.classList.contains("table-header") && /^\d+(?:\.\d+)?\s+\S+/.test(rowText)) {
-        servingSize = `${normalize(cells[0]?.textContent)} ${normalize(cells[1]?.textContent)}`;
-        break;
-      }
+    let portions: FoodPortionDefinition[] = [];
+    const servingTables = Array.from(document.querySelectorAll("#main-food-editor-info-area table.crono-table")).map((table) =>
+      Array.from(table.querySelectorAll("tr")).map((row) => Array.from(row.querySelectorAll("th,td")).map((cell) => {
+        const input = cell.querySelector("input");
+        return normalize(input instanceof HTMLInputElement && input.value ? input.value : cell.textContent);
+      })));
+    const servingTable = servingTables.find((rows) => rows.some((cells) =>
+      cells[0] === "#" && cells[1]?.toLowerCase() === "measure" && cells[2]?.toLowerCase() === "grams"));
+    const servingHeaderIndex = servingTable?.findIndex((cells) =>
+      cells[0] === "#" && cells[1]?.toLowerCase() === "measure" && cells[2]?.toLowerCase() === "grams") ?? -1;
+    const servingRows = servingHeaderIndex >= 0 ? servingTable!.slice(servingHeaderIndex + 1).flatMap((cells) => {
+      const amount = Number(cells[0]);
+      const measure = normalize(cells[1]);
+      const grams = Number(cells[2]);
+      return Number.isFinite(amount) && amount > 0 && measure
+        ? [{ amount, amountText: normalize(cells[0]), measure, grams: Number.isFinite(grams) && grams > 0 ? grams : undefined }]
+        : [];
+    }) : [];
+    if (servingRows[0]) {
+      servingSize = `${servingRows[0].amountText} ${servingRows[0].measure}`;
+      portions = servingRows.slice(1).flatMap((row) => row.grams === undefined ? [] : [{ name: row.measure, weightGrams: row.grams }]);
     }
 
     const nutrients: Record<string, { value: number; unit: string; percentDailyValue?: number }> = {};
@@ -7640,6 +7783,7 @@ async function extractCustomFoodDetail(page: Page): Promise<CustomFoodDetail | u
       foodId,
       name,
       servingSize,
+      portions,
       barcodes,
       energy: nutrients.Energy ? { value: nutrients.Energy.value, unit: nutrients.Energy.unit } : undefined,
       macros,
