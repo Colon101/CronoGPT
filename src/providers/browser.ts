@@ -896,6 +896,13 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         input: safeInput(input),
       },
       () => this.withPage("log_foods", (page) => this.logFoodsOnPage(page, input, normalizedItems, batchIdempotencyKey)),
+      {
+        callerIdempotencyKey: batchIdempotencyKey,
+        semanticPayload: normalizedItems.map((item) => canonicalFoodLogPayload(item.normalized)),
+        expectedExistingMatchCount: normalizedItems.some((item) => item.input.expectedExistingMatchCount !== undefined)
+          ? normalizedItems.reduce((total, item) => total + (item.input.expectedExistingMatchCount ?? 0), 0)
+          : undefined,
+      },
     );
 
     return this.waitForAcceptedBackgroundJob(
@@ -4687,6 +4694,7 @@ function normalizeFoodLogBatchItems(input: FoodLogBatchInput, timeZone: string) 
       ...item,
       date: input.date,
       meal: input.meal,
+      expectedExistingMatchCount: item.expectedExistingMatchCount ?? input.expectedExistingMatchCount?.[index],
       dryRun: item.dryRun ?? input.dryRun,
       confirmed: item.confirmed ?? input.confirmed,
     };
