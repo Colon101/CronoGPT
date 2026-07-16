@@ -15,6 +15,12 @@ import {
   servingSizeRowMatches,
   verifyCustomFoodWrite,
 } from "../dist/providers/browser.js";
+import {
+  customFoodServingPreview,
+  customFoodTransactionPreview,
+  expectedExistingMatchCountPreview,
+  foodTransactionDigest,
+} from "../dist/domain.js";
 import { customFoodNutrientLabelForKey } from "../dist/nutrients.js";
 import { gtinCheckDigit, validateBarcode } from "../dist/barcode.js";
 import {
@@ -161,6 +167,22 @@ assert.deepEqual(parseServingSize("12 micrograms"), { amount: 12, amountText: "1
 assert.equal(parseServingSize("serving"), undefined);
 assert.equal(servingSizeRowMatches("1 serving", "1", "serving"), true);
 assert.equal(servingSizeRowMatches("250 milliliters", "250", "ml"), true);
+
+const gramPortionPreview = customFoodServingPreview({
+  portions: [{ name: " bag ", weightGrams: 130 }, { name: "piece", weightGrams: 10 }],
+});
+assert.equal(gramPortionPreview.valid, true);
+assert.equal(gramPortionPreview.servingSize, "1 g");
+assert.equal(gramPortionPreview.servingSizeSource, "preferred_gram_default");
+assert.deepEqual(gramPortionPreview.portions, [{ name: "bag", weightGrams: 130 }, { name: "piece", weightGrams: 10 }]);
+assert.equal(customFoodServingPreview({ servingSize: "1 serving" }).servingSize, "1 serving");
+assert.equal(customFoodServingPreview({ portions: [{ name: "bag", weightGrams: 130 }, { name: "Bag", weightGrams: 130 }] }).valid, false);
+const customTransaction = customFoodTransactionPreview({ name: "Package food", portions: [{ name: "bag", weightGrams: 130 }], expectedExistingMatchCount: 0 });
+assert.equal(customTransaction.valid, true);
+assert.match(customTransaction.transactionDigest, /^txn-/);
+assert.equal(expectedExistingMatchCountPreview(-1).valid, false);
+assert.equal(foodTransactionDigest({ query: "Food", meal: "Lunch", expectedExistingMatchCount: 0 }), foodTransactionDigest({ query: " food ", meal: "lunch", expectedExistingMatchCount: 0 }));
+assert.notEqual(foodTransactionDigest({ query: "Food", meal: "Lunch", expectedExistingMatchCount: 0 }), foodTransactionDigest({ query: "Food", meal: "Lunch", expectedExistingMatchCount: 1 }));
 
 const nutrientEntries = customFoodNutrientEntries({
   calories: 10,

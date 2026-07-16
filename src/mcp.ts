@@ -15,6 +15,7 @@ import { toMcpToolResponse } from "./tool-response.js";
 import { CUSTOM_FOOD_NUTRIENT_SCHEMA, customFoodNutrientSchemaSummary } from "./nutrients.js";
 import { validateBarcode } from "./barcode.js";
 import { FOOD_LOG_MEALS, isValidFoodLogDate, parseFoodLogTimestamp } from "./food-log-transaction.js";
+import { customFoodTransactionPreview } from "./domain.js";
 import type { CronometerProvider, RecipeInput } from "./domain.js";
 import { comparePrivateRecipe, type ExistingRecipeSummary } from "./recipe-semantics.js";
 import {
@@ -101,6 +102,21 @@ const foodPortionDefinitionSchema = z.object({
   name: z.string().min(1).describe("Exact portion name, for example bag, piece, can, or serving."),
   weightGrams: z.number().finite().positive().describe("Weight in grams of one named portion."),
 });
+const customFoodPortionsSchema = z.array(foodPortionDefinitionSchema)
+  .min(1)
+  .superRefine((portions, context) => {
+    const names = new Set<string>();
+    portions.forEach((portion, index) => {
+      const normalizedName = portion.name.replace(/\s+/g, " ").trim().toLowerCase();
+      if (names.has(normalizedName)) {
+        context.addIssue({ code: z.ZodIssueCode.custom, path: [index, "name"], message: "Each custom-food portion name must be unique." });
+      }
+      names.add(normalizedName);
+    });
+  })
+  .describe("Optional additional exact portion name-to-gram mappings, such as piece=10 g, serving=30 g, or bag=130 g. When present without servingSize, CronoGPT uses a stable base servingSize of 1 g.");
+const expectedExistingMatchCountSchema = z.number().int().nonnegative()
+  .describe("Optional exact match count from an immediately preceding read-only lookup. The write refuses a changed count instead of overwriting a concurrent change.");
 const wholePackagePortionSchema = z.object({
   kind: z.literal("whole_package"),
   portion: foodPortionDefinitionSchema.describe("The package portion as its exact name-to-weight mapping."),
@@ -108,7 +124,7 @@ const wholePackagePortionSchema = z.object({
 }).describe("Use when the user consumed a whole package. CronoGPT logs count × portion.weightGrams, so multiple portions on the same food remain unambiguous.");
 
 export const MCP_PATH = "/mcp";
-export const MCP_SERVER_VERSION = "0.1.16";
+export const MCP_SERVER_VERSION = "0.1.17";
 const readToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read"] }];
 const writeToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read", "cronometer:write"] }];
 export const STABLE_MODEL_VISIBLE_TOOLS = [
@@ -644,6 +660,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
       timestamp: foodTimestampInputSchema.optional(),
       matchPolicy: z.enum(["high_confidence", "selected_only"]).optional().describe("Defaults to high_confidence. Use selected_only with selectedName and selectedSource to pin an exact search result. Unsafe best-effort writes are intentionally not model-visible."),
       searchScope: z.enum(["auto", "all", "custom", "favorites"]).optional().describe("Optional food-search tab preference. Use custom for private custom foods/recipes, all for official database lookups, or auto by default."),
+      expectedExistingMatchCount: expectedExistingMatchCountSchema.optional(),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
       idempotencyKey: z.string().optional().describe("Optional caller-supplied idempotency key. If omitted, cronogpt derives one from date, meal, food, amount, and unit."),
@@ -670,8 +687,10 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
         timestamp: foodTimestampInputSchema.optional(),
         matchPolicy: z.enum(["high_confidence", "selected_only"]).optional().describe("Defaults to high_confidence. Use selected_only with selectedName and selectedSource to pin an exact search result."),
         searchScope: z.enum(["auto", "all", "custom", "favorites"]).optional().describe("Optional food-search tab preference. Use custom for private custom foods/recipes, all for official database lookups, or auto by default."),
+        expectedExistingMatchCount: expectedExistingMatchCountSchema.optional(),
         idempotencyKey: z.string().optional().describe("Optional per-item idempotency key. If omitted, cronogpt derives one from date, meal, food, amount, and unit."),
       })).min(1).max(50),
+      expectedExistingMatchCount: z.array(expectedExistingMatchCountSchema).optional().describe("Optional expected exact-row counts in items order from a prior lookup. Each supplied value must match its corresponding item's current count before write."),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
       idempotencyKey: z.string().optional().describe("Optional caller-supplied batch idempotency key. If omitted, cronogpt derives one from all normalized item keys."),
@@ -757,16 +776,24 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
     "Use this when the user wants a private Cronometer custom food created or safely updated without immediately logging it. This is the preferred custom-food path: use the package serving size, include every nutrient available from the label, and pass the UPC/EAN/GTIN barcode whenever visible so later barcode searches/scans resolve to this food. It handles same-name duplicates internally; do not call list_custom_foods first. For Israeli labels, pass listed available carbohydrates as total_carbs or net_carbs and pass fiber/sugar_alcohol separately.",
     {
       name: z.string().min(1),
-      servingSize: z.string().min(1).describe("Required explicit serving size, for example '100 g', '1 serving', '250 ml', or '1 oz'."),
+      servingSize: z.string().min(1).optional().describe("Primary nutrition-label serving size. When portions is supplied and this is omitted, CronoGPT uses the preferred stable base serving of 1 g; without portions, an explicit servingSize remains required."),
+      portions: customFoodPortionsSchema.optional(),
       nutrients: nonEmptyNutrientRecordSchema.describe("Required nutrition facts using custom_food_nutrient_schema keys, aliases, or exact Cronometer labels. Include every value present on the package label, including caffeine, vitamins, minerals, amino acids, or fatty acids when available."),
       barcode: barcodeInputSchema.optional(),
       duplicatePolicy: z.enum(["fail", "update_existing", "create_new"]).optional().describe("Defaults to update_existing for exactly one same-named food, fails on multiple matches, and creates only when no match exists. Use create_new only when a duplicate is intentional."),
+      expectedExistingMatchCount: expectedExistingMatchCountSchema.optional(),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
       waitForCompletionSeconds: z.number().int().min(0).max(600).optional().describe("Defaults to a server-chosen wait window for confirmed writes. Use 0 to return immediately after accepting the background job."),
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-    async (args) => toMcpToolResponse(await provider.createCustomFood(args as never)),
+    async (args) => {
+      const preview = customFoodTransactionPreview({ ...args, requireServingSize: true } as never);
+      if (!preview.valid) {
+        return toMcpToolResponse({ provider: provider.name, mode: provider.mode, feature: "create_custom_food", status: "needs_manual_step", warning: preview.issues.join(" "), data: { preview, browserOpened: false, writeAttempted: false } });
+      }
+      return toMcpToolResponse(await provider.createCustomFood({ ...args, servingSize: preview.servingSize } as never));
+    },
   );
 
   register(
@@ -775,11 +802,13 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
     "Use this as the preferred one-call workflow when a packaged food is missing from Cronometer and the user wants to log it now. Supply the package serving size, every available label nutrient, the UPC/EAN/GTIN barcode whenever visible, and the user's exact diary meal. The tool validates the detailed editor, handles same-name foods internally, verifies the saved barcode and nutrients, then pins and logs that exact private custom food. Do not call list_custom_foods first. Use dryRun=true when facts are uncertain; confirmed=true is required for writes.",
     {
       name: z.string().min(1).describe("Exact custom food name to create/update and then log."),
-      servingSize: z.string().min(1).describe("Required primary nutrition-label serving size, for example '100 g', '1 serving', '250 ml', or '1 oz'."),
+      servingSize: z.string().min(1).optional().describe("Primary nutrition-label serving size. When portions is supplied and this is omitted, CronoGPT uses the preferred stable base serving of 1 g; without portions, an explicit servingSize remains required."),
+      portions: customFoodPortionsSchema.optional(),
       nutrients: nonEmptyNutrientRecordSchema.describe("Required package-label values using custom_food_nutrient_schema keys, aliases, or exact Cronometer labels. Include every available value, not only calories and macros."),
       nutritionSource: z.string().optional().describe("Short citation or URL/title summary of where ChatGPT found the nutrition facts. Stored in the tool result for audit; not written as a secret."),
       barcode: barcodeInputSchema.optional(),
       duplicatePolicy: z.enum(["fail", "update_existing"]).optional().describe("Defaults to update_existing so an existing same-named custom food is updated rather than duplicated. Use create_custom_food separately only when an intentional duplicate is required."),
+      expectedExistingMatchCount: expectedExistingMatchCountSchema.optional(),
       date: diaryDateInputSchema.optional(),
       meal: diaryMealInputSchema,
       amount: z.number().positive().optional().describe("Amount to log in the diary. Defaults to 1 only when portion is omitted."),
@@ -791,7 +820,13 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
       waitForCompletionSeconds: z.number().int().min(0).max(600).optional().describe("Defaults to a server-chosen wait window for confirmed create-and-log writes. Use 0 to return immediately after accepting the background job."),
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    async (args) => toMcpToolResponse(await provider.createAndLogCustomFood(args as never)),
+    async (args) => {
+      const preview = customFoodTransactionPreview({ ...args, requireServingSize: true } as never);
+      if (!preview.valid) {
+        return toMcpToolResponse({ provider: provider.name, mode: provider.mode, feature: "create_and_log_custom_food", status: "needs_manual_step", warning: preview.issues.join(" "), data: { preview, browserOpened: false, writeAttempted: false } });
+      }
+      return toMcpToolResponse(await provider.createAndLogCustomFood({ ...args, servingSize: preview.servingSize } as never));
+    },
   );
 
   register(
@@ -828,14 +863,22 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
       name: z.string().min(1).describe("Current exact custom food name. If multiple foods match, also pass foodId from list_custom_foods."),
       newName: z.string().optional(),
       servingSize: z.string().optional(),
+      portions: customFoodPortionsSchema.optional(),
       nutrients: nutrientRecordSchema.optional().describe("Replacement values for only the provided detailed nutrient fields; omitted fields are left unchanged."),
       barcode: barcodeInputSchema.optional().describe("Barcode to add if it is not already linked to this custom food."),
+      expectedExistingMatchCount: expectedExistingMatchCountSchema.optional(),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
       waitForCompletionSeconds: z.number().int().min(0).max(600).optional().describe("Defaults to a server-chosen wait window for confirmed updates. Use 0 to return immediately after accepting the background job."),
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    async (args) => toMcpToolResponse(await provider.updateCustomFood(args as never)),
+    async (args) => {
+      const preview = customFoodTransactionPreview({ ...args, requireServingSize: true } as never);
+      if (!preview.valid) {
+        return toMcpToolResponse({ provider: provider.name, mode: provider.mode, feature: "update_custom_food", status: "needs_manual_step", warning: preview.issues.join(" "), data: { preview, browserOpened: false, writeAttempted: false } });
+      }
+      return toMcpToolResponse(await provider.updateCustomFood({ ...args, servingSize: args.servingSize === undefined ? undefined : preview.servingSize } as never));
+    },
   );
 
   register(

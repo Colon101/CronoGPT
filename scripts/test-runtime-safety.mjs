@@ -128,16 +128,23 @@ try {
   const deleteDiaryTool = listedTools.tools.find((tool) => tool.name === "delete_diary_food_entry");
   assert.ok(deleteDiaryTool?.inputSchema?.properties?.deleteCount);
   const createCustomFoodTool = listedTools.tools.find((tool) => tool.name === "create_custom_food");
-  assert.ok(createCustomFoodTool?.inputSchema?.required?.includes("servingSize"));
-  assert.ok(createCustomFoodTool?.inputSchema?.required?.includes("nutrients"));
   const createAndLogTool = listedTools.tools.find((tool) => tool.name === "create_and_log_custom_food");
+  assert.ok(createCustomFoodTool?.inputSchema?.required?.includes("nutrients"));
   assert.ok(createAndLogTool?.inputSchema?.required?.includes("meal"));
-  assert.ok(createAndLogTool?.inputSchema?.required?.includes("servingSize"));
   assert.ok(createAndLogTool?.inputSchema?.required?.includes("nutrients"));
   assert.deepEqual(createAndLogTool?.inputSchema?.properties?.duplicatePolicy?.enum, ["fail", "update_existing"]);
   assert.equal(logFoodTool?.annotations?.openWorldHint, false);
   assert.equal(logFoodTool?.annotations?.idempotentHint, true);
   assert.match(scopedClient.getInstructions() ?? "", /barcode links the private custom food/i);
+  assert.ok(createCustomFoodTool?.inputSchema?.properties?.portions);
+  assert.equal(createCustomFoodTool?.inputSchema?.required?.includes("servingSize"), false, "servingSize remains optional when custom-food portions supply the preferred 1 g base serving");
+  assert.ok(createCustomFoodTool?.inputSchema?.properties?.expectedExistingMatchCount);
+  assert.ok(createAndLogTool?.inputSchema?.properties?.portions);
+  assert.equal(createAndLogTool?.inputSchema?.required?.includes("servingSize"), false);
+  assert.ok(createAndLogTool?.inputSchema?.properties?.expectedExistingMatchCount);
+  assert.ok(logFoodTool?.inputSchema?.properties?.expectedExistingMatchCount);
+  assert.ok(logFoodsTool?.inputSchema?.properties?.expectedExistingMatchCount);
+  assert.ok(deleteDiaryTool?.inputSchema?.properties?.deleteCount);
   const rejectedWrite = await scopedClient.callTool({
     name: "create_custom_food",
     arguments: {

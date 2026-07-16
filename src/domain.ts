@@ -37,6 +37,131 @@ export interface FoodPortionDefinition {
   weightGrams: number;
 }
 
+export interface CustomFoodServingPreview {
+  servingSize?: string;
+  servingSizeSource: "provided" | "preferred_gram_default" | "missing";
+  portions: FoodPortionDefinition[];
+  valid: boolean;
+  issues: string[];
+}
+
+/**
+ * Normalizes custom-food portions without coupling domain validation to browser UI selectors.
+ * A gram-based primary serving keeps named package portions unambiguous; legacy callers may
+ * continue to provide any explicit servingSize when they do not use portions.
+ */
+export function customFoodServingPreview(input: {
+  servingSize?: string;
+  portions?: FoodPortionDefinition[];
+}): CustomFoodServingPreview {
+  const portions = (input.portions ?? []).map((portion) => ({
+    name: portion.name?.replace(/\s+/g, " ").trim() ?? "",
+    weightGrams: portion.weightGrams,
+  }));
+  const seenNames = new Set<string>();
+  const issues: string[] = [];
+  for (const portion of portions) {
+    const normalizedName = portion.name.toLowerCase();
+    if (!portion.name) issues.push("Custom-food portion name must not be blank.");
+    if (!Number.isFinite(portion.weightGrams) || portion.weightGrams <= 0) {
+      issues.push(`Custom-food portion ${JSON.stringify(portion.name || "<unnamed>")} weightGrams must be a finite number greater than zero.`);
+    }
+    if (normalizedName && seenNames.has(normalizedName)) {
+      issues.push(`Custom-food portion name ${JSON.stringify(portion.name)} was supplied more than once.`);
+    }
+    seenNames.add(normalizedName);
+  }
+  const providedServingSize = input.servingSize?.replace(/\s+/g, " ").trim();
+  const servingSize = providedServingSize || (portions.length > 0 ? "1 g" : undefined);
+  return {
+    servingSize,
+    servingSizeSource: providedServingSize ? "provided" : portions.length > 0 ? "preferred_gram_default" : "missing",
+    portions,
+    valid: issues.length === 0,
+    issues,
+  };
+}
+
+export interface ExpectedExistingMatchCountPreview {
+  expectedExistingMatchCount?: number;
+  valid: boolean;
+  issues: string[];
+}
+
+export function expectedExistingMatchCountPreview(expectedExistingMatchCount?: number): ExpectedExistingMatchCountPreview {
+  const valid = expectedExistingMatchCount === undefined
+    || (Number.isInteger(expectedExistingMatchCount) && expectedExistingMatchCount >= 0);
+  return {
+    expectedExistingMatchCount,
+    valid,
+    issues: valid ? [] : ["expectedExistingMatchCount must be a non-negative integer."],
+  };
+}
+
+export interface CustomFoodTransactionPreview extends CustomFoodServingPreview {
+  expectedExistingMatchCount: ExpectedExistingMatchCountPreview;
+  transactionDigest: string;
+}
+
+/** Stable browser-independent preview for create, create-and-log, and update inputs. */
+export function customFoodTransactionPreview(input: {
+  name?: string;
+  servingSize?: string;
+  portions?: FoodPortionDefinition[];
+  expectedExistingMatchCount?: number;
+  requireServingSize?: boolean;
+}): CustomFoodTransactionPreview {
+  const serving = customFoodServingPreview(input);
+  const expectedExistingMatchCount = expectedExistingMatchCountPreview(input.expectedExistingMatchCount);
+  const servingSizeIssues = input.requireServingSize && !serving.servingSize
+    ? ["Custom food servingSize is required unless portions are supplied."]
+    : [];
+  const transactionDigest = stableTransactionDigest({
+    name: normalizeTransactionText(input.name),
+    servingSize: serving.servingSize ?? null,
+    portions: serving.portions.map((portion) => ({ name: normalizeTransactionText(portion.name), weightGrams: portion.weightGrams })),
+    expectedExistingMatchCount: input.expectedExistingMatchCount ?? null,
+  });
+  return {
+    ...serving,
+    valid: serving.valid && expectedExistingMatchCount.valid && servingSizeIssues.length === 0,
+    issues: [...serving.issues, ...expectedExistingMatchCount.issues, ...servingSizeIssues],
+    expectedExistingMatchCount,
+    transactionDigest,
+  };
+}
+
+/** Stable digest for food writes, including optional optimistic-concurrency expectations. */
+export function foodTransactionDigest(input: Pick<FoodLogInput, "date" | "meal" | "query" | "selectedName" | "selectedSource" | "amount" | "unit" | "portion" | "timestamp" | "expectedExistingMatchCount">) {
+  return stableTransactionDigest({
+    date: input.date ?? null,
+    meal: normalizeTransactionText(input.meal),
+    query: normalizeTransactionText(input.query),
+    selectedName: normalizeTransactionText(input.selectedName),
+    selectedSource: normalizeTransactionText(input.selectedSource),
+    amount: input.amount ?? null,
+    unit: normalizeTransactionText(input.unit),
+    portion: input.portion
+      ? { kind: input.portion.kind, name: normalizeTransactionText(input.portion.portion.name), weightGrams: input.portion.portion.weightGrams, count: input.portion.count ?? 1 }
+      : null,
+    timestamp: input.timestamp ?? null,
+    expectedExistingMatchCount: input.expectedExistingMatchCount ?? null,
+  });
+}
+
+function normalizeTransactionText(value: unknown) {
+  return String(value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function stableTransactionDigest(value: unknown) {
+  let hash = 2166136261;
+  for (const character of JSON.stringify(value)) {
+    hash ^= character.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `txn-${(hash >>> 0).toString(16).padStart(8, "0")}`;
+}
+
 export interface WholePackagePortion {
   kind: "whole_package";
   portion: FoodPortionDefinition;
@@ -55,6 +180,11 @@ export interface FoodLogInput {
   timestamp?: string;
   matchPolicy?: "high_confidence" | "selected_only";
   searchScope?: "auto" | "all" | "custom" | "favorites";
+  /**
+   * Read-only preflight count for the exact requested diary row. The browser transaction
+   * must refuse a changed count rather than assuming its prior lookup is still current.
+   */
+  expectedExistingMatchCount?: number;
   dryRun?: boolean;
   confirmed?: boolean;
   idempotencyKey?: string;
@@ -65,6 +195,8 @@ export interface FoodLogBatchInput {
   date?: string;
   meal?: string;
   items: FoodLogInput[];
+  /** Expected exact-row counts, in the same order as items, from a prior preflight lookup. */
+  expectedExistingMatchCount?: number[];
   dryRun?: boolean;
   confirmed?: boolean;
   idempotencyKey?: string;
@@ -181,10 +313,15 @@ export interface RecipeRetireInput extends CustomRecipeSelectorInput {
 
 export interface CustomFoodInput {
   name: string;
+  /** Defaults to the stable one-gram base serving when named portions are supplied. */
   servingSize?: string;
+  /** Additional exact name-to-gram serving mappings to create on the private food. */
+  portions?: FoodPortionDefinition[];
   nutrients?: Record<string, number>;
   barcode?: string;
   duplicatePolicy?: "fail" | "update_existing" | "create_new";
+  /** Optimistic-concurrency count from a prior exact-name custom-food lookup. */
+  expectedExistingMatchCount?: number;
   dryRun?: boolean;
   confirmed?: boolean;
   waitForCompletionSeconds?: number;
@@ -214,8 +351,11 @@ export interface CustomFoodListInput {
 export interface CustomFoodUpdateInput extends CustomFoodSelectorInput {
   newName?: string;
   servingSize?: string;
+  portions?: FoodPortionDefinition[];
   nutrients?: Record<string, number>;
   barcode?: string;
+  /** Optimistic-concurrency count from a prior exact-name custom-food lookup. */
+  expectedExistingMatchCount?: number;
   dryRun?: boolean;
   confirmed?: boolean;
   waitForCompletionSeconds?: number;
