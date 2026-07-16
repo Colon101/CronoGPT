@@ -6627,17 +6627,16 @@ async function addCustomFoodServingRow(page: Page, previousCount: number) {
   const table = await servingTableElement(page);
   if (!table) return false;
   const area = page.locator("#main-food-editor-info-area");
-  const controls = area.locator("[title]").filter({ has: page.locator(":scope") });
-  const titled = area.locator("[title*='Serving' i], [title*='Measure' i]");
+  const exact = area.locator("[title='Add Measure']");
   const candidates = [];
-  for (let index = 0; index < await titled.count().catch(() => 0); index += 1) {
-    const candidate = titled.nth(index);
-    const title = await candidate.getAttribute("title").catch(() => "");
-    if (/\badd\b/i.test(title ?? "") && await candidate.isVisible().catch(() => false)) candidates.push(candidate);
+  for (let index = 0; index < await exact.count().catch(() => 0); index += 1) {
+    candidates.push(exact.nth(index));
   }
-  void controls;
   if (candidates.length !== 1) return false;
-  await candidates[0]!.click({ force: true, timeout: 3000 }).catch(() => undefined);
+  const candidate = candidates[0]!;
+  const activated = await candidate.click({ force: true, timeout: 3000 }).then(() => true).catch(async () =>
+    candidate.dispatchEvent("click").then(() => true).catch(() => false));
+  if (!activated) return false;
   await page.waitForTimeout(350);
   return (await customFoodServingTableSnapshot(page)).rows.length === previousCount + 1;
 }
