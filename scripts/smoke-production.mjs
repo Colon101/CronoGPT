@@ -45,6 +45,7 @@ const chatGptActionToolNames = [
   "update_custom_recipe",
   "delete_custom_recipe",
   "cronometer_runtime_status",
+  "get_cronometer_operation",
   "cronometer_stability_check",
   "refresh_cronometer_session",
 ];
