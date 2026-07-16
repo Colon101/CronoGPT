@@ -1102,7 +1102,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       );
     }
 
-    const editor = await foodEditor(page);
+    const editor = await waitForUniqueFoodEditor(page, 5000);
     if (!editor) {
       return this.result(
         "log_food",
@@ -5353,6 +5353,16 @@ function activeDialog(page: Page) {
   return page.locator(".pretty-dialog, [role='dialog'], .gwt-DialogBox, .popupContent").last();
 }
 
+async function waitForUniqueFoodEditor(page: Page, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const editor = await foodEditor(page);
+    if (editor) return editor;
+    await page.waitForTimeout(100);
+  }
+  return undefined;
+}
+
 async function foodEditor(page: Page) {
   const editors = page.locator(".pretty-dialog:visible, [role='dialog']:visible, .gwt-DialogBox:visible, .popupContent:visible").filter({ hasText: /(Add Food to Diary|Description\s+Source)/i });
   const count = await editors.count().catch(() => 0);
@@ -8036,8 +8046,8 @@ async function commitFoodEditor(editor: ReturnType<Page["locator"]>) {
   return true;
 }
 
-export async function __exerciseFoodEditorSafetyForTests(page: Page, meal: string) {
-  const editor = await foodEditor(page);
+export async function __exerciseFoodEditorSafetyForTests(page: Page, meal: string, waitMs = 0) {
+  const editor = waitMs > 0 ? await waitForUniqueFoodEditor(page, waitMs) : await foodEditor(page);
   if (!editor) return { editorCount: 0, selected: false, readback: { matches: false }, committed: false };
   const selected = await chooseMeal(page, editor, meal);
   const readback = await readFoodEditorMeal(editor, meal);

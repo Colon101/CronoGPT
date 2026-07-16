@@ -26,6 +26,19 @@ try {
   assert.equal(result.committed, true);
   assert.equal(await page.locator('body').getAttribute('data-committed'), 'editor');
 
+  await page.setContent(`<style>.dialog{display:block;position:absolute;width:300px;height:200px;top:10px;left:10px}button,input{display:block;width:100px;height:25px}</style><div id="mount"></div>`);
+  await page.evaluate(() => {
+    setTimeout(() => {
+      document.querySelector('#mount').innerHTML = '<div class="dialog" role="dialog"><div>Add Food to Diary</div><input><input><button class="meal dropdown-toggle">Lunch</button><button class="unit">g</button><button class="commit">ADD TO DIARY</button></div>';
+      document.querySelector('.commit').onclick = () => document.body.dataset.committed = 'delayed-editor';
+    }, 350);
+  });
+  const delayed = await __exerciseFoodEditorSafetyForTests(page, "Lunch", 1500);
+  assert.equal(delayed.editorCount, 1, "the resolver must wait for an asynchronously mounted food editor");
+  assert.equal(delayed.readback.matches, true);
+  assert.equal(delayed.committed, true);
+  assert.equal(await page.locator('body').getAttribute('data-committed'), 'delayed-editor');
+
   await page.setContent(`<div class="pretty-dialog" role="dialog">Add Food to Diary <input><input><button>Lunch</button><button>ADD</button></div><div class="pretty-dialog" role="dialog">Add Food to Diary <input><input><button>Lunch</button><button>ADD</button></div>`);
   const ambiguous = await __exerciseFoodEditorSafetyForTests(page, "Lunch");
   assert.equal(ambiguous.editorCount, 0, "multiple semantic food editors must not be used");
