@@ -6528,6 +6528,8 @@ async function fillCustomFoodServing(page: Page, servingSize?: string, portions:
     const expected = expectedRows[rowIndex]!;
     const values = [expected.amountText, expected.measure, ...(rowIndex > 0 ? [formatServingNumber(expected.grams!)] : [])];
     for (let cellIndex = 0; cellIndex < values.length; cellIndex += 1) {
+      const alreadyMatches = rowIndex < snapshot.rows.length && servingCellMatches(snapshot.rows[rowIndex], cellIndex, values[cellIndex]!);
+      if (alreadyMatches) continue;
       if (!await fillServingSizeCell(page, rowIndex, cellIndex, values[cellIndex]!)) {
         result.warning = `Could not edit serving row ${rowIndex + 1}, column ${cellIndex + 1}.`;
         return result;
@@ -6592,6 +6594,13 @@ function customFoodServingRowsMatch(
 
 function normalizeServingMeasure(value?: string) {
   return normalizeServingUnit(value ?? "")?.toLowerCase();
+}
+
+function servingCellMatches(row: CustomFoodServingRow | undefined, cellIndex: number, value: string) {
+  if (!row) return false;
+  if (cellIndex === 0) return servingNumbersEqual(row.amount, Number(value));
+  if (cellIndex === 1) return normalizeServingMeasure(row.measure) === normalizeServingMeasure(value);
+  return servingNumbersEqual(row.grams, Number(value));
 }
 
 function servingNumbersEqual(actual: number | undefined, expected: number | undefined) {
