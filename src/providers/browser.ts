@@ -1116,6 +1116,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           browserOpened: true,
           writeAttempted: false,
           queryUsed,
+          foodEditorDiagnostics: await foodEditorDiagnostics(page),
           retry: retryGuidanceForFoodLog("needs_manual_step"),
         },
         "Could not identify exactly one semantic food editor after selecting the food. No food was written.",
@@ -5353,6 +5354,21 @@ function activeDialog(page: Page) {
   return page.locator(".pretty-dialog, [role='dialog'], .gwt-DialogBox, .popupContent").last();
 }
 
+async function foodEditorDiagnostics(page: Page) {
+  return page.locator(".pretty-dialog:visible, [role='dialog']:visible, .gwt-DialogBox:visible, .popupContent:visible").evaluateAll((elements) =>
+    elements.map((element) => ({
+      tag: element.tagName,
+      className: String(element.className ?? ""),
+      text: (element.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 1500),
+      controlCount: element.querySelectorAll("input, button, select").length,
+      buttons: Array.from(element.querySelectorAll("button,[role='button'],input[type='button'],input[type='submit']"))
+        .map((control) => ((control instanceof HTMLInputElement ? control.value : control.textContent) ?? "").replace(/\s+/g, " ").trim())
+        .filter(Boolean)
+        .slice(0, 30),
+    })),
+  ).catch(() => []);
+}
+
 async function waitForUniqueFoodEditor(page: Page, timeoutMs: number) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -5370,11 +5386,16 @@ async function foodEditor(page: Page) {
   for (let index = 0; index < count; index += 1) {
     const editor = editors.nth(index);
     const semantic = await editor.evaluate((element) => {
-      const text = (element.textContent ?? "").replace(/\s+/g, " ");
-      const controls = element.querySelectorAll("input, button, select");
-      return /(Add Food to Diary|Description\s+Source)/i.test(text)
-        && controls.length >= 3
-        && /\b(ADD|ADD FOOD|ADD TO DIARY|ADD SERVING|SAVE|DONE)\b/i.test(text);
+      const isSemanticEditor = (candidate: Element) => {
+        const text = (candidate.textContent ?? "").replace(/\s+/g, " ");
+        const controls = candidate.querySelectorAll("input, button, select");
+        return /(Add Food to Diary|Description\s+Source)/i.test(text)
+          && controls.length >= 3
+          && /\b(ADD|ADD FOOD|ADD TO DIARY|ADD SERVING|SAVE|DONE)\b/i.test(text);
+      };
+      if (!isSemanticEditor(element)) return false;
+      const nestedDialogs = element.querySelectorAll(".pretty-dialog, [role='dialog'], .gwt-DialogBox, .popupContent");
+      return !Array.from(nestedDialogs).some((candidate) => candidate !== element && isSemanticEditor(candidate));
     }).catch(() => false);
     if (semantic) candidates.push(editor);
   }

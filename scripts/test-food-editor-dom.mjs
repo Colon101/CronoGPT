@@ -39,6 +39,12 @@ try {
   assert.equal(delayed.committed, true);
   assert.equal(await page.locator('body').getAttribute('data-committed'), 'delayed-editor');
 
+  await page.setContent(`<style>.pretty-dialog,.popupContent{display:block;position:absolute;width:300px;height:200px;top:10px;left:10px}button,input{display:block;width:100px;height:25px}</style><div class="pretty-dialog"><div class="popupContent" role="dialog"><div>Add Food to Diary</div><input><input><button class="meal dropdown-toggle">Lunch</button><button>g</button><button class="commit">ADD TO DIARY</button></div></div><script>document.querySelector('.commit').onclick=()=>document.body.dataset.committed='nested-editor'</script>`);
+  const nested = await __exerciseFoodEditorSafetyForTests(page, "Lunch");
+  assert.equal(nested.editorCount, 1, "nested GWT dialog wrappers must resolve to one logical editor");
+  assert.equal(nested.committed, true);
+  assert.equal(await page.locator('body').getAttribute('data-committed'), 'nested-editor');
+
   await page.setContent(`<div class="pretty-dialog" role="dialog">Add Food to Diary <input><input><button>Lunch</button><button>ADD</button></div><div class="pretty-dialog" role="dialog">Add Food to Diary <input><input><button>Lunch</button><button>ADD</button></div>`);
   const ambiguous = await __exerciseFoodEditorSafetyForTests(page, "Lunch");
   assert.equal(ambiguous.editorCount, 0, "multiple semantic food editors must not be used");
