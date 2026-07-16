@@ -73,6 +73,12 @@ export function customFoodServingPreview(input: {
   }
   const providedServingSize = input.servingSize?.replace(/\s+/g, " ").trim();
   const servingSize = providedServingSize || (portions.length > 0 ? "1 g" : undefined);
+  if (portions.length > 0 && providedServingSize && !/^1\s*(?:g|gram|grams)$/i.test(providedServingSize)) {
+    issues.push("Custom foods with named portions require a 1 g base servingSize so every portion weight remains unambiguous.");
+  }
+  if (portions.some((portion) => /^(?:g|gram|grams)$/i.test(portion.name))) {
+    issues.push("Do not add g as a named portion; servingSize 1 g is the nutrition basis.");
+  }
   return {
     servingSize,
     servingSizeSource: providedServingSize ? "provided" : portions.length > 0 ? "preferred_gram_default" : "missing",
