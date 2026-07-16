@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 import type {
   BiometricLogInput,
@@ -173,8 +173,19 @@ interface PersistedBackgroundBrowserJob {
   startedAt: number;
   updatedAt: number;
   input: unknown;
+  canonicalPayload?: string;
+  callerIdempotencyKey?: string;
+  semanticKey?: string;
   result?: ProviderResult;
   error?: string;
+}
+
+interface OperationJournalHealth {
+  configured: boolean;
+  readable: boolean;
+  writable: boolean;
+  durableAdmission: boolean;
+  reason?: string;
 }
 
 interface BackgroundBrowserJob extends Omit<PersistedBackgroundBrowserJob, "status"> {
@@ -252,10 +263,13 @@ interface StorageStateInfo {
 
 export class BrowserCronometerProvider extends BaseCronometerProvider {
   private readonly persistedOperations = new Map<string, PersistedBackgroundBrowserJob>();
+  private journalHealth: OperationJournalHealth;
 
   constructor(private readonly config: BrowserConfig) {
     super("browser", "browser");
-    for (const operation of readOperationJournal(config.operationJournalFile)) {
+    const journal = readOperationJournal(config.operationJournalFile);
+    this.journalHealth = journal.health;
+    for (const operation of journal.operations) {
       const recovered = operation.status === "running"
         ? { ...operation, status: "indeterminate" as const, error: "The process restarted before this operation reached a terminal state." }
         : operation;
@@ -335,14 +349,15 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       loginBackoffSource: loginBackoff.source,
       loginBackoffFileConfigured: Boolean(this.config.loginBackoffFile),
       operationJournalFileConfigured: Boolean(this.config.operationJournalFile),
+      operationJournal: this.journalHealth,
       persistedOperationCount: this.persistedOperations.size,
       lastLoginFailure: loginBackoff.reason,
       guidance: [
         "Use dryRun=true for validation and previews; dry-run write tools do not open Cronometer.",
         "Use refresh_cronometer_session only as an optional read-only warmup; do not block a confirmed create_and_log_custom_food workflow on it.",
-        "Confirmed log_food writes run as background jobs; poll cronometer_runtime_status until the job is completed before retrying.",
+        "Confirmed log_food writes run as background jobs; poll get_cronometer_operation with the operationId before retrying.",
         "Use log_foods for multi-ingredient meals; it submits one idempotent batch and reports per-item write status.",
-        "Confirmed create_and_log_custom_food writes run as background jobs; poll cronometer_runtime_status until the job is completed before retrying.",
+        "Confirmed create_and_log_custom_food writes run as background jobs; poll get_cronometer_operation with the operationId before retrying.",
         "A stale browser job is reported but never bypassed with a concurrent writer; its operation timeout closes the browser session before the serialized queue advances.",
         "Use resolve_recipe_ingredients with a low limitPerIngredient and a larger maxSeconds value for large recipes.",
         "If loginPaused is true and storageStateUsable is false, wait or provide durable storage state/remote browser before retrying browser actions. Usable storage state may still allow non-login browser actions during cooldown.",
@@ -764,6 +779,11 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           input: safeInput(input),
         },
         () => this.withPage("log_food", (page) => this.logFoodOnPage(page, input, normalized, preflightData)),
+        {
+          callerIdempotencyKey: normalized.idempotencyKey,
+          semanticPayload: canonicalFoodLogPayload(normalized),
+          expectedExistingMatchCount: expectedExistingMatchCount(input),
+        },
       );
       return this.waitForAcceptedBackgroundJob(
         "log_food",
@@ -1043,6 +1063,14 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
     const selectedName = selection.result.name;
     const selectedSource = selection.result.source;
+    const verifiedLog = {
+      ...normalized,
+      selectedName,
+      selectedSource,
+    };
+    const beforeSelectedMatch = beforeDiary?.mealSections.length
+      ? matchFoodLogInDiaryEntries(beforeDiary.entries, verifiedLog)
+      : undefined;
     const clicked = await clickFoodSearchResult(page, selectedName, selectedSource);
     if (!clicked) {
       return this.result(
@@ -1214,6 +1242,22 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       );
     }
 
+    const expectedCount = expectedExistingMatchCount(input);
+    const baselineMatchCount = beforeSelectedMatch?.count;
+    if (expectedCount !== undefined && baselineMatchCount !== expectedCount) {
+      return this.result("log_food", "needs_manual_step", {
+        ...preflightData,
+        input: safeInput(input),
+        selectedName,
+        selectedSource,
+        browserOpened: true,
+        writeAttempted: false,
+        expectedExistingMatchCount: expectedCount,
+        actualExistingMatchCount: baselineMatchCount,
+        nextStep: "Refresh the diary and provide expectedExistingMatchCount only when it matches the current exact row count.",
+      }, "The current diary baseline does not match expectedExistingMatchCount. No food was written.");
+    }
+
     markPageWriteAttempted(page);
     const saved = await commitFoodEditor(editor);
     if (!saved) {
@@ -1239,15 +1283,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
     await page.waitForTimeout(1500);
     const afterText = await this.waitForDiaryText(page).catch(() => "");
-    const verifiedLog = {
-      ...normalized,
-      selectedName,
-      selectedSource,
-    };
     const afterDiary = await extractDiaryFoodEntries(page).catch(() => undefined);
-    const beforeSelectedMatch = beforeDiary?.mealSections.length
-      ? matchFoodLogInDiaryEntries(beforeDiary.entries, verifiedLog)
-      : undefined;
     const afterMatch = afterDiary?.mealSections.length
       ? matchFoodLogInDiaryEntries(afterDiary.entries, verifiedLog)
       : undefined;
@@ -3313,12 +3349,60 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     key: string,
     input: unknown,
     runner: () => Promise<ProviderResult>,
+    safety?: { callerIdempotencyKey?: string; semanticPayload?: unknown; expectedExistingMatchCount?: number },
   ): ProviderResult {
     pruneBackgroundBrowserJobs();
+    const lock = acquireOperationJournalLock(this.config.operationJournalFile);
+    if (!lock.ok) {
+      this.journalHealth = lock.health;
+      return this.result(feature, "error", {
+        browserOpened: false,
+        writeAttempted: false,
+        journal: this.journalHealth,
+        nextAction: "repair_operation_journal",
+      }, "Could not acquire the operation-journal lock, so Cronometer write was not scheduled.", "browser");
+    }
+    try {
+    const canonicalPayload = stableJson(safety?.semanticPayload ?? input);
+    const semanticKey = backgroundBrowserJobKey(feature, safety?.semanticPayload ?? input);
+    const expectedCount = safety?.expectedExistingMatchCount;
+    const conflictingSemanticOperation = Array.from(this.persistedOperations.values()).find((operation) =>
+      operation.feature === feature
+      && operation.semanticKey === semanticKey
+      && ["running", "indeterminate", "completed"].includes(operation.status)
+      && operation.result?.status !== "written"
+      && operation.result?.status !== "already_exists",
+    );
+    if (conflictingSemanticOperation && expectedCount === undefined) {
+      return this.result(feature, "possibly_written_verify_failed", {
+        operationId: conflictingSemanticOperation.id,
+        state: conflictingSemanticOperation.status,
+        retryable: false,
+        nextAction: "poll_operation",
+        operation: conflictingSemanticOperation,
+        journal: this.journalHealth,
+      }, "A prior unresolved operation has the same canonical write payload. Do not bypass it with a new idempotency key; call get_cronometer_operation and inspect the diary. An intentional repeat requires expectedExistingMatchCount.");
+    }
+    if (!this.journalHealth.durableAdmission) {
+      return this.result(feature, "error", {
+        browserOpened: false,
+        writeAttempted: false,
+        journal: this.journalHealth,
+        nextAction: "repair_operation_journal",
+      }, "Durable operation-journal admission is unavailable, so Cronometer write was not scheduled.", "browser");
+    }
 
     const existingId = backgroundBrowserJobKeys.get(key);
     const existing = existingId ? backgroundBrowserJobs.get(existingId) : undefined;
     const persistedExisting = Array.from(this.persistedOperations.values()).find((operation) => operation.key === key);
+    if (persistedExisting && persistedExisting.canonicalPayload && persistedExisting.canonicalPayload !== canonicalPayload) {
+      return this.result(feature, "needs_manual_step", {
+        operationId: persistedExisting.id,
+        idempotencyKey: safety?.callerIdempotencyKey,
+        journal: this.journalHealth,
+        nextAction: "use_new_idempotency_key",
+      }, "This idempotency key is already bound to a different canonical payload. Use a new key after reviewing the previous operation.");
+    }
     if (!existing && persistedExisting?.status === "indeterminate") {
       return this.result(feature, "possibly_written_verify_failed", {
         operationId: persistedExisting.id,
@@ -3361,11 +3445,21 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       startedAt: now,
       updatedAt: now,
       input,
+      canonicalPayload,
+      callerIdempotencyKey: safety?.callerIdempotencyKey,
+      semanticKey,
     };
+    if (!this.persistOperationJournal({ ...job })) {
+      return this.result(feature, "error", {
+        browserOpened: false,
+        writeAttempted: false,
+        journal: this.journalHealth,
+        nextAction: "repair_operation_journal",
+      }, "Could not durably admit the operation journal record, so Cronometer write was not scheduled.", "browser");
+    }
     backgroundBrowserJobs.set(id, job);
     backgroundBrowserJobKeys.set(key, id);
     this.persistedOperations.set(id, job);
-    this.persistOperationJournal();
 
     void Promise.resolve()
       .then(runner)
@@ -3386,10 +3480,18 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       });
 
     return this.backgroundBrowserJobAcceptedResult(feature, job, false);
+    } finally {
+      lock.release();
+    }
   }
 
-  private persistOperationJournal() {
-    writeOperationJournal(this.config.operationJournalFile, Array.from(this.persistedOperations.values()));
+  private persistOperationJournal(admission?: PersistedBackgroundBrowserJob) {
+    const operations = admission
+      ? [...Array.from(this.persistedOperations.values()).filter((operation) => operation.id !== admission.id), admission]
+      : Array.from(this.persistedOperations.values());
+    const write = writeOperationJournal(this.config.operationJournalFile, operations);
+    this.journalHealth = write.health;
+    return write.ok;
   }
 
   private backgroundBrowserJobAcceptedResult(feature: string, job: BackgroundBrowserJob, alreadyRunning: boolean): ProviderResult {
@@ -3404,7 +3506,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       writeScheduled: true,
       backgroundJob: summarizeBackgroundBrowserJob(job, Date.now()),
       alreadyRunning,
-      nextStep: "Call cronometer_runtime_status until this backgroundJob.id is completed or failed. Do not retry the write while it is running.",
+      nextStep: "Call get_cronometer_operation with this operationId until it completes or fails. Do not retry the write while it is running.",
     });
   }
 
@@ -3451,7 +3553,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       ...data,
       backgroundJob: job ? summarizeBackgroundBrowserJob(job, Date.now()) : data.backgroundJob,
       waitedForCompletionMs: Date.now() - startedAt,
-      nextStep: "The background job is still running. Call cronometer_runtime_status until it completes; do not submit the same batch again.",
+      nextStep: "The background job is still running. Call get_cronometer_operation with its operationId until it completes; do not submit the same batch again.",
     }, result.warning, result.source);
   }
 
@@ -4265,12 +4367,32 @@ export function __setActiveBrowserJobForTests(feature: string, startedAt: number
   activeBrowserJob = { id: ++browserJobSeq, feature, startedAt };
 }
 
-function readOperationJournal(filePath?: string): PersistedBackgroundBrowserJob[] {
-  if (!filePath || !existsSync(filePath)) return [];
+function acquireOperationJournalLock(filePath?: string) {
+  if (!filePath) return { ok: false, health: { configured: false, readable: true, writable: false, durableAdmission: false, reason: "No operation journal file is configured." } satisfies OperationJournalHealth, release: () => undefined };
+  const lockPath = `${filePath}.lock`;
+  try {
+    mkdirSync(lockPath, { mode: 0o700 });
+    return {
+      ok: true,
+      health: { configured: true, readable: true, writable: true, durableAdmission: true } satisfies OperationJournalHealth,
+      release: () => { try { rmdirSync(lockPath); } catch { /* best effort */ } },
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      health: { configured: true, readable: existsSync(filePath), writable: false, durableAdmission: false, reason: error instanceof Error ? error.message : "Operation journal lock unavailable." } satisfies OperationJournalHealth,
+      release: () => undefined,
+    };
+  }
+}
+
+function readOperationJournal(filePath?: string): { operations: PersistedBackgroundBrowserJob[]; health: OperationJournalHealth } {
+  if (!filePath) return { operations: [], health: { configured: false, readable: true, writable: false, durableAdmission: false, reason: "No operation journal file is configured." } };
+  if (!existsSync(filePath)) return { operations: [], health: { configured: true, readable: true, writable: true, durableAdmission: true } };
   try {
     const parsed = JSON.parse(readFileSync(filePath, "utf8")) as { operations?: unknown };
-    if (!Array.isArray(parsed.operations)) return [];
-    return parsed.operations.filter((value): value is PersistedBackgroundBrowserJob => {
+    if (!Array.isArray(parsed.operations)) throw new Error("missing operations array");
+    const operations = parsed.operations.filter((value): value is PersistedBackgroundBrowserJob => {
       if (!value || typeof value !== "object") return false;
       const item = value as Record<string, unknown>;
       return typeof item.id === "string"
@@ -4280,33 +4402,57 @@ function readOperationJournal(filePath?: string): PersistedBackgroundBrowserJob[
         && typeof item.startedAt === "number"
         && typeof item.updatedAt === "number";
     });
-  } catch {
-    return [];
+    return { operations, health: { configured: true, readable: true, writable: true, durableAdmission: true } };
+  } catch (error) {
+    return { operations: [], health: { configured: true, readable: false, writable: false, durableAdmission: false, reason: error instanceof Error ? error.message : "Operation journal is unreadable." } };
   }
 }
 
 function writeOperationJournal(filePath: string | undefined, operations: PersistedBackgroundBrowserJob[]) {
-  if (!filePath) return;
+  if (!filePath) return { ok: false, health: { configured: false, readable: true, writable: false, durableAdmission: false, reason: "No operation journal file is configured." } satisfies OperationJournalHealth };
   const maxAgeMs = 24 * 60 * 60 * 1000;
   const now = Date.now();
   const retained = operations
     .filter((operation) => operation.status === "running" || operation.status === "indeterminate" || now - operation.updatedAt <= maxAgeMs)
     .sort((left, right) => right.updatedAt - left.updatedAt || compareStringsOrdinal(left.id, right.id))
     .slice(0, 100);
-  const temporaryPath = `${filePath}.tmp`;
+  const temporaryPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   try {
-    writeFileSync(temporaryPath, JSON.stringify({ version: 1, operations: retained }, null, 2), { mode: 0o600 });
+    writeFileSync(temporaryPath, JSON.stringify({ version: 2, operations: retained }, null, 2), { mode: 0o600, flag: "wx" });
     chmodSync(temporaryPath, 0o600);
     renameSync(temporaryPath, filePath);
     chmodSync(filePath, 0o600);
-  } catch {
+    return { ok: true, health: { configured: true, readable: true, writable: true, durableAdmission: true } satisfies OperationJournalHealth };
+  } catch (error) {
     try { unlinkSync(temporaryPath); } catch { /* best effort */ }
+    return { ok: false, health: { configured: true, readable: existsSync(filePath), writable: false, durableAdmission: false, reason: error instanceof Error ? error.message : "Operation journal write failed." } satisfies OperationJournalHealth };
   }
 }
 
 function backgroundBrowserJobKey(feature: string, input: unknown) {
   const digest = createHash("sha256").update(stableJson(input)).digest("hex").slice(0, 24);
   return `${feature}:${digest}`;
+}
+
+function canonicalFoodLogPayload(normalized: NormalizedFoodLog) {
+  return {
+    date: normalized.date,
+    meal: normalized.meal,
+    query: normalized.query,
+    selectedName: normalized.selectedName,
+    selectedSource: normalized.selectedSource,
+    amount: normalized.amount,
+    unit: normalized.unit,
+    portion: normalized.portion,
+    timestamp: normalized.timestamp,
+  };
+}
+
+function expectedExistingMatchCount(input: unknown) {
+  const value = input && typeof input === "object"
+    ? (input as Record<string, unknown>).expectedExistingMatchCount
+    : undefined;
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
 }
 
 function pruneBackgroundBrowserJobs(now = Date.now()) {
