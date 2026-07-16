@@ -83,6 +83,24 @@ await withClient(async (client) => {
   const nonModelVisibleActionTools = actionTools
     .filter((tool) => tool && !tool._meta?.ui?.visibility?.includes("model"))
     .map((tool) => tool.name);
+  const deleteDiaryTool = tools.tools.find((tool) => tool.name === "delete_diary_food_entry");
+  const createCustomFoodTool = tools.tools.find((tool) => tool.name === "create_custom_food");
+  const createAndLogCustomFoodTool = tools.tools.find((tool) => tool.name === "create_and_log_custom_food");
+  const logFoodTool = tools.tools.find((tool) => tool.name === "log_food");
+  const logFoodsTool = tools.tools.find((tool) => tool.name === "log_foods");
+  const deleteCountSchema = deleteDiaryTool?.inputSchema?.properties?.deleteCount;
+  const portionsSchema = createCustomFoodTool?.inputSchema?.properties?.portions;
+  const expectedMatchCountSchema = logFoodTool?.inputSchema?.properties?.expectedExistingMatchCount;
+  const schemaShapesOk = deleteCountSchema?.type === "integer" &&
+    (deleteCountSchema.minimum === 1 || deleteCountSchema.exclusiveMinimum === 0) &&
+    !deleteDiaryTool?.inputSchema?.required?.includes("deleteCount") &&
+    portionsSchema?.type === "array" &&
+    portionsSchema?.items?.properties?.name?.type === "string" &&
+    portionsSchema?.items?.properties?.weightGrams?.type === "number" &&
+    createAndLogCustomFoodTool?.inputSchema?.properties?.portions?.type === "array" &&
+    expectedMatchCountSchema?.type === "integer" &&
+    expectedMatchCountSchema?.minimum === 0 &&
+    logFoodsTool?.inputSchema?.properties?.items?.items?.properties?.expectedExistingMatchCount?.type === "integer";
   checks.push({
     name: "tools",
     ok: tools.tools.length >= 50 &&
@@ -91,6 +109,7 @@ await withClient(async (client) => {
       missingActionTools.length === 0 &&
       templateBoundActionTools.length === 0 &&
       nonModelVisibleActionTools.length === 0 &&
+      schemaShapesOk &&
       Array.isArray(runtimeSecuritySchemes) &&
       runtimeSecuritySchemes.some((scheme) => scheme?.type === "oauth2"),
     data: {
@@ -100,6 +119,14 @@ await withClient(async (client) => {
       missingActionTools,
       templateBoundActionTools,
       nonModelVisibleActionTools,
+      schemaShapesOk,
+      schemaFragments: {
+        deleteCount: deleteCountSchema,
+        portions: portionsSchema,
+        createAndLogPortions: createAndLogCustomFoodTool?.inputSchema?.properties?.portions,
+        expectedExistingMatchCount: expectedMatchCountSchema,
+        batchExpectedExistingMatchCount: logFoodsTool?.inputSchema?.properties?.items?.items?.properties?.expectedExistingMatchCount,
+      },
       runtimeHasOauthMetadata: Array.isArray(runtimeSecuritySchemes) &&
         runtimeSecuritySchemes.some((scheme) => scheme?.type === "oauth2"),
     },
@@ -119,7 +146,10 @@ await withClient(async (client) => {
     name: "create_custom_food",
     arguments: {
       name: "cronogpt smoke test dry run",
-      servingSize: "1 serving",
+      portions: [
+        { name: "crisp", weightGrams: 8.5 },
+        { name: "bag", weightGrams: 85 },
+      ],
       barcode: "4006381333931",
       nutrients: { calories: 1, net_carbs: 2, caffeine: 80, "omega-3 dha": 0.2, "20:5n3": 0.1, vitamin_c: 12 },
       dryRun: true,
@@ -131,7 +161,9 @@ await withClient(async (client) => {
   checks.push({
     name: "custom_food_dry_run",
     ok: dryRun.structuredContent?.status === "dry_run" &&
-      customFoodPreview?.servingSize?.parsed?.unit === "serving" &&
+      customFoodPreview?.servingSize?.parsed?.unit === "g" &&
+      customFoodPreview?.servingSize?.parsed?.amount === 1 &&
+      customFoodPreview?.portions?.length === 2 &&
       customFoodPreview?.barcode?.normalized === "4006381333931" &&
       customFoodPreviewLabels.includes("Energy") &&
       customFoodPreviewLabels.includes("Total Carbs") &&
@@ -150,12 +182,15 @@ await withClient(async (client) => {
     name: "create_and_log_custom_food",
     arguments: {
       name: "cronogpt smoke test researched snack",
-      servingSize: "1 serving",
+      portions: [
+        { name: "crisp", weightGrams: 12 },
+        { name: "bag", weightGrams: 120 },
+      ],
       barcode: "036000291452",
       nutrients: { calories: 123, protein: 4, net_carbs: 20, total_fat: 3 },
       nutritionSource: "smoke test fixture",
       meal: "Snacks",
-      amount: 1,
+      portion: { kind: "whole_package", portion: { name: "bag", weightGrams: 120 } },
       dryRun: true,
       confirmed: false,
     },
