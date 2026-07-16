@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 import type {
   BiometricLogInput,
@@ -173,19 +173,8 @@ interface PersistedBackgroundBrowserJob {
   startedAt: number;
   updatedAt: number;
   input: unknown;
-  canonicalPayload?: string;
-  callerIdempotencyKey?: string;
-  semanticKey?: string;
   result?: ProviderResult;
   error?: string;
-}
-
-interface OperationJournalHealth {
-  configured: boolean;
-  readable: boolean;
-  writable: boolean;
-  durableAdmission: boolean;
-  reason?: string;
 }
 
 interface BackgroundBrowserJob extends Omit<PersistedBackgroundBrowserJob, "status"> {
@@ -263,13 +252,10 @@ interface StorageStateInfo {
 
 export class BrowserCronometerProvider extends BaseCronometerProvider {
   private readonly persistedOperations = new Map<string, PersistedBackgroundBrowserJob>();
-  private journalHealth: OperationJournalHealth;
 
   constructor(private readonly config: BrowserConfig) {
     super("browser", "browser");
-    const journal = readOperationJournal(config.operationJournalFile);
-    this.journalHealth = journal.health;
-    for (const operation of journal.operations) {
+    for (const operation of readOperationJournal(config.operationJournalFile)) {
       const recovered = operation.status === "running"
         ? { ...operation, status: "indeterminate" as const, error: "The process restarted before this operation reached a terminal state." }
         : operation;
@@ -349,15 +335,14 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       loginBackoffSource: loginBackoff.source,
       loginBackoffFileConfigured: Boolean(this.config.loginBackoffFile),
       operationJournalFileConfigured: Boolean(this.config.operationJournalFile),
-      operationJournal: this.journalHealth,
       persistedOperationCount: this.persistedOperations.size,
       lastLoginFailure: loginBackoff.reason,
       guidance: [
         "Use dryRun=true for validation and previews; dry-run write tools do not open Cronometer.",
         "Use refresh_cronometer_session only as an optional read-only warmup; do not block a confirmed create_and_log_custom_food workflow on it.",
-        "Confirmed log_food writes run as background jobs; poll get_cronometer_operation with the operationId before retrying.",
+        "Confirmed log_food writes run as background jobs; poll cronometer_runtime_status until the job is completed before retrying.",
         "Use log_foods for multi-ingredient meals; it submits one idempotent batch and reports per-item write status.",
-        "Confirmed create_and_log_custom_food writes run as background jobs; poll get_cronometer_operation with the operationId before retrying.",
+        "Confirmed create_and_log_custom_food writes run as background jobs; poll cronometer_runtime_status until the job is completed before retrying.",
         "A stale browser job is reported but never bypassed with a concurrent writer; its operation timeout closes the browser session before the serialized queue advances.",
         "Use resolve_recipe_ingredients with a low limitPerIngredient and a larger maxSeconds value for large recipes.",
         "If loginPaused is true and storageStateUsable is false, wait or provide durable storage state/remote browser before retrying browser actions. Usable storage state may still allow non-login browser actions during cooldown.",
@@ -779,11 +764,6 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           input: safeInput(input),
         },
         () => this.withPage("log_food", (page) => this.logFoodOnPage(page, input, normalized, preflightData)),
-        {
-          callerIdempotencyKey: normalized.idempotencyKey,
-          semanticPayload: canonicalFoodLogPayload(normalized),
-          expectedExistingMatchCount: expectedExistingMatchCount(input),
-        },
       );
       return this.waitForAcceptedBackgroundJob(
         "log_food",
@@ -1063,14 +1043,6 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
     const selectedName = selection.result.name;
     const selectedSource = selection.result.source;
-    const verifiedLog = {
-      ...normalized,
-      selectedName,
-      selectedSource,
-    };
-    const beforeSelectedMatch = beforeDiary?.mealSections.length
-      ? matchFoodLogInDiaryEntries(beforeDiary.entries, verifiedLog)
-      : undefined;
     const clicked = await clickFoodSearchResult(page, selectedName, selectedSource);
     if (!clicked) {
       return this.result(
@@ -1092,8 +1064,28 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       );
     }
 
+    const editor = await foodEditor(page);
+    if (!editor) {
+      return this.result(
+        "log_food",
+        "needs_manual_step",
+        {
+          ...preflightData,
+          input: safeInput(input),
+          selectedName,
+          selectedSource,
+          selection,
+          browserOpened: true,
+          writeAttempted: false,
+          queryUsed,
+          retry: retryGuidanceForFoodLog("needs_manual_step"),
+        },
+        "Could not identify exactly one semantic food editor after selecting the food. No food was written.",
+      );
+    }
+
     await page.waitForTimeout(1000);
-    const timeFill = await fillFoodTime(page, normalized.timestamp);
+    const timeFill = await fillFoodTime(page, editor, normalized.timestamp);
     if (!timeFill.filled) {
       return this.result(
         "log_food",
@@ -1115,15 +1107,16 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     }
     let convertedFoodAmount = await convertFoodLogGramAmountForCurrentServingUnit(
       page,
+      editor,
       normalized.amount,
       normalized.unit,
       selectedName,
     );
     let unitFill = convertedFoodAmount?.converted === true
       ? convertedFoodLogUnitFill(normalized.unit, convertedFoodAmount.currentUnitText ?? "")
-      : await fillFoodUnit(page, normalized.unit);
+      : await fillFoodUnit(page, editor, normalized.unit);
     convertedFoodAmount = unitFill.filled === false
-      ? await convertFoodLogGramAmountForCurrentServingUnit(page, normalized.amount, normalized.unit, selectedName)
+      ? await convertFoodLogGramAmountForCurrentServingUnit(page, editor, normalized.amount, normalized.unit, selectedName)
       : convertedFoodAmount;
     if (unitFill.filled === false && convertedFoodAmount?.converted === true) {
       unitFill = convertedFoodLogUnitFill(normalized.unit, convertedFoodAmount.currentUnitText ?? "");
@@ -1150,7 +1143,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     }
     const amountFill = convertedFoodAmount?.converted === true && convertedFoodAmount.amount
       ? convertedFoodAmount.amount
-      : await fillFoodAmount(page, normalized.amount, selectedName);
+      : await fillFoodAmount(page, editor, normalized.amount, selectedName);
     if (!amountFill.filled) {
       return this.result(
         "log_food",
@@ -1172,7 +1165,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         amountFill.warning ?? `Could not fill requested amount ${normalized.amount}. No food was written.`,
       );
     }
-    const mealSelection = await chooseMeal(page, normalized.meal);
+    const mealSelection = await chooseMeal(page, editor, normalized.meal);
     if (!mealSelection.selected) {
       return this.result(
         "log_food",
@@ -1196,24 +1189,33 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       );
     }
 
-    const expectedCount = expectedExistingMatchCount(input);
-    const baselineMatchCount = beforeSelectedMatch?.count;
-    if (expectedCount !== undefined && baselineMatchCount !== expectedCount) {
-      return this.result("log_food", "needs_manual_step", {
-        ...preflightData,
-        input: safeInput(input),
-        selectedName,
-        selectedSource,
-        browserOpened: true,
-        writeAttempted: false,
-        expectedExistingMatchCount: expectedCount,
-        actualExistingMatchCount: baselineMatchCount,
-        nextStep: "Refresh the diary and provide expectedExistingMatchCount only when it matches the current exact row count.",
-      }, "The current diary baseline does not match expectedExistingMatchCount. No food was written.");
+    const mealReadback = await readFoodEditorMeal(editor, normalized.meal);
+    if (!mealReadback.matches) {
+      return this.result(
+        "log_food",
+        "needs_manual_step",
+        {
+          ...preflightData,
+          input: safeInput(input),
+          selectedName,
+          selectedSource,
+          selection,
+          timeFill,
+          unitFill,
+          amountFill,
+          mealSelection,
+          mealReadback,
+          browserOpened: true,
+          writeAttempted: false,
+          queryUsed,
+          retry: retryGuidanceForFoodLog("needs_manual_step"),
+        },
+        `The editor meal readback immediately before commit was ${mealReadback.currentMeal || "unreadable"}, not ${normalized.meal}. No food was written.`,
+      );
     }
 
     markPageWriteAttempted(page);
-    const saved = await clickDialogButton(page, /^(ADD|ADD FOOD|ADD TO DIARY|ADD SERVING|SAVE|SAVE CHANGES|DONE|OK)$/i);
+    const saved = await commitFoodEditor(editor);
     if (!saved) {
       return this.result(
         "log_food",
@@ -1228,6 +1230,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           queryUsed,
           timeFill,
           mealSelection,
+          mealReadback,
           retry: retryGuidanceForFoodLog("needs_manual_step"),
         },
         "Selected the food but could not find a stable add/save button. Nothing was intentionally saved.",
@@ -1236,7 +1239,15 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
     await page.waitForTimeout(1500);
     const afterText = await this.waitForDiaryText(page).catch(() => "");
+    const verifiedLog = {
+      ...normalized,
+      selectedName,
+      selectedSource,
+    };
     const afterDiary = await extractDiaryFoodEntries(page).catch(() => undefined);
+    const beforeSelectedMatch = beforeDiary?.mealSections.length
+      ? matchFoodLogInDiaryEntries(beforeDiary.entries, verifiedLog)
+      : undefined;
     const afterMatch = afterDiary?.mealSections.length
       ? matchFoodLogInDiaryEntries(afterDiary.entries, verifiedLog)
       : undefined;
@@ -1256,6 +1267,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       amountFill,
       timeFill,
       mealSelection,
+      mealReadback,
       convertedFoodAmount,
       browserOpened: true,
       writeAttempted: true,
@@ -3301,60 +3313,12 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     key: string,
     input: unknown,
     runner: () => Promise<ProviderResult>,
-    safety?: { callerIdempotencyKey?: string; semanticPayload?: unknown; expectedExistingMatchCount?: number },
   ): ProviderResult {
     pruneBackgroundBrowserJobs();
-    const lock = acquireOperationJournalLock(this.config.operationJournalFile);
-    if (!lock.ok) {
-      this.journalHealth = lock.health;
-      return this.result(feature, "error", {
-        browserOpened: false,
-        writeAttempted: false,
-        journal: this.journalHealth,
-        nextAction: "repair_operation_journal",
-      }, "Could not acquire the operation-journal lock, so Cronometer write was not scheduled.", "browser");
-    }
-    try {
-    const canonicalPayload = stableJson(safety?.semanticPayload ?? input);
-    const semanticKey = backgroundBrowserJobKey(feature, safety?.semanticPayload ?? input);
-    const expectedCount = safety?.expectedExistingMatchCount;
-    const conflictingSemanticOperation = Array.from(this.persistedOperations.values()).find((operation) =>
-      operation.feature === feature
-      && operation.semanticKey === semanticKey
-      && ["running", "indeterminate", "completed"].includes(operation.status)
-      && operation.result?.status !== "written"
-      && operation.result?.status !== "already_exists",
-    );
-    if (conflictingSemanticOperation && expectedCount === undefined) {
-      return this.result(feature, "possibly_written_verify_failed", {
-        operationId: conflictingSemanticOperation.id,
-        state: conflictingSemanticOperation.status,
-        retryable: false,
-        nextAction: "poll_operation",
-        operation: conflictingSemanticOperation,
-        journal: this.journalHealth,
-      }, "A prior unresolved operation has the same canonical write payload. Do not bypass it with a new idempotency key; call get_cronometer_operation and inspect the diary. An intentional repeat requires expectedExistingMatchCount.");
-    }
-    if (!this.journalHealth.durableAdmission) {
-      return this.result(feature, "error", {
-        browserOpened: false,
-        writeAttempted: false,
-        journal: this.journalHealth,
-        nextAction: "repair_operation_journal",
-      }, "Durable operation-journal admission is unavailable, so Cronometer write was not scheduled.", "browser");
-    }
 
     const existingId = backgroundBrowserJobKeys.get(key);
     const existing = existingId ? backgroundBrowserJobs.get(existingId) : undefined;
     const persistedExisting = Array.from(this.persistedOperations.values()).find((operation) => operation.key === key);
-    if (persistedExisting && persistedExisting.canonicalPayload && persistedExisting.canonicalPayload !== canonicalPayload) {
-      return this.result(feature, "needs_manual_step", {
-        operationId: persistedExisting.id,
-        idempotencyKey: safety?.callerIdempotencyKey,
-        journal: this.journalHealth,
-        nextAction: "use_new_idempotency_key",
-      }, "This idempotency key is already bound to a different canonical payload. Use a new key after reviewing the previous operation.");
-    }
     if (!existing && persistedExisting?.status === "indeterminate") {
       return this.result(feature, "possibly_written_verify_failed", {
         operationId: persistedExisting.id,
@@ -3397,21 +3361,11 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       startedAt: now,
       updatedAt: now,
       input,
-      canonicalPayload,
-      callerIdempotencyKey: safety?.callerIdempotencyKey,
-      semanticKey,
     };
-    if (!this.persistOperationJournal({ ...job })) {
-      return this.result(feature, "error", {
-        browserOpened: false,
-        writeAttempted: false,
-        journal: this.journalHealth,
-        nextAction: "repair_operation_journal",
-      }, "Could not durably admit the operation journal record, so Cronometer write was not scheduled.", "browser");
-    }
     backgroundBrowserJobs.set(id, job);
     backgroundBrowserJobKeys.set(key, id);
     this.persistedOperations.set(id, job);
+    this.persistOperationJournal();
 
     void Promise.resolve()
       .then(runner)
@@ -3432,18 +3386,10 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       });
 
     return this.backgroundBrowserJobAcceptedResult(feature, job, false);
-    } finally {
-      lock.release();
-    }
   }
 
-  private persistOperationJournal(admission?: PersistedBackgroundBrowserJob) {
-    const operations = admission
-      ? [...Array.from(this.persistedOperations.values()).filter((operation) => operation.id !== admission.id), admission]
-      : Array.from(this.persistedOperations.values());
-    const write = writeOperationJournal(this.config.operationJournalFile, operations);
-    this.journalHealth = write.health;
-    return write.ok;
+  private persistOperationJournal() {
+    writeOperationJournal(this.config.operationJournalFile, Array.from(this.persistedOperations.values()));
   }
 
   private backgroundBrowserJobAcceptedResult(feature: string, job: BackgroundBrowserJob, alreadyRunning: boolean): ProviderResult {
@@ -3458,7 +3404,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       writeScheduled: true,
       backgroundJob: summarizeBackgroundBrowserJob(job, Date.now()),
       alreadyRunning,
-      nextStep: "Call get_cronometer_operation with this operationId until it completes or fails. Do not retry the write while it is running.",
+      nextStep: "Call cronometer_runtime_status until this backgroundJob.id is completed or failed. Do not retry the write while it is running.",
     });
   }
 
@@ -3505,7 +3451,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       ...data,
       backgroundJob: job ? summarizeBackgroundBrowserJob(job, Date.now()) : data.backgroundJob,
       waitedForCompletionMs: Date.now() - startedAt,
-      nextStep: "The background job is still running. Call get_cronometer_operation with its operationId until it completes; do not submit the same batch again.",
+      nextStep: "The background job is still running. Call cronometer_runtime_status until it completes; do not submit the same batch again.",
     }, result.warning, result.source);
   }
 
@@ -4319,32 +4265,12 @@ export function __setActiveBrowserJobForTests(feature: string, startedAt: number
   activeBrowserJob = { id: ++browserJobSeq, feature, startedAt };
 }
 
-function acquireOperationJournalLock(filePath?: string) {
-  if (!filePath) return { ok: false, health: { configured: false, readable: true, writable: false, durableAdmission: false, reason: "No operation journal file is configured." } satisfies OperationJournalHealth, release: () => undefined };
-  const lockPath = `${filePath}.lock`;
-  try {
-    mkdirSync(lockPath, { mode: 0o700 });
-    return {
-      ok: true,
-      health: { configured: true, readable: true, writable: true, durableAdmission: true } satisfies OperationJournalHealth,
-      release: () => { try { rmdirSync(lockPath); } catch { /* best effort */ } },
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      health: { configured: true, readable: existsSync(filePath), writable: false, durableAdmission: false, reason: error instanceof Error ? error.message : "Operation journal lock unavailable." } satisfies OperationJournalHealth,
-      release: () => undefined,
-    };
-  }
-}
-
-function readOperationJournal(filePath?: string): { operations: PersistedBackgroundBrowserJob[]; health: OperationJournalHealth } {
-  if (!filePath) return { operations: [], health: { configured: false, readable: true, writable: false, durableAdmission: false, reason: "No operation journal file is configured." } };
-  if (!existsSync(filePath)) return { operations: [], health: { configured: true, readable: true, writable: true, durableAdmission: true } };
+function readOperationJournal(filePath?: string): PersistedBackgroundBrowserJob[] {
+  if (!filePath || !existsSync(filePath)) return [];
   try {
     const parsed = JSON.parse(readFileSync(filePath, "utf8")) as { operations?: unknown };
-    if (!Array.isArray(parsed.operations)) throw new Error("missing operations array");
-    const operations = parsed.operations.filter((value): value is PersistedBackgroundBrowserJob => {
+    if (!Array.isArray(parsed.operations)) return [];
+    return parsed.operations.filter((value): value is PersistedBackgroundBrowserJob => {
       if (!value || typeof value !== "object") return false;
       const item = value as Record<string, unknown>;
       return typeof item.id === "string"
@@ -4354,57 +4280,33 @@ function readOperationJournal(filePath?: string): { operations: PersistedBackgro
         && typeof item.startedAt === "number"
         && typeof item.updatedAt === "number";
     });
-    return { operations, health: { configured: true, readable: true, writable: true, durableAdmission: true } };
-  } catch (error) {
-    return { operations: [], health: { configured: true, readable: false, writable: false, durableAdmission: false, reason: error instanceof Error ? error.message : "Operation journal is unreadable." } };
+  } catch {
+    return [];
   }
 }
 
 function writeOperationJournal(filePath: string | undefined, operations: PersistedBackgroundBrowserJob[]) {
-  if (!filePath) return { ok: false, health: { configured: false, readable: true, writable: false, durableAdmission: false, reason: "No operation journal file is configured." } satisfies OperationJournalHealth };
+  if (!filePath) return;
   const maxAgeMs = 24 * 60 * 60 * 1000;
   const now = Date.now();
   const retained = operations
     .filter((operation) => operation.status === "running" || operation.status === "indeterminate" || now - operation.updatedAt <= maxAgeMs)
     .sort((left, right) => right.updatedAt - left.updatedAt || compareStringsOrdinal(left.id, right.id))
     .slice(0, 100);
-  const temporaryPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  const temporaryPath = `${filePath}.tmp`;
   try {
-    writeFileSync(temporaryPath, JSON.stringify({ version: 2, operations: retained }, null, 2), { mode: 0o600, flag: "wx" });
+    writeFileSync(temporaryPath, JSON.stringify({ version: 1, operations: retained }, null, 2), { mode: 0o600 });
     chmodSync(temporaryPath, 0o600);
     renameSync(temporaryPath, filePath);
     chmodSync(filePath, 0o600);
-    return { ok: true, health: { configured: true, readable: true, writable: true, durableAdmission: true } satisfies OperationJournalHealth };
-  } catch (error) {
+  } catch {
     try { unlinkSync(temporaryPath); } catch { /* best effort */ }
-    return { ok: false, health: { configured: true, readable: existsSync(filePath), writable: false, durableAdmission: false, reason: error instanceof Error ? error.message : "Operation journal write failed." } satisfies OperationJournalHealth };
   }
 }
 
 function backgroundBrowserJobKey(feature: string, input: unknown) {
   const digest = createHash("sha256").update(stableJson(input)).digest("hex").slice(0, 24);
   return `${feature}:${digest}`;
-}
-
-function canonicalFoodLogPayload(normalized: NormalizedFoodLog) {
-  return {
-    date: normalized.date,
-    meal: normalized.meal,
-    query: normalized.query,
-    selectedName: normalized.selectedName,
-    selectedSource: normalized.selectedSource,
-    amount: normalized.amount,
-    unit: normalized.unit,
-    portion: normalized.portion,
-    timestamp: normalized.timestamp,
-  };
-}
-
-function expectedExistingMatchCount(input: unknown) {
-  const value = input && typeof input === "object"
-    ? (input as Record<string, unknown>).expectedExistingMatchCount
-    : undefined;
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
 }
 
 function pruneBackgroundBrowserJobs(now = Date.now()) {
@@ -5284,11 +5186,26 @@ function activeDialog(page: Page) {
   return page.locator(".pretty-dialog, [role='dialog'], .gwt-DialogBox, .popupContent").last();
 }
 
+async function foodEditor(page: Page) {
+  const editors = page.locator(".pretty-dialog:visible, [role='dialog']:visible, .gwt-DialogBox:visible, .popupContent:visible").filter({ hasText: /(Add Food to Diary|Description\s+Source)/i });
+  const count = await editors.count().catch(() => 0);
+  const candidates: Array<ReturnType<Page["locator"]>> = [];
+  for (let index = 0; index < count; index += 1) {
+    const editor = editors.nth(index);
+    const semantic = await editor.evaluate((element) => {
+      const text = (element.textContent ?? "").replace(/\s+/g, " ");
+      const controls = element.querySelectorAll("input, button, select");
+      return /(Add Food to Diary|Description\s+Source)/i.test(text)
+        && controls.length >= 3
+        && /\b(ADD|ADD FOOD|ADD TO DIARY|ADD SERVING|SAVE|DONE)\b/i.test(text);
+    }).catch(() => false);
+    if (semantic) candidates.push(editor);
+  }
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+
 async function foodDialogIsOpen(page: Page) {
-  const dialog = activeDialog(page);
-  if (!(await dialog.isVisible().catch(() => false))) return false;
-  const text = await dialog.innerText({ timeout: 1000 }).catch(() => "");
-  return /\b(Add Food to Diary|Description\s+Source|SEARCH)\b/i.test(text);
+  return Boolean(await foodEditor(page));
 }
 
 async function waitForFoodDialogReady(page: Page, timeoutMs: number) {
@@ -5539,15 +5456,14 @@ async function clickFoodSearchResult(page: Page, selectedName: string, selectedS
   return false;
 }
 
-async function fillFoodAmount(page: Page, amount?: number, selectedName?: string) {
+async function fillFoodAmount(page: Page, editor: ReturnType<Page["locator"]>, amount?: number, selectedName?: string) {
   if (amount === undefined) return { filled: true as const, skipped: true as const };
-  const dialog = activeDialog(page);
-  const textBoxes = dialog.locator("input.text-box:visible");
+  const textBoxes = editor.locator("input.text-box:visible");
   const count = await textBoxes.count().catch(() => 0);
   const selectedPanel = count === 0 ? await recipeIngredientSelectedPanel(page, selectedName) : undefined;
   const input = count > 0
     ? textBoxes.nth(count - 1)
-    : await editableAmountInput(page, 2500, selectedPanel);
+    : await editableAmountInputInScope(editor, selectedPanel);
   if (!input) return { filled: false as const, warning: "No visible food amount input was found." };
   const value = String(amount);
   await input.fill(value);
@@ -5565,13 +5481,12 @@ async function fillFoodAmount(page: Page, amount?: number, selectedName?: string
   return { filled: true as const, value, actualValue, selectedPanel };
 }
 
-async function fillFoodTime(page: Page, timestamp?: string) {
+async function fillFoodTime(page: Page, editor: ReturnType<Page["locator"]>, timestamp?: string) {
   if (!timestamp) return { filled: true as const, skipped: true as const };
   const parsed = parseTime(timestamp);
   if (!parsed) return { filled: false as const, timestamp, warning: "Food time was not in a supported unambiguous format." };
 
-  const dialog = activeDialog(page);
-  const textBoxes = dialog.locator("input.text-box:visible");
+  const textBoxes = editor.locator("input.text-box:visible");
   if ((await textBoxes.count().catch(() => 0)) < 2) {
     return { filled: false as const, timestamp, warning: "The food editor did not expose both hour and minute inputs." };
   }
@@ -5591,7 +5506,7 @@ async function fillFoodTime(page: Page, timestamp?: string) {
     };
   }
 
-  const periodButton = dialog.locator("button.dropdown-toggle:visible").filter({ hasText: /^(AM|PM)$/i }).first();
+  const periodButton = editor.locator("button.dropdown-toggle:visible").filter({ hasText: /^(AM|PM)$/i }).first();
   if ((await periodButton.count().catch(() => 0)) === 0) {
     return { filled: false as const, timestamp, actualHour, actualMinute, warning: "The food editor did not expose an AM/PM control." };
   }
@@ -5619,10 +5534,10 @@ async function fillFoodTime(page: Page, timestamp?: string) {
   };
 }
 
-async function fillFoodUnit(page: Page, unit?: string) {
+async function fillFoodUnit(page: Page, editor: ReturnType<Page["locator"]>, unit?: string) {
   if (!unit) return { filled: true as const, skipped: true as const };
   const normalizedUnit = unit.trim();
-  const unitButton = await foodLogUnitDropdownButton(page);
+  const unitButton = await foodLogUnitDropdownButton(editor);
   if (!unitButton) {
     return { filled: false as const, unit: normalizedUnit, warning: "No visible food unit dropdown was found." };
   }
@@ -5654,13 +5569,11 @@ async function fillFoodUnit(page: Page, unit?: string) {
   return { filled: true as const, unit: normalizedUnit, strategy: "dropdown-option" as const, currentUnitText: updatedUnitText };
 }
 
-async function foodLogUnitDropdownButton(page: Page) {
-  const scopes = [activeDialog(page), page.locator("body")];
-  for (const scope of scopes) {
-    const buttons = scope.locator("button.dropdown-toggle:visible, button.dropdown-btn:visible");
-    const count = await buttons.count().catch(() => 0);
-    for (let index = count - 1; index >= 0; index -= 1) {
-      const button = buttons.nth(index);
+async function foodLogUnitDropdownButton(scope: ReturnType<Page["locator"]>) {
+  const buttons = scope.locator("button.dropdown-toggle:visible, button.dropdown-btn:visible");
+  const count = await buttons.count().catch(() => 0);
+  for (let index = count - 1; index >= 0; index -= 1) {
+    const button = buttons.nth(index);
       const meta = await button.evaluate((element) => {
         const rect = element.getBoundingClientRect();
         const text = (element.textContent ?? "").replace(/\s+/g, " ").trim();
@@ -5673,7 +5586,6 @@ async function foodLogUnitDropdownButton(page: Page) {
       if (!meta || meta.width < 20 || meta.height < 16) continue;
       if (/\b(AM|PM|All|Custom|NCCDB|USDA|CRDB|Category|Source|Show score)\b/i.test(meta.text)) continue;
       if (foodLogUnitTextLooksSelectable(meta.text)) return button;
-    }
   }
   return undefined;
 }
@@ -5889,15 +5801,15 @@ async function currentRecipeUnitText(page: Page) {
   return unitButton ? unitButton.innerText().catch(() => "") : "";
 }
 
-async function currentFoodLogUnitText(page: Page, selectedName?: string) {
-  const unitButton = await foodLogUnitDropdownButton(page);
+async function currentFoodLogUnitText(editor: ReturnType<Page["locator"]>, selectedName?: string) {
+  const unitButton = await foodLogUnitDropdownButton(editor);
   const buttonText = unitButton ? await unitButton.innerText().catch(() => "") : "";
   if (buttonText.trim()) return buttonText;
-  return foodLogVisibleServingUnitText(page, selectedName);
+  return foodLogVisibleServingUnitText(editor, selectedName);
 }
 
-async function foodLogVisibleServingUnitText(page: Page, selectedName?: string) {
-  return page.evaluate((selectedName) => {
+async function foodLogVisibleServingUnitText(editor: ReturnType<Page["locator"]>, selectedName?: string) {
+  return editor.evaluate((root, selectedName) => {
     const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
     const target = normalize(selectedName).toLowerCase();
     const gramsPerServingUnit = (text: string) => {
@@ -5914,9 +5826,6 @@ async function foodLogVisibleServingUnitText(page: Page, selectedName?: string) 
       const style = window.getComputedStyle(element);
       return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
     };
-    const dialogs = Array.from(document.querySelectorAll(".pretty-dialog, [role='dialog'], .gwt-DialogBox, .popupContent"))
-      .filter(isVisible);
-    const root = dialogs.at(-1) ?? document.body;
     const candidates = Array.from(root.querySelectorAll(".food-search-serving-size,[class*='serving'][class*='size'],[class*='Serving'][class*='Size']"))
       .filter(isVisible)
       .map((element) => {
@@ -5941,13 +5850,13 @@ async function foodLogVisibleServingUnitText(page: Page, selectedName?: string) 
   }, selectedName).catch(() => "");
 }
 
-async function convertFoodLogGramAmountForCurrentServingUnit(page: Page, amount?: number, unit?: string, selectedName?: string) {
+async function convertFoodLogGramAmountForCurrentServingUnit(page: Page, editor: ReturnType<Page["locator"]>, amount?: number, unit?: string, selectedName?: string) {
   if (amount === undefined || unit?.trim().toLowerCase() !== "g") return undefined;
-  const unitText = await currentFoodLogUnitText(page, selectedName);
+  const unitText = await currentFoodLogUnitText(editor, selectedName);
   const gramsPerServing = gramsPerServingUnit(unitText);
   if (!gramsPerServing) return { converted: false, unitText, warning: "Current food log serving unit does not expose a gram weight for conversion." };
   const convertedAmount = Number((amount / gramsPerServing).toFixed(6));
-  const filled = await fillFoodAmount(page, convertedAmount, selectedName);
+  const filled = await fillFoodAmount(page, editor, convertedAmount, selectedName);
   return {
     converted: filled?.filled === true,
     originalAmount: amount,
@@ -7800,13 +7709,73 @@ export function retiredItemName(name: string, id: string | undefined, timeZone: 
   return `Retired - ${base}${suffix} - ${today}`;
 }
 
-async function chooseMeal(page: Page, meal?: string) {
+async function readFoodEditorMeal(editor: ReturnType<Page["locator"]>, expectedMeal: string) {
+  const dropdown = editor.locator("button.dropdown-toggle:visible")
+    .filter({ hasText: /(Breakfast|Lunch|Dinner|Snacks|Snack|Supplements)/i });
+  const count = await dropdown.count().catch(() => 0);
+  if (count !== 1) return { matches: false, currentMeal: "", editorMealControlCount: count };
+  const currentMeal = (await dropdown.first().innerText().catch(() => "")).trim();
+  return { matches: foodLogMealTextMatches(currentMeal, expectedMeal), currentMeal, editorMealControlCount: count };
+}
+
+async function commitFoodEditor(editor: ReturnType<Page["locator"]>) {
+  const controls = editor.locator("button,.gwt-Button,[role='button'],input[type='button'],input[type='submit']");
+  const count = await controls.count().catch(() => 0);
+  const commits: Array<ReturnType<Page["locator"]>> = [];
+  for (let index = 0; index < count; index += 1) {
+    const control = controls.nth(index);
+    if (!(await control.isVisible().catch(() => false))) continue;
+    const label = await control.evaluate((element) => {
+      const input = element instanceof HTMLInputElement ? element.value : "";
+      return `${element.textContent ?? ""} ${element.getAttribute("aria-label") ?? ""} ${input}`.replace(/\s+/g, " ").trim();
+    }).catch(() => "");
+    if (/^(ADD|ADD FOOD|ADD TO DIARY|ADD SERVING|SAVE|SAVE CHANGES|DONE)$/i.test(label)) commits.push(control);
+  }
+  if (commits.length !== 1) return false;
+  await commits[0].click();
+  return true;
+}
+
+export async function __exerciseFoodEditorSafetyForTests(page: Page, meal: string) {
+  const editor = await foodEditor(page);
+  if (!editor) return { editorCount: 0, selected: false, readback: { matches: false }, committed: false };
+  const selected = await chooseMeal(page, editor, meal);
+  const readback = await readFoodEditorMeal(editor, meal);
+  const committed = selected.selected && readback.matches ? await commitFoodEditor(editor) : false;
+  return { editorCount: 1, selected, readback, committed };
+}
+
+async function foodEditorMenuOption(
+  page: Page,
+  editor: ReturnType<Page["locator"]>,
+  trigger: ReturnType<Page["locator"]>,
+  label: string,
+) {
+  const triggerBox = await trigger.boundingBox().catch(() => null);
+  if (!triggerBox) return undefined;
+  const options = page.locator(".dropdown-item:visible,[role='option']:visible,.gwt-MenuItem:visible");
+  const count = await options.count().catch(() => 0);
+  const matches: Array<{ option: ReturnType<Page["locator"]>; distance: number }> = [];
+  for (let index = 0; index < count; index += 1) {
+    const option = options.nth(index);
+    const text = (await option.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+    if (text.toLowerCase() !== label.toLowerCase()) continue;
+    const box = await option.boundingBox().catch(() => null);
+    if (!box) continue;
+    const distance = Math.abs(box.x - triggerBox.x) + Math.abs(box.y - (triggerBox.y + triggerBox.height));
+    if (distance <= 1200) matches.push({ option, distance });
+  }
+  matches.sort((a, b) => a.distance - b.distance);
+  if (matches.length !== 1 || !editor) return undefined;
+  return matches[0].option;
+}
+
+async function chooseMeal(page: Page, editor: ReturnType<Page["locator"]>, meal?: string) {
   if (!meal) return { selected: false as const, warning: "No meal was supplied." };
   const normalizedMeal = meal.trim();
-  const dialog = activeDialog(page);
-  const mealDropdown = dialog
+  const mealDropdown = editor
     .locator("button.dropdown-toggle:visible")
-    .filter({ hasText: /^(Breakfast|Lunch|Dinner|Snacks|Snack|Supplements)$/i })
+    .filter({ hasText: /(Breakfast|Lunch|Dinner|Snacks|Snack|Supplements)/i })
     .first();
   if ((await mealDropdown.count().catch(() => 0)) === 0) {
     return {
@@ -7822,13 +7791,10 @@ async function chooseMeal(page: Page, meal?: string) {
   if (!(await mealDropdown.click().then(() => true).catch(() => false))) {
     return { selected: false as const, requestedMeal: normalizedMeal, previousMeal: current, warning: "Could not open the meal dropdown. No food was written." };
   }
-  const option = page
-    .locator(".dropdown-item:visible")
-    .filter({ hasText: new RegExp(`^${escapeRegExp(normalizedMeal)}$`, "i") })
-    .last();
-  if (!(await option.isVisible().catch(() => false))) {
+  const option = await foodEditorMenuOption(page, editor, mealDropdown, normalizedMeal);
+  if (!option) {
     await page.keyboard.press("Escape").catch(() => undefined);
-    return { selected: false as const, requestedMeal: normalizedMeal, previousMeal: current, warning: `The ${normalizedMeal} option was not visible in Cronometer's meal dropdown. No food was written.` };
+    return { selected: false as const, requestedMeal: normalizedMeal, previousMeal: current, warning: `The ${normalizedMeal} option was not uniquely associated with Cronometer's food-editor meal dropdown. No food was written.` };
   }
   await option.click().catch(() => undefined);
   let updated = "";
