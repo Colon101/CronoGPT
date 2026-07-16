@@ -11,6 +11,8 @@ const packageVersion = JSON.parse(readFileSync(new URL("../package.json", import
 const browserWarmupTimeoutMs = positiveIntegerEnv("CRONOGPT_SMOKE_BROWSER_WARMUP_TIMEOUT_MS", 240000);
 const browserProbeTimeoutMs = positiveIntegerEnv("CRONOGPT_SMOKE_BROWSER_TIMEOUT_MS", 180000);
 const browserQueueWaitMs = positiveIntegerEnv("CRONOGPT_SMOKE_BROWSER_QUEUE_WAIT_MS", 240000);
+const smokeRecipeName = process.env.CRONOGPT_SMOKE_RECIPE_NAME?.trim();
+const smokeRecipeIngredientCount = positiveIntegerEnv("CRONOGPT_SMOKE_RECIPE_INGREDIENT_COUNT", 0);
 
 if (!token) {
   throw new Error("Missing CRONOGPT_API_TOKEN.");
@@ -39,6 +41,9 @@ const chatGptActionToolNames = [
   "find_private_recipe",
   "resolve_recipe_ingredients",
   "ensure_private_recipe",
+  "create_recipe",
+  "update_custom_recipe",
+  "delete_custom_recipe",
   "cronometer_runtime_status",
   "cronometer_stability_check",
   "refresh_cronometer_session",
@@ -359,6 +364,32 @@ await withClient(async (client) => {
             ...(stability.structuredContent?.data ?? {}),
           },
         });
+  }
+
+  if (smokeRecipeName) {
+    const recipeRead = await callTool(client, "find_private_recipe", {
+      name: smokeRecipeName,
+    }, { timeout: browserProbeTimeoutMs });
+    const recipes = recipeRead.structuredContent?.data?.recipes ?? [];
+    const exactRecipe = recipes.find((recipe) => recipe?.name?.toLowerCase() === smokeRecipeName.toLowerCase());
+    const ingredients = exactRecipe?.ingredients ?? [];
+    checks.push({
+      name: "private_recipe_readback",
+      ok: recipeRead.structuredContent?.status === "ok" &&
+        exactRecipe?.ingredientsStatus === "parsed" &&
+        ingredients.length > 0 &&
+        (smokeRecipeIngredientCount === 0 || ingredients.length === smokeRecipeIngredientCount),
+      data: {
+        status: recipeRead.structuredContent?.status,
+        warning: recipeRead.structuredContent?.warning,
+        recipeName: exactRecipe?.name,
+        recipeId: exactRecipe?.recipeId,
+        ingredientsStatus: exactRecipe?.ingredientsStatus,
+        ingredientCount: ingredients.length,
+        expectedIngredientCount: smokeRecipeIngredientCount || undefined,
+        ingredients,
+      },
+    });
   }
 
   const datedFoodDryRun = await client.callTool({

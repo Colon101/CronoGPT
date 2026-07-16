@@ -8,8 +8,10 @@ import {
   customFoodWritePreview,
   foodSearchTabAttempts,
   parseFoodSearchResults,
+  parseCustomRecipeIngredientTables,
   parseServingSize,
   rankFoodResults,
+  recipeIngredientAmountMatches,
   servingSizeRowMatches,
   verifyCustomFoodWrite,
 } from "../dist/providers/browser.js";
@@ -18,6 +20,7 @@ import { gtinCheckDigit, validateBarcode } from "../dist/barcode.js";
 import {
   FOOD_LOG_MEALS,
   foodLogBatchIdempotencyKey,
+  foodLogCountDelta,
   foodLogIdempotencyKey,
   isValidFoodLogDate,
   normalizeFoodLogInput,
@@ -28,6 +31,43 @@ import {
   verifyFoodLogInDiaryEntries,
   verifyFoodLogInDiaryText,
 } from "../dist/food-log-transaction.js";
+
+assert.equal(recipeIngredientAmountMatches(600, "g", 600, "g", "600.0 g"), true);
+assert.equal(recipeIngredientAmountMatches(2, "2 tbsp", 26, "g", "26.0 g"), true);
+assert.equal(recipeIngredientAmountMatches(2, "2 tbsp", 26, "g", "25.0 g"), false);
+assert.equal(recipeIngredientAmountMatches(0.8615, "2 scoops — 65 g", 56, "g"), true);
+assert.equal(recipeIngredientAmountMatches(0.861, "2 scoops — 65 g", 56, "g"), false);
+
+const parsedRecipeTable = parseCustomRecipeIngredientTables([
+  [
+    ["Description", "Source"],
+    ["Milk, 1 % Fat, Lowfat", "NCCDB"],
+  ],
+  [
+    ["Description", "Database", "Amount", "Unit", "Energy", "Weight", ""],
+    ["Milk, 1 % Fat, Lowfat", "NCCDB", "600", "g", "258.0", "600.0 g", "Delete"],
+    ["PB2, Powdered Peanut Butter, Original", "CRDB", "26", "g", "120.0", "26.0 g", "Delete"],
+    ["Elite, Low Fat Cocoa Powder", "Custom", "0.17", "100 g", "64.4", "Unknown", "Delete"],
+    ["Isopure, Low Carb Protein Powder, Dutch Chocolate", "CRDB", "0.8615", "2 scoops — 65 g", "189.5", "56.0 g", "Delete"],
+    ["Xanthan Gum", "CRDB", "1", "g", "3.4", "1.0 g", "Delete"],
+  ],
+]);
+assert.equal(parsedRecipeTable.ingredientsTableFound, true);
+assert.deepEqual(parsedRecipeTable.ingredients, [
+  { name: "Milk, 1 % Fat, Lowfat", database: "NCCDB", amount: 600, unit: "g", energyKcal: 258, weight: "600.0 g" },
+  { name: "PB2, Powdered Peanut Butter, Original", database: "CRDB", amount: 26, unit: "g", energyKcal: 120, weight: "26.0 g" },
+  { name: "Elite, Low Fat Cocoa Powder", database: "Custom Food", amount: 0.17, unit: "100 g", energyKcal: 64.4, weight: "Unknown" },
+  { name: "Isopure, Low Carb Protein Powder, Dutch Chocolate", database: "CRDB", amount: 0.8615, unit: "2 scoops — 65 g", energyKcal: 189.5, weight: "56.0 g" },
+  { name: "Xanthan Gum", database: "CRDB", amount: 1, unit: "g", energyKcal: 3.4, weight: "1.0 g" },
+]);
+assert.deepEqual(parseCustomRecipeIngredientTables([[['Description', 'Database', 'Amount', 'Unit']]]), {
+  ingredientsTableFound: true,
+  ingredients: [],
+});
+assert.deepEqual(parseCustomRecipeIngredientTables([[['General', 'Amount', '% DV']]]), {
+  ingredientsTableFound: false,
+  ingredients: [],
+});
 
 const bananaResults = [
   { name: "Banana cream", source: "Custom Recipe", raw: "Banana cream Custom Recipe" },
@@ -283,6 +323,42 @@ assert.equal(normalizeFoodLogUnit("tablespoons"), "tbsp");
 assert.equal(normalizeFoodLogUnit("servings"), "serving");
 assert.deepEqual(FOOD_LOG_MEALS, ["Breakfast", "Lunch", "Dinner", "Snacks", "Supplements"]);
 assert.equal(normalizeFoodLogInput({ query: "Banana" }, "Asia/Jerusalem").validationIssues.some((issue) => issue.includes("Unsupported meal")), true);
+const wholeBag = normalizeFoodLogInput({
+  query: "Energy rice cakes",
+  meal: "Lunch",
+  portion: { kind: "whole_package", portion: { name: "bag", weightGrams: 130 } },
+}, "Asia/Jerusalem", new Date("2026-06-06T08:00:00.000Z"));
+assert.equal(wholeBag.amount, 130);
+assert.equal(wholeBag.unit, "g");
+assert.deepEqual(wholeBag.portion, {
+  kind: "whole_package",
+  name: "bag",
+  weightGrams: 130,
+  count: 1,
+  resolvedAmount: 130,
+  resolvedUnit: "g",
+});
+assert.deepEqual(wholeBag.validationIssues, []);
+const twoCans = normalizeFoodLogInput({
+  query: "Energy drink",
+  meal: "Lunch",
+  portion: { kind: "whole_package", portion: { name: "can", weightGrams: 250 }, count: 2 },
+}, "Asia/Jerusalem", new Date("2026-06-06T08:00:00.000Z"));
+assert.equal(twoCans.amount, 500);
+assert.equal(twoCans.unit, "g");
+assert.notEqual(twoCans.idempotencyKey, wholeBag.idempotencyKey);
+const conflictingPortion = normalizeFoodLogInput({
+  query: "Energy rice cakes",
+  meal: "Lunch",
+  amount: 1,
+  unit: "serving",
+  portion: { kind: "whole_package", portion: { name: "bag", weightGrams: 130 } },
+}, "Asia/Jerusalem", new Date("2026-06-06T08:00:00.000Z"));
+assert.match(conflictingPortion.validationIssues.join(" "), /either portion or amount\/unit/);
+assert.deepEqual(foodLogCountDelta(0, 1), { beforeCount: 0, afterCount: 1, intendedDelta: 1, actualDelta: 1, verified: true, status: "verified", reason: undefined });
+assert.equal(foodLogCountDelta(1, 1).verified, false);
+assert.equal(foodLogCountDelta(1, 3).verified, false);
+assert.equal(foodLogCountDelta(3, 2, -1).verified, true);
 assert.equal(isValidFoodLogDate("2026-02-28"), true);
 assert.equal(isValidFoodLogDate("2026-02-29"), false);
 assert.deepEqual(parseFoodLogTimestamp("13:05"), { normalized: "13:05", hour12: 1, minute: 5, period: "PM" });

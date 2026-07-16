@@ -49,6 +49,15 @@ export class BaseCronometerProvider implements CronometerProvider {
     });
   }
 
+  async getOperation(operationId: string): Promise<ProviderResult> {
+    return this.result("get_cronometer_operation", "not_configured", {
+      operationId,
+      state: "failed",
+      retryable: false,
+      nextAction: "manual_resolution",
+    }, `${this.name} does not run persisted background operations.`);
+  }
+
   async refreshSession(): Promise<ProviderResult> {
     return this.unsupported("refresh_cronometer_session");
   }

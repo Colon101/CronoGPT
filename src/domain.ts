@@ -32,6 +32,17 @@ export interface DateRangeInput {
   endDate?: string;
 }
 
+export interface FoodPortionDefinition {
+  name: string;
+  weightGrams: number;
+}
+
+export interface WholePackagePortion {
+  kind: "whole_package";
+  portion: FoodPortionDefinition;
+  count?: number;
+}
+
 export interface FoodLogInput {
   date?: string;
   meal?: string;
@@ -40,6 +51,7 @@ export interface FoodLogInput {
   selectedSource?: string;
   amount?: number;
   unit?: string;
+  portion?: WholePackagePortion;
   timestamp?: string;
   matchPolicy?: "high_confidence" | "selected_only";
   searchScope?: "auto" | "all" | "custom" | "favorites";
@@ -66,6 +78,7 @@ export interface DiaryFoodDeleteInput {
   name: string;
   amount?: number;
   unit?: string;
+  deleteCount?: number;
   confirmName?: string;
   dryRun?: boolean;
   confirmed?: boolean;
@@ -162,7 +175,6 @@ export interface RecipeUpdateInput extends CustomRecipeSelectorInput {
 }
 
 export interface RecipeRetireInput extends CustomRecipeSelectorInput {
-  retiredName?: string;
   dryRun?: boolean;
   confirmed?: boolean;
 }
@@ -183,6 +195,7 @@ export interface CustomFoodAndLogInput extends CustomFoodInput {
   meal: string;
   amount?: number;
   unit?: string;
+  portion?: WholePackagePortion;
   timestamp?: string;
   nutritionSource?: string;
 }
@@ -318,6 +331,7 @@ export interface CronometerProvider {
   readonly mode: BackendMode;
   capabilities(): Promise<ProviderResult<Capability[]>>;
   runtimeStatus(): Promise<ProviderResult>;
+  getOperation(operationId: string): Promise<ProviderResult>;
   refreshSession(): Promise<ProviderResult>;
   stabilityCheck(input: StabilityCheckInput): Promise<ProviderResult>;
   readFeaturePage(feature: string, hash: string, input: unknown): Promise<ProviderResult>;

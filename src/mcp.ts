@@ -15,6 +15,8 @@ import { toMcpToolResponse } from "./tool-response.js";
 import { CUSTOM_FOOD_NUTRIENT_SCHEMA, customFoodNutrientSchemaSummary } from "./nutrients.js";
 import { validateBarcode } from "./barcode.js";
 import { FOOD_LOG_MEALS, isValidFoodLogDate, parseFoodLogTimestamp } from "./food-log-transaction.js";
+import type { CronometerProvider, RecipeInput } from "./domain.js";
+import { comparePrivateRecipe, type ExistingRecipeSummary } from "./recipe-semantics.js";
 import {
   authorizeMcpRequest,
   getAuthToken,
@@ -63,6 +65,10 @@ const commonOutputSchema = {
     "needs_manual_step",
     "error",
   ]),
+  state: z.enum(["pending", "running", "succeeded", "failed", "indeterminate"]).optional(),
+  retryable: z.boolean().optional(),
+  nextAction: z.enum(["none", "poll", "inspect_diary", "retry_with_same_key", "manual_resolution"]).optional(),
+  operationId: z.string().optional(),
   warning: z.string().optional(),
   source: z.string().optional(),
   data: z.unknown().optional(),
@@ -91,9 +97,18 @@ const foodTimestampInputSchema = z.string()
     message: "Use unambiguous 24-hour HH:MM or 12-hour h:mm AM/PM time.",
   })
   .describe("Optional exact food time as 24-hour HH:MM (13:05) or 12-hour h:mm AM/PM (1:05 PM). Ambiguous values such as '1' are rejected.");
+const foodPortionDefinitionSchema = z.object({
+  name: z.string().min(1).describe("Exact portion name, for example bag, piece, can, or serving."),
+  weightGrams: z.number().finite().positive().describe("Weight in grams of one named portion."),
+});
+const wholePackagePortionSchema = z.object({
+  kind: z.literal("whole_package"),
+  portion: foodPortionDefinitionSchema.describe("The package portion as its exact name-to-weight mapping."),
+  count: z.number().finite().positive().optional().describe("Number of whole packages consumed. Defaults to 1."),
+}).describe("Use when the user consumed a whole package. CronoGPT logs count × portion.weightGrams, so multiple portions on the same food remain unambiguous.");
 
 export const MCP_PATH = "/mcp";
-export const MCP_SERVER_VERSION = "0.1.5";
+export const MCP_SERVER_VERSION = "0.1.16";
 const readToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read"] }];
 const writeToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read", "cronometer:write"] }];
 export const STABLE_MODEL_VISIBLE_TOOLS = [
@@ -118,7 +133,11 @@ export const STABLE_MODEL_VISIBLE_TOOLS = [
   "find_private_recipe",
   "resolve_recipe_ingredients",
   "ensure_private_recipe",
+  "create_recipe",
+  "update_custom_recipe",
+  "delete_custom_recipe",
   "cronometer_runtime_status",
+  "get_cronometer_operation",
   "cronometer_stability_check",
   "refresh_cronometer_session",
 ] as const;
@@ -126,16 +145,17 @@ const stableModelVisibleTools = new Set<string>(STABLE_MODEL_VISIBLE_TOOLS);
 
 const MCP_SERVER_INSTRUCTIONS = [
   "Use create_and_log_custom_food as the preferred single-step workflow when a packaged food is missing from Cronometer and the user wants it logged.",
-  "Use ensure_private_recipe as the preferred private recipe workflow. Unconfirmed calls preview without opening Cronometer; confirmed calls verify an exact existing name before creating anything.",
+  "Use ensure_private_recipe as the preferred private recipe workflow. Unconfirmed calls preview without opening Cronometer; confirmed calls compare full recipe contents and safely repair an incomplete same-named recipe when possible. Use create_recipe directly only after find_private_recipe has confirmed that the exact recipe name is absent. Use delete_custom_recipe only with an exact recipe ID and confirmation name for user-approved cleanup or rollback; it retires instead of deleting when Cronometer reports existing uses unless the user explicitly requests force.",
   "For custom foods, use Cronometer's detailed #/custom-foods editor: pass the package serving size, every nutrient available on the label, and the UPC/EAN/GTIN barcode whenever it is visible. The barcode links the private custom food to future barcode searches/scans.",
   "Do not call duplicate-list tools before create_custom_food or create_and_log_custom_food; those tools resolve exact same-name foods themselves and default to updating one exact match.",
-  "For every diary food write or delete, pass the user's exact meal section explicitly. A write is not attempted unless the requested date, meal, optional time, amount, and unit can be verified before Save.",
-  "Use dryRun=true when nutrition facts or barcode data are uncertain. For a confirmed background write, do not retry while it is accepted or running; poll cronometer_runtime_status until completion.",
+  "For every diary food write or delete, pass the user's exact meal section explicitly. A product or search category never chooses the meal: if the user says Lunch, pass Lunch even for an energy drink or supplement-like product.",
+  "For a whole bag, can, bottle, or package, pass portion={kind:'whole_package',portion:{name,weightGrams},count}. A custom food can have multiple named portions; use the exact name-to-weight mapping for the consumed package and never guess its weight. Do not also pass amount/unit.",
+  "Submit one multi-food user intent once through log_foods. For a confirmed background write, accepted means the write is in progress, not failed: never resubmit it; poll get_cronometer_operation with the returned operation ID.",
   "Treat possibly_written_verify_failed as an ambiguous write: inspect the custom-food list or diary before retrying so a duplicate is not created.",
   "Treat ok=false or completed=false as not completed, even when the tool call itself returned normally. accepted means a background job is still pending, not that the requested write succeeded.",
 ].join("\n");
 
-export function createCronoServer(options: { grantedScopes?: readonly string[] } = {}) {
+export function createCronoServer(options: { grantedScopes?: readonly string[]; provider?: CronometerProvider } = {}) {
   const server = new McpServer(
     { name: "cronogpt", version: MCP_SERVER_VERSION },
     { instructions: MCP_SERVER_INSTRUCTIONS },
@@ -273,6 +293,11 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
       recipeId: typeof value.recipeId === "string" ? value.recipeId : undefined,
       servings: typeof value.servings === "number" ? value.servings : undefined,
       servingName: typeof value.servingName === "string" ? value.servingName : undefined,
+      cookedWeight: typeof value.cookedWeight === "number" ? value.cookedWeight : undefined,
+      cookedWeightUnit: typeof value.cookedWeightUnit === "string" ? value.cookedWeightUnit : undefined,
+      ingredientsStatus: value.ingredientsStatus === "parsed" || value.ingredientsStatus === "empty_confirmed" || value.ingredientsStatus === "extraction_failed"
+        ? value.ingredientsStatus
+        : undefined,
       ingredients: Array.isArray(value.ingredients)
         ? value.ingredients.map((ingredient) => {
           const item = ingredient && typeof ingredient === "object" ? ingredient as Record<string, unknown> : {};
@@ -280,7 +305,9 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
             name: typeof item.name === "string" ? item.name : undefined,
             amount: typeof item.amount === "number" || typeof item.amount === "string" ? item.amount : undefined,
             unit: typeof item.unit === "string" ? item.unit : undefined,
-            source: typeof item.source === "string" ? item.source : undefined,
+            source: typeof item.source === "string"
+              ? item.source
+              : typeof item.database === "string" ? item.database : undefined,
           };
         })
         : undefined,
@@ -380,6 +407,15 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
     emptyInputSchema,
     { readOnlyHint: true, openWorldHint: false },
     async () => toMcpToolResponse(await provider.runtimeStatus()),
+  );
+
+  register(
+    "get_cronometer_operation",
+    "Get Cronometer operation",
+    "Polls one accepted Cronometer background operation by its returned operation ID. Use this instead of resubmitting a write.",
+    { operationId: z.string().min(1) },
+    { readOnlyHint: true, openWorldHint: false },
+    async (args) => toMcpToolResponse(await provider.getOperation(String(args.operationId))),
   );
 
   register(
@@ -604,6 +640,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
       selectedSource: z.string().optional().describe("Optional Cronometer result source from search_foods, such as CRDB, NCCDB, USDA, Custom Food, Custom Recipe, or Brand."),
       amount: z.number().positive().optional(),
       unit: z.string().min(1).optional(),
+      portion: wholePackagePortionSchema.optional(),
       timestamp: foodTimestampInputSchema.optional(),
       matchPolicy: z.enum(["high_confidence", "selected_only"]).optional().describe("Defaults to high_confidence. Use selected_only with selectedName and selectedSource to pin an exact search result. Unsafe best-effort writes are intentionally not model-visible."),
       searchScope: z.enum(["auto", "all", "custom", "favorites"]).optional().describe("Optional food-search tab preference. Use custom for private custom foods/recipes, all for official database lookups, or auto by default."),
@@ -629,6 +666,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
         selectedSource: z.string().optional().describe("Optional Cronometer result source from search_foods, such as CRDB, NCCDB, USDA, Custom Food, Custom Recipe, or Brand."),
         amount: z.number().positive().optional(),
         unit: z.string().min(1).optional(),
+        portion: wholePackagePortionSchema.optional(),
         timestamp: foodTimestampInputSchema.optional(),
         matchPolicy: z.enum(["high_confidence", "selected_only"]).optional().describe("Defaults to high_confidence. Use selected_only with selectedName and selectedSource to pin an exact search result."),
         searchScope: z.enum(["auto", "all", "custom", "favorites"]).optional().describe("Optional food-search tab preference. Use custom for private custom foods/recipes, all for official database lookups, or auto by default."),
@@ -647,13 +685,14 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
   register(
     "delete_diary_food_entry",
     "Delete diary food entry",
-    "Deletes one matching food entry from a Cronometer diary meal. Requires dryRun=false, confirmed=true, and confirmName exactly matching the food name. Refuses broad or multi-match deletes.",
+    "Deletes a bounded number of matching food entries from one explicit Cronometer diary meal. By default it preserves the conservative unique-match behavior. For indistinguishable duplicate rows, first preview the match count, then pass an explicit deleteCount with confirmation; the server deletes one at a time and verifies the count drops by exactly one after each action.",
     {
       date: diaryDateInputSchema.optional(),
       meal: diaryMealInputSchema,
       name: z.string().min(1).describe("Exact visible diary food name to delete."),
       amount: z.number().positive().optional().describe("Optional amount used to narrow the matching diary row."),
       unit: z.string().min(1).optional().describe("Optional unit used to narrow the matching diary row."),
+      deleteCount: z.number().int().positive().optional().describe("Exact number of indistinguishable matching rows to delete. Omit for the conservative unique-match default; there is intentionally no delete-all mode."),
       confirmName: z.string().optional().describe("Must exactly match name when executing the delete."),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
@@ -736,15 +775,16 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
     "Use this as the preferred one-call workflow when a packaged food is missing from Cronometer and the user wants to log it now. Supply the package serving size, every available label nutrient, the UPC/EAN/GTIN barcode whenever visible, and the user's exact diary meal. The tool validates the detailed editor, handles same-name foods internally, verifies the saved barcode and nutrients, then pins and logs that exact private custom food. Do not call list_custom_foods first. Use dryRun=true when facts are uncertain; confirmed=true is required for writes.",
     {
       name: z.string().min(1).describe("Exact custom food name to create/update and then log."),
-      servingSize: z.string().min(1).describe("Required serving size for the custom food, for example '100 g', '1 serving', '250 ml', or '1 oz'."),
+      servingSize: z.string().min(1).describe("Required primary nutrition-label serving size, for example '100 g', '1 serving', '250 ml', or '1 oz'."),
       nutrients: nonEmptyNutrientRecordSchema.describe("Required package-label values using custom_food_nutrient_schema keys, aliases, or exact Cronometer labels. Include every available value, not only calories and macros."),
       nutritionSource: z.string().optional().describe("Short citation or URL/title summary of where ChatGPT found the nutrition facts. Stored in the tool result for audit; not written as a secret."),
       barcode: barcodeInputSchema.optional(),
       duplicatePolicy: z.enum(["fail", "update_existing"]).optional().describe("Defaults to update_existing so an existing same-named custom food is updated rather than duplicated. Use create_custom_food separately only when an intentional duplicate is required."),
       date: diaryDateInputSchema.optional(),
       meal: diaryMealInputSchema,
-      amount: z.number().positive().optional().describe("Amount to log in the diary. Defaults to 1."),
-      unit: z.string().min(1).optional().describe("Diary unit to log. Omit to use Cronometer's default serving if appropriate."),
+      amount: z.number().positive().optional().describe("Amount to log in the diary. Defaults to 1 only when portion is omitted."),
+      unit: z.string().min(1).optional().describe("Diary unit to log. Omit when using portion."),
+      portion: wholePackagePortionSchema.optional(),
       timestamp: foodTimestampInputSchema.optional(),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
@@ -806,7 +846,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
       foodId: z.string().optional(),
       name: z.string().min(1).describe("Exact current custom food name. If duplicate names exist, also pass foodId from list_custom_foods."),
       confirmName: z.string().optional(),
-      ifUsed: z.enum(["stop", "retire", "force"]).optional().describe("Defaults to stop. Use retire to rename instead if Cronometer warns that old diary entries use this food; use force only after explicit user approval."),
+      ifUsed: z.enum(["stop", "retire", "force"]).optional().describe("Defaults to stop. Use retire to click Cronometer's native Retire action if old diary entries use this food; use force only after explicit user approval."),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
       waitForCompletionSeconds: z.number().int().min(0).max(600).optional().describe("Defaults to a server-chosen wait window for confirmed deletes. Use 0 to return immediately after accepting the background job."),
@@ -907,7 +947,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
   register(
     "create_recipe",
     "Create recipe",
-    "Creates and verifies a private custom Cronometer recipe in the authenticated user's account after user confirmation. This does not publish, send, share, or write outside that private Cronometer account. For straightforward ingredients, pass query, amount, and unit directly; the browser provider auto-selects high-confidence official Cronometer matches. Use selectedName and selectedSource only when the user or resolve_recipe_ingredients picked a specific match. Ambiguous low-confidence searches are returned without writing.",
+    "Creates and verifies a new private custom Cronometer recipe in the authenticated user's account after user confirmation. Use this direct creator only after find_private_recipe has confirmed that the exact name is absent; otherwise prefer ensure_private_recipe to avoid duplicates. This does not publish, send, share, or write outside that private Cronometer account. For straightforward ingredients, pass query, amount, and unit directly; the browser provider auto-selects high-confidence official Cronometer matches. Use selectedName and selectedSource only when the user or resolve_recipe_ingredients picked a specific match. Ambiguous low-confidence searches are returned without writing.",
     {
       name: z.string().min(1),
       ingredients: z.array(
@@ -933,7 +973,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
   register(
     "ensure_private_recipe",
     "Ensure private recipe",
-    "Preferred recipe-writing workflow. Idempotently ensures one private custom Cronometer recipe exists in the authenticated user's account. If an exact recipe name already exists, it returns that private recipe summary without writing; otherwise it creates and verifies the private recipe after user confirmation. Dry-run or unconfirmed calls return a browser-free creation preview. It does not publish, send, share, or write outside that private Cronometer account.",
+    "Preferred recipe-writing workflow. Idempotently compares the requested private Cronometer recipe with the full contents of any exact same-named recipe. It returns already_exists only for a semantic match, safely adds missing ingredients or repairs serving fields when the existing recipe is an unambiguous subset, and returns a structured conflict for changed, extra, duplicate, or unparseable contents. Otherwise it creates and verifies the recipe after confirmation. Dry-run or unconfirmed calls return a browser-free preview.",
     {
       name: z.string().min(1),
       ingredients: z.array(
@@ -954,8 +994,9 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     async (args) => {
+      const ensureProvider = options.provider ?? provider;
       if (args.dryRun === true || args.confirmed !== true) {
-        const preview = await provider.createRecipe({
+        const preview = await ensureProvider.createRecipe({
           ...args,
           dryRun: true,
           confirmed: false,
@@ -975,7 +1016,8 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
       }
 
       const name = String(args.name);
-      const existing = await provider.listCustomRecipes({ query: name, includeDetails: false, maxDetails: 0 });
+      const requestedRecipe = args as unknown as RecipeInput;
+      const existing = await ensureProvider.listCustomRecipes({ query: name, includeDetails: true, maxDetails: 5 });
       const existingData = (existing.data ?? {}) as { names?: unknown; recipes?: unknown };
       if (existing.status !== "ok") {
         return toMcpToolResponse({
@@ -991,33 +1033,115 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
         });
       }
 
-      const exactRecipeFromSummaries = Array.isArray(existingData.recipes)
-        ? existingData.recipes.find((recipe) => {
+      const normalizedName = name.trim().toLowerCase();
+      const exactNames = Array.isArray(existingData.names)
+        ? existingData.names.filter((candidate): candidate is string =>
+          typeof candidate === "string" && candidate.trim().toLowerCase() === normalizedName)
+        : [];
+      const exactRecipes = Array.isArray(existingData.recipes)
+        ? existingData.recipes.filter((recipe) => {
           const value = recipe && typeof recipe === "object" ? recipe as Record<string, unknown> : {};
-          return typeof value.name === "string" && value.name.trim().toLowerCase() === name.trim().toLowerCase();
+          return typeof value.name === "string" && value.name.trim().toLowerCase() === normalizedName;
         })
-        : undefined;
-      const exactName = Array.isArray(existingData.names)
-        ? existingData.names.find((candidate): candidate is string =>
-          typeof candidate === "string" && candidate.trim().toLowerCase() === name.trim().toLowerCase())
-        : undefined;
-      const exactRecipe = exactRecipeFromSummaries ?? (exactName ? { name: exactName } : undefined);
+        : [];
 
-      if (exactRecipe) {
+      if (exactNames.length > 1 || exactRecipes.length > 1) {
         return toMcpToolResponse({
           provider: existing.provider,
           mode: existing.mode,
           feature: "ensure_private_recipe",
-          status: "already_exists",
+          status: "needs_manual_step",
+          warning: "Multiple exact same-named private recipes were found. No recipe was created or updated because the target is ambiguous.",
           data: {
             existed: true,
             created: false,
-            recipe: sanitizeRecipeSummary(exactRecipe),
+            updated: false,
+            stage: "conflict",
+            conflict: "duplicate_exact_names",
+            exactNameCount: Math.max(exactNames.length, exactRecipes.length),
+            recipes: exactRecipes.map((recipe) => sanitizeRecipeSummary(recipe)),
           },
         });
       }
 
-      const created = await provider.createRecipe(args as never);
+      const exactRecipe = exactRecipes[0] as ExistingRecipeSummary | undefined
+        ?? (exactNames[0] ? { name: exactNames[0], ingredientsStatus: "extraction_failed" } : undefined);
+      if (exactRecipe) {
+        const comparison = comparePrivateRecipe(requestedRecipe, exactRecipe);
+        if (comparison.matches) {
+          return toMcpToolResponse({
+            provider: existing.provider,
+            mode: existing.mode,
+            feature: "ensure_private_recipe",
+            status: "already_exists",
+            data: {
+              existed: true,
+              created: false,
+              updated: false,
+              stage: "verified_existing",
+              recipe: sanitizeRecipeSummary(exactRecipe),
+              comparison,
+            },
+          });
+        }
+
+        const ingredientsToAdd = comparison.missingIngredients.length > 0 ? comparison.missingIngredients : undefined;
+        const servings = comparison.fieldMismatches.servings ? requestedRecipe.servings : undefined;
+        const servingName = comparison.fieldMismatches.servingName ? requestedRecipe.servingName : undefined;
+        const cookedWeight = comparison.fieldMismatches.cookedWeight ? requestedRecipe.cookedWeight : undefined;
+        const cookedWeightUnit = comparison.fieldMismatches.cookedWeightUnit ? requestedRecipe.cookedWeightUnit : undefined;
+        const hasRepair = Boolean(ingredientsToAdd?.length || servings !== undefined || servingName !== undefined || cookedWeight !== undefined || cookedWeightUnit !== undefined);
+
+        if (comparison.repairable && hasRepair) {
+          const repaired = await ensureProvider.updateCustomRecipe({
+            recipeId: typeof exactRecipe.recipeId === "string" ? exactRecipe.recipeId : undefined,
+            name,
+            ingredientsToAdd,
+            servings,
+            servingName,
+            cookedWeight,
+            cookedWeightUnit,
+            dryRun: false,
+            confirmed: true,
+          });
+          const updated = ["ok", "written"].includes(repaired.status);
+          return toMcpToolResponse({
+            ...repaired,
+            feature: "ensure_private_recipe",
+            data: {
+              ...(repaired.data && typeof repaired.data === "object" ? repaired.data as Record<string, unknown> : {}),
+              existed: true,
+              created: false,
+              updated,
+              stage: "repair",
+              previousRecipe: sanitizeRecipeSummary(exactRecipe),
+              comparison,
+            },
+          });
+        }
+
+        return toMcpToolResponse({
+          provider: existing.provider,
+          mode: existing.mode,
+          feature: "ensure_private_recipe",
+          status: "needs_manual_step",
+          warning: comparison.ingredientsStatus === "extraction_failed"
+            ? "The exact same-named recipe was found, but its ingredient table could not be parsed. No write was attempted."
+            : "The exact same-named recipe differs in ways that cannot be repaired by only adding missing ingredients or updating serving fields. No write was attempted.",
+          data: {
+            existed: true,
+            created: false,
+            updated: false,
+            stage: "conflict",
+            conflict: comparison.ingredientsStatus === "extraction_failed" ? "ingredient_extraction_failed" : "semantic_mismatch",
+            requested: sanitizeRecipeSummary(requestedRecipe),
+            existing: sanitizeRecipeSummary(exactRecipe),
+            comparison,
+          },
+        });
+      }
+
+      const created = await ensureProvider.createRecipe(args as never);
       return toMcpToolResponse({
         ...created,
         feature: "ensure_private_recipe",
@@ -1025,6 +1149,8 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
           ...(created.data && typeof created.data === "object" ? created.data as Record<string, unknown> : {}),
           existed: false,
           created: ["ok", "written", "already_exists"].includes(created.status),
+          updated: false,
+          stage: "create",
         },
       });
     },
@@ -1033,12 +1159,12 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
   register(
     "delete_custom_recipe",
     "Delete custom recipe",
-    "Deletes one existing Cronometer custom recipe by exact recipeId or unique exact name. Requires confirmed=true and confirmName matching the selected recipe name. Use ifUsed='retire' only if Cronometer warns that old diary entries depend on the recipe.",
+    "Deletes one existing Cronometer custom recipe by exact recipeId or unique exact name. Requires confirmed=true and confirmName matching the selected recipe name. If Cronometer reports existing diary uses, the default behavior is to click Cronometer's native Retire action and preserve history; force deletion requires explicit user approval.",
     {
       recipeId: z.string().optional(),
       name: z.string().optional(),
       confirmName: z.string().optional(),
-      ifUsed: z.enum(["stop", "retire", "force"]).optional().describe("Defaults to stop. Use retire to rename instead if Cronometer warns that old diary entries use this recipe; use force only after explicit user approval."),
+      ifUsed: z.enum(["stop", "retire", "force"]).optional().describe("Defaults to retire. When Cronometer reports existing diary uses, retire clicks Cronometer's native Retire action and preserves history; force requires explicit user approval."),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
     },
@@ -1077,11 +1203,10 @@ export function createCronoServer(options: { grantedScopes?: readonly string[] }
   register(
     "retire_custom_recipe",
     "Retire custom recipe",
-    "Renames one existing Cronometer custom recipe instead of deleting it.",
+    "Uses Cronometer's native Retire action for one existing custom recipe, preserving historical diary usage without adding a 'Retired -' prefix.",
     {
       recipeId: z.string().optional(),
       name: z.string().optional(),
-      retiredName: z.string().optional().describe("Optional exact replacement name. Defaults to 'Retired - <name> - YYYY-MM-DD'."),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
     },

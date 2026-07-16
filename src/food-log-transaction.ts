@@ -28,6 +28,14 @@ export interface NormalizedFoodLog {
   date: string;
   amount?: number;
   unit?: string;
+  portion?: {
+    kind: "whole_package";
+    name: string;
+    weightGrams: number;
+    count: number;
+    resolvedAmount: number;
+    resolvedUnit: "g";
+  };
   timestamp?: string;
   selectedName?: string;
   selectedSource?: string;
@@ -48,15 +56,18 @@ export function normalizeFoodLogInput(input: FoodLogInput, timeZone: string, now
   const query = normalizeFoodLogQuery(input.query);
   const meal = normalizeFoodLogMeal(input.meal);
   const date = normalizeFoodLogDate(input.date, timeZone, now);
-  const unit = normalizeFoodLogUnit(input.unit);
+  const portion = normalizeWholePackagePortion(input.portion);
+  const amount = portion?.resolvedAmount ?? input.amount;
+  const unit = portion?.resolvedUnit ?? normalizeFoodLogUnit(input.unit);
   const timestamp = parseFoodLogTimestamp(input.timestamp)?.normalized;
-  const validationIssues = foodLogValidationIssues(input, { query, meal, date, unit, timestamp });
+  const validationIssues = foodLogValidationIssues(input, { query, meal, date, unit, timestamp, portion });
   const idempotencyKey = input.idempotencyKey?.trim() || foodLogIdempotencyKey({
     date,
     meal,
     query,
-    amount: input.amount,
+    amount,
     unit,
+    portion,
     timestamp,
     selectedName: input.selectedName,
     selectedSource: input.selectedSource,
@@ -68,8 +79,9 @@ export function normalizeFoodLogInput(input: FoodLogInput, timeZone: string, now
     searchQueries: foodLogSearchQueries(query, input.query),
     meal,
     date,
-    amount: input.amount,
+    amount,
     unit,
+    portion,
     timestamp,
     selectedName: input.selectedName?.trim() || undefined,
     selectedSource: input.selectedSource?.trim() || undefined,
@@ -116,6 +128,19 @@ export function normalizeFoodLogMeal(meal?: string) {
 
 export function isKnownFoodLogMeal(meal: string): meal is FoodLogMeal {
   return FOOD_LOG_MEALS.some((candidate) => candidate === meal);
+}
+
+export function normalizeWholePackagePortion(portion?: FoodLogInput["portion"]) {
+  if (!portion) return undefined;
+  const count = portion.count ?? 1;
+  return {
+    kind: "whole_package" as const,
+    name: portion.portion.name.replace(/\s+/g, " ").trim(),
+    weightGrams: portion.portion.weightGrams,
+    count,
+    resolvedAmount: portion.portion.weightGrams * count,
+    resolvedUnit: "g" as const,
+  };
 }
 
 export function normalizeFoodLogUnit(unit?: string) {
@@ -194,6 +219,7 @@ export function foodLogValidationIssues(
     date: input.date ?? "",
     unit: normalizeFoodLogUnit(input.unit),
     timestamp: parseFoodLogTimestamp(input.timestamp)?.normalized,
+    portion: normalizeWholePackagePortion(input.portion),
   },
 ) {
   const issues: string[] = [];
@@ -206,6 +232,23 @@ export function foodLogValidationIssues(
   }
   if (input.amount !== undefined && (!Number.isFinite(input.amount) || input.amount <= 0)) {
     issues.push("Food amount must be a finite number greater than zero.");
+  }
+  if (input.portion && (input.amount !== undefined || input.unit !== undefined)) {
+    issues.push("Use either portion or amount/unit, not both.");
+  }
+  if (input.portion) {
+    if (!input.portion.portion.name.trim()) {
+      issues.push("Whole-package portion name must not be blank.");
+    }
+    if (!Number.isFinite(input.portion.portion.weightGrams) || input.portion.portion.weightGrams <= 0) {
+      issues.push("Whole-package portion weightGrams must be a finite number greater than zero.");
+    }
+    if (input.portion.count !== undefined && (!Number.isFinite(input.portion.count) || input.portion.count <= 0)) {
+      issues.push("Whole-package portion count must be a finite number greater than zero.");
+    }
+    if (!Number.isFinite(normalized.portion?.resolvedAmount) || (normalized.portion?.resolvedAmount ?? 0) <= 0) {
+      issues.push("Whole-package portion could not be resolved to a positive gram amount.");
+    }
   }
   if (input.unit !== undefined && !normalized.unit) issues.push("Food unit must not be blank when provided.");
   if (input.timestamp !== undefined && !normalized.timestamp) {
@@ -231,6 +274,7 @@ export function foodLogIdempotencyKey(input: {
   query: string;
   amount?: number;
   unit?: string;
+  portion?: NormalizedFoodLog["portion"];
   timestamp?: string;
   selectedName?: string;
   selectedSource?: string;
@@ -241,6 +285,15 @@ export function foodLogIdempotencyKey(input: {
     query: normalizeComparable(input.query),
     amount: input.amount ?? null,
     unit: normalizeComparable(input.unit ?? ""),
+    portion: input.portion
+      ? {
+        kind: input.portion.kind,
+        name: normalizeComparable(input.portion.name),
+        weightGrams: input.portion.weightGrams,
+        count: input.portion.count,
+        resolvedAmount: input.portion.resolvedAmount,
+      }
+      : null,
     timestamp: input.timestamp ?? null,
     selectedName: normalizeComparable(input.selectedName ?? ""),
     selectedSource: normalizeComparable(input.selectedSource ?? ""),
@@ -257,6 +310,7 @@ export function foodLogBatchIdempotencyKey(items: NormalizedFoodLog[]) {
       query: normalizeComparable(item.query),
       amount: item.amount ?? null,
       unit: normalizeComparable(item.unit ?? ""),
+      portion: item.portion ?? null,
       timestamp: item.timestamp ?? null,
       selectedName: normalizeComparable(item.selectedName ?? ""),
       selectedSource: normalizeComparable(item.selectedSource ?? ""),
@@ -285,28 +339,58 @@ export function verifyFoodLogInDiaryText(text: string, normalized: NormalizedFoo
   };
 }
 
-export function verifyFoodLogInDiaryEntries(entries: DiaryFoodEntry[], normalized: NormalizedFoodLog): FoodLogVerification {
+export interface FoodLogMatchResult {
+  count: number;
+  matches: DiaryFoodEntry[];
+  verification: FoodLogVerification;
+}
+
+export function matchFoodLogInDiaryEntries(entries: DiaryFoodEntry[], normalized: NormalizedFoodLog): FoodLogMatchResult {
   const mealEntries = entries.filter((entry) => normalizeComparable(entry.meal) === normalizeComparable(normalized.meal));
   const nameEntries = mealEntries.filter((entry) => foodEntryNameMatches(entry.name, normalized));
   const amountEntries = normalized.amount === undefined
     ? nameEntries
     : nameEntries.filter((entry) => foodEntryAmountMatches(entry, normalized.amount!, normalized.unit));
-  const requestedUnit = normalized.unit;
-  const unitEntries = requestedUnit === undefined
+  const matches = normalized.unit === undefined
     ? amountEntries
-    : amountEntries.filter((entry) => foodEntryUnitMatches(entry, normalized.amount, requestedUnit));
-  const matchedMeal = mealEntries.length > 0 || entries.some((entry) => normalizeComparable(entry.meal) === normalizeComparable(normalized.meal));
+    : amountEntries.filter((entry) => foodEntryUnitMatches(entry, normalized.amount, normalized.unit!));
+  const matchedMeal = mealEntries.length > 0;
   const matchedFood = nameEntries.length > 0;
   const matchedAmount = normalized.amount === undefined || amountEntries.length > 0;
-  const matchedUnit = normalized.unit === undefined || unitEntries.length > 0;
+  const matchedUnit = normalized.unit === undefined || matches.length > 0;
   return {
-    status: matchedFood && matchedAmount && matchedUnit && matchedMeal ? "verified" : "not_verified",
-    matchedFood,
-    matchedAmount,
-    matchedUnit,
-    matchedMeal,
-    textSample: compactText(JSON.stringify(mealEntries.slice(0, 30)), 2500),
+    count: matches.length,
+    matches,
+    verification: {
+      status: matchedFood && matchedAmount && matchedUnit && matchedMeal ? "verified" : "not_verified",
+      matchedFood,
+      matchedAmount,
+      matchedUnit,
+      matchedMeal,
+      textSample: compactText(JSON.stringify(mealEntries.slice(0, 30)), 2500),
+    },
   };
+}
+
+export function foodLogCountDelta(beforeCount: number, afterCount: number, intendedDelta = 1) {
+  const actualDelta = afterCount - beforeCount;
+  return {
+    beforeCount,
+    afterCount,
+    intendedDelta,
+    actualDelta,
+    verified: actualDelta === intendedDelta,
+    status: actualDelta === intendedDelta ? "verified" as const : "not_verified" as const,
+    reason: actualDelta === intendedDelta
+      ? undefined
+      : actualDelta < intendedDelta
+        ? "The diary did not gain the requested number of matching rows."
+        : "The diary gained more matching rows than this operation requested.",
+  };
+}
+
+export function verifyFoodLogInDiaryEntries(entries: DiaryFoodEntry[], normalized: NormalizedFoodLog): FoodLogVerification {
+  return matchFoodLogInDiaryEntries(entries, normalized).verification;
 }
 
 export function retryGuidanceForFoodLog(status: string) {
@@ -329,6 +413,7 @@ export function foodLogBrowserPreflightData(normalized: NormalizedFoodLog) {
       date: normalized.date,
       amount: normalized.amount,
       unit: normalized.unit,
+      portion: normalized.portion,
       timestamp: normalized.timestamp,
       selectedName: normalized.selectedName,
       selectedSource: normalized.selectedSource,

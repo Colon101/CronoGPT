@@ -96,18 +96,23 @@ CRONOMETER_REQUIRE_FOOD_CONFIRMATION=false
 CRONOMETER_NAVIGATION_TIMEOUT_MS=60000
 CRONOMETER_LOGIN_BACKOFF_MS=900000
 CRONOMETER_LOGIN_BACKOFF_FILE=/opt/cronogpt/state/cronometer-login-backoff.json
+CRONOMETER_OPERATION_JOURNAL_FILE=/opt/cronogpt/state/cronometer-operation-journal.json
 CRONOMETER_OPERATION_TIMEOUT_MS=180000
 CRONOMETER_BROWSER_RETRY_COUNT=1
 CRONOGPT_FULL_TOOL_SURFACE=false
 ```
 
-The Oracle Docker image includes local Chromium through the Playwright base image. Keep `CRONOMETER_REUSE_LOCAL_BROWSER=true` and `CRONOMETER_BROWSER_PROFILE_DIR=/opt/cronogpt/state/chromium-profile` so the hosted process reuses one warm Chromium session and persists Cronometer cookies across deploys. `REMOTE_CHROME_WS_ENDPOINT` is optional if you want Browserless or another remote Chrome provider instead. `CRONOMETER_STORAGE_STATE_BASE64` seeds the hosted browser with a valid Cronometer session when the persistent profile is empty or stale. `CRONOMETER_STRICT_ACCOUNT_VERIFICATION=true` refuses browser work when the authenticated account cannot be verified as the configured email. `CRONOMETER_LOGIN_BACKOFF_MS` pauses new login attempts after a rate-limit, challenge, or ambiguous login-page failure, and `CRONOMETER_LOGIN_BACKOFF_FILE` persists that cooldown across server restarts. `CRONOGPT_OAUTH_STATE_FILE` persists consumed authorization-code digests so a code cannot be replayed after a restart.
+The Oracle Docker image includes local Chromium through the Playwright base image. Keep `CRONOMETER_REUSE_LOCAL_BROWSER=true` and `CRONOMETER_BROWSER_PROFILE_DIR=/opt/cronogpt/state/chromium-profile` so the hosted process reuses one warm Chromium session and persists Cronometer cookies across deploys. `REMOTE_CHROME_WS_ENDPOINT` is optional if you want Browserless or another remote Chrome provider instead. `CRONOMETER_STORAGE_STATE_BASE64` seeds the hosted browser with a valid Cronometer session when the persistent profile is empty or stale. `CRONOMETER_STRICT_ACCOUNT_VERIFICATION=true` refuses browser work when the authenticated account cannot be verified as the configured email. `CRONOMETER_LOGIN_BACKOFF_MS` pauses new login attempts after a rate-limit, challenge, or ambiguous login-page failure, and `CRONOMETER_LOGIN_BACKOFF_FILE` persists that cooldown across server restarts. `CRONOMETER_OPERATION_JOURNAL_FILE` persists bounded, credential-free operation metadata so a restart never blindly replays an unfinished food write. `CRONOGPT_OAUTH_STATE_FILE` persists consumed authorization-code digests so a code cannot be replayed after a restart.
 
 Food logs write directly when `CRONOMETER_ENABLE_WRITES=true` unless the tool call sets `dryRun=true`. Set `CRONOMETER_REQUIRE_FOOD_CONFIRMATION=true` to restore the older second-step confirmation behavior. Other write tools require `confirmed=true` and will write as long as `dryRun` is not `true`. Dry-run write previews return without opening Cronometer, so recipe/custom-food validation does not burn browser login attempts. Set `CRONOMETER_ENABLE_WRITES=false` for read-only dry-run mode.
 
 Browser-backed tools are serialized inside the hosted process to reduce Chromium contention. Confirmed `log_food` writes are accepted as background jobs and deduped by idempotency key, so slow Cronometer UI work can finish after the caller returns. `CRONOMETER_OPERATION_TIMEOUT_MS` bounds individual browser attempts, and `CRONOMETER_BROWSER_RETRY_COUNT` retries transient pre-write automation failures without retrying login/CAPTCHA/credential failures. Once a commit control has been reached, any browser exception becomes `possibly_written_verify_failed`; it is never retried automatically.
 
-For multi-ingredient meals, use `log_foods` instead of several separate `log_food` calls. It accepts an `items` array, derives one batch idempotency key, logs the foods sequentially in one browser job, verifies each item, and returns a per-item status table. By default it waits briefly for the batch to finish; if Cronometer is slow, poll `cronometer_runtime_status` for the returned background job instead of submitting the same batch again.
+For multi-ingredient meals, use `log_foods` instead of several separate `log_food` calls. It accepts an `items` array, derives one batch idempotency key, logs the foods sequentially in one browser job, verifies each item by proving the exact matching-row count increased by one, and returns a per-item status table. By default it waits briefly for the batch to finish; if Cronometer is slow, call `get_cronometer_operation` with the returned operation ID. An `accepted` result means the write is in progress, not failed—never submit the same batch again as a polling mechanism.
+
+When the user consumes a whole bag, can, bottle, or other package, pass `portion: { kind: "whole_package", portion: { name, weightGrams }, count }`. A food can have multiple portions, each represented by its own name-to-weight mapping (for example `piece: 10 g`, `serving: 30 g`, and `bag: 130 g`); use the exact package mapping and do not also pass `amount`/`unit`. CronoGPT resolves the requested package to grams for an unambiguous diary write and refuses missing or guessed weights. The explicit diary `meal` always wins over product/search categories: an energy drink requested for Lunch is logged to Lunch, never inferred as Supplements.
+
+`delete_diary_food_entry` remains conservative for normal use. If accidental rows are indistinguishable, preview the exact date/meal/name/amount match count and then pass an explicit `deleteCount`; CronoGPT deletes one row at a time and stops unless read-back proves the count dropped by exactly one. There is intentionally no delete-all mode.
 
 If Cronometer returns `Too Many Attempts`, stop live browser checks and seed the shared cooldown before retrying later:
 
@@ -195,6 +200,7 @@ By default, only these tools are model-visible:
 
 - `log_food`
 - `log_foods`
+- `get_cronometer_operation`
 - `delete_diary_food_entry`
 - `get_daily_summary`
 - `list_food_entries`
@@ -214,6 +220,7 @@ By default, only these tools are model-visible:
 - `find_private_recipe`
 - `resolve_recipe_ingredients`
 - `ensure_private_recipe`
+- `update_custom_recipe`
 - `cronometer_runtime_status`
 - `cronometer_stability_check`
 - `refresh_cronometer_session`
@@ -234,7 +241,7 @@ Set `CRONOMETER_BACKEND` in `.env`:
 
 The existing lowercase `email` and `password` keys are supported only for local browser-framework detection. Prefer `CRONOMETER_EMAIL` and `CRONOMETER_PASSWORD`.
 
-`resolve_recipe_ingredients` reuses a single Cronometer food-search dialog and stops before the hosted operation budget expires. If a large recipe returns skipped or unresolved ingredients, call it again with only those remaining ingredients. For model-initiated recipe writes, pass the chosen `selectedName` and `selectedSource` from `resolve_recipe_ingredients` into each `ensure_private_recipe` ingredient. Ambiguous matches return candidates instead of writing the wrong food; the lower-level `create_recipe` tool remains available only to the app and direct MCP clients.
+`resolve_recipe_ingredients` reuses a single Cronometer food-search dialog and stops before the hosted operation budget expires. If a large recipe returns skipped or unresolved ingredients, call it again with only those remaining ingredients. For model-initiated recipe writes, pass the chosen `selectedName` and `selectedSource` from `resolve_recipe_ingredients` into each `ensure_private_recipe` ingredient. `ensure_private_recipe` reads back the full exact same-named recipe and returns `already_exists` only for a semantic match; it can safely add missing ingredients to an unambiguous partial recipe and otherwise returns a structured conflict. Ambiguous matches return candidates instead of writing the wrong food. `create_recipe` is model-visible as a confirmed direct fallback only after `find_private_recipe` has proved the exact name absent, and independently refuses an exact-name duplicate. `delete_custom_recipe` is model-visible for exact-ID cleanup and retains its destructive annotation plus exact confirmation-name gate; when Cronometer reports existing diary uses, it clicks Cronometer's native `RETIRE` action by default and verifies the success message. It does not rename the recipe.
 
 ## Current tool map
 

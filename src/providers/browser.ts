@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 import type {
   BiometricLogInput,
@@ -45,12 +45,14 @@ import {
   foodLogBatchIdempotencyKey,
   foodLogBrowserPreflightData,
   foodLogIdempotencyKey,
+  foodLogCountDelta,
   isKnownFoodLogMeal,
   isValidFoodLogDate,
   normalizeFoodLogDate,
   normalizeFoodLogInput,
   normalizeFoodLogMeal,
   normalizeFoodLogUnit,
+  matchFoodLogInDiaryEntries,
   parseFoodLogTimestamp,
   retryGuidanceForFoodLog,
   verifyFoodLogInDiaryEntries,
@@ -71,6 +73,7 @@ export interface BrowserConfig {
   navigationTimeoutMs: number;
   loginBackoffMs: number;
   loginBackoffFile?: string;
+  operationJournalFile?: string;
   operationTimeoutMs: number;
   browserRetryCount: number;
   timeZone: string;
@@ -105,6 +108,7 @@ interface NormalizedDiaryFoodDelete {
   name: string;
   amount?: number;
   unit?: string;
+  deleteCount: number;
   validationIssues: string[];
 }
 
@@ -137,6 +141,9 @@ interface CustomRecipeDetail {
   occurrence?: number;
   servingName?: string;
   servings?: number;
+  cookedWeight?: number;
+  cookedWeightUnit?: string;
+  ingredientsStatus?: "parsed" | "empty_confirmed" | "extraction_failed";
   ingredients?: Array<{
     name: string;
     database?: string;
@@ -148,6 +155,8 @@ interface CustomRecipeDetail {
   rawText?: string;
 }
 
+type CustomRecipeIngredientDetail = NonNullable<CustomRecipeDetail["ingredients"]>[number];
+
 interface BrowserSession {
   browser?: Browser;
   context: BrowserContext;
@@ -156,16 +165,20 @@ interface BrowserSession {
   closeBrowser?: boolean;
 }
 
-interface BackgroundBrowserJob {
+interface PersistedBackgroundBrowserJob {
   id: string;
   key: string;
   feature: string;
-  status: "running" | "completed" | "failed";
+  status: "running" | "completed" | "failed" | "indeterminate";
   startedAt: number;
   updatedAt: number;
   input: unknown;
   result?: ProviderResult;
   error?: string;
+}
+
+interface BackgroundBrowserJob extends Omit<PersistedBackgroundBrowserJob, "status"> {
+  status: "running" | "completed" | "failed";
 }
 
 interface ParsedStorageState {
@@ -238,8 +251,17 @@ interface StorageStateInfo {
 }
 
 export class BrowserCronometerProvider extends BaseCronometerProvider {
+  private readonly persistedOperations = new Map<string, PersistedBackgroundBrowserJob>();
+
   constructor(private readonly config: BrowserConfig) {
     super("browser", "browser");
+    for (const operation of readOperationJournal(config.operationJournalFile)) {
+      const recovered = operation.status === "running"
+        ? { ...operation, status: "indeterminate" as const, error: "The process restarted before this operation reached a terminal state." }
+        : operation;
+      this.persistedOperations.set(recovered.id, recovered);
+    }
+    this.persistOperationJournal();
   }
 
   async capabilities(): Promise<ProviderResult<Capability[]>> {
@@ -312,6 +334,8 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       loginPauseSecondsRemaining: loginPaused ? Math.ceil((loginBackoff.until - now) / 1000) : 0,
       loginBackoffSource: loginBackoff.source,
       loginBackoffFileConfigured: Boolean(this.config.loginBackoffFile),
+      operationJournalFileConfigured: Boolean(this.config.operationJournalFile),
+      persistedOperationCount: this.persistedOperations.size,
       lastLoginFailure: loginBackoff.reason,
       guidance: [
         "Use dryRun=true for validation and previews; dry-run write tools do not open Cronometer.",
@@ -325,6 +349,66 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         "For the most reliable hosted writes, configure a persistent remote browser or CRONOMETER_STORAGE_STATE_BASE64.",
       ],
     });
+  }
+
+  async getOperation(operationId: string): Promise<ProviderResult> {
+    pruneBackgroundBrowserJobs();
+    const job = backgroundBrowserJobs.get(operationId);
+    const persisted = this.persistedOperations.get(operationId);
+    if (!job && persisted?.status === "indeterminate") {
+      return this.result("get_cronometer_operation", "possibly_written_verify_failed", {
+        operationId,
+        state: "indeterminate",
+        retryable: false,
+        nextAction: "inspect_diary",
+        operation: persisted,
+      }, persisted.error ?? "The process restarted before this operation reached a terminal state. Inspect the diary before any retry.");
+    }
+    if (!job && persisted?.status === "completed" && persisted.result) {
+      return this.result("get_cronometer_operation", persisted.result.status, {
+        ...resultDataObject(persisted.result),
+        operationId,
+        state: ["written", "already_exists", "ok"].includes(persisted.result.status) ? "succeeded" : "failed",
+        retryable: false,
+        nextAction: persisted.result.status === "possibly_written_verify_failed" ? "inspect_diary" : "none",
+        returnedFromJournal: true,
+      }, persisted.result.warning, persisted.result.source);
+    }
+    if (!job && persisted?.status === "failed") {
+      return this.result("get_cronometer_operation", "error", {
+        operationId,
+        state: "failed",
+        retryable: false,
+        nextAction: "manual_resolution",
+        returnedFromJournal: true,
+      }, persisted.error ?? "Background Cronometer operation failed.", "browser");
+    }
+    if (!job) {
+      return this.result("get_cronometer_operation", "not_configured", {
+        operationId,
+        state: "indeterminate",
+        retryable: false,
+        nextAction: "inspect_diary",
+      }, "That operation is not available in this process. Inspect the diary before considering any retry.");
+    }
+    if (job.status === "running") return this.backgroundBrowserJobAcceptedResult(job.feature, job, true);
+    if (job.status === "completed" && job.result) {
+      return this.result("get_cronometer_operation", job.result.status, {
+        ...resultDataObject(job.result),
+        operationId: job.id,
+        state: ["written", "already_exists", "ok"].includes(job.result.status) ? "succeeded" : "failed",
+        retryable: false,
+        nextAction: job.result.status === "possibly_written_verify_failed" ? "inspect_diary" : "none",
+        backgroundJob: summarizeBackgroundBrowserJob(job, Date.now()),
+      }, job.result.warning, job.result.source);
+    }
+    return this.result("get_cronometer_operation", "error", {
+      operationId: job.id,
+      state: "failed",
+      retryable: false,
+      nextAction: "manual_resolution",
+      backgroundJob: summarizeBackgroundBrowserJob(job, Date.now()),
+    }, job.error ?? "Background Cronometer operation failed.", "browser");
   }
 
   async refreshSession(): Promise<ProviderResult> {
@@ -859,9 +943,10 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     const initialDateStatus = await this.openDiary(page, normalized.date);
     const beforeDiaryText = await this.visibleText(page).catch(() => "");
     const beforeDiary = await extractDiaryFoodEntries(page).catch(() => undefined);
-    const beforeVerification = beforeDiary?.mealSections.length
-      ? verifyFoodLogInDiaryEntries(beforeDiary.entries, normalized)
-      : verifyFoodLogInDiaryText(beforeDiaryText, normalized);
+    const beforeMatch = beforeDiary?.mealSections.length
+      ? matchFoodLogInDiaryEntries(beforeDiary.entries, normalized)
+      : undefined;
+    const beforeVerification = beforeMatch?.verification ?? verifyFoodLogInDiaryText(beforeDiaryText, normalized);
     if (!initialDateStatus.selected) {
       return this.result(
         "log_food",
@@ -877,18 +962,6 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         },
         initialDateStatus.warning ?? "Could not apply the requested diary date. No write was attempted.",
       );
-    }
-
-    if (beforeVerification.status === "verified") {
-      return this.result("log_food", "already_exists", {
-        ...preflightData,
-        input: safeInput(input),
-        browserOpened: true,
-        writeAttempted: false,
-        dateStatus: initialDateStatus,
-        verification: beforeVerification,
-        retry: retryGuidanceForFoodLog("already_exists"),
-      });
     }
 
     const foodSearch = await this.searchFoodForLog(page, normalized, requested, input);
@@ -1125,10 +1198,19 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       selectedSource,
     };
     const afterDiary = await extractDiaryFoodEntries(page).catch(() => undefined);
-    const verification = afterDiary?.mealSections.length
-      ? verifyFoodLogInDiaryEntries(afterDiary.entries, verifiedLog)
-      : verifyFoodLogInDiaryText(afterText || await this.visibleText(page).catch(() => ""), verifiedLog);
-    const status = verification.status === "verified" ? "written" : "possibly_written_verify_failed";
+    const beforeSelectedMatch = beforeDiary?.mealSections.length
+      ? matchFoodLogInDiaryEntries(beforeDiary.entries, verifiedLog)
+      : undefined;
+    const afterMatch = afterDiary?.mealSections.length
+      ? matchFoodLogInDiaryEntries(afterDiary.entries, verifiedLog)
+      : undefined;
+    const verification = afterMatch?.verification
+      ?? verifyFoodLogInDiaryText(afterText || await this.visibleText(page).catch(() => ""), verifiedLog);
+    const countDelta = beforeSelectedMatch && afterMatch
+      ? foodLogCountDelta(beforeSelectedMatch.count, afterMatch.count)
+      : undefined;
+    const countVerified = countDelta?.verified === true;
+    const status = countVerified ? "written" : "possibly_written_verify_failed";
     return this.result("log_food", status, {
       ...preflightData,
       logged: { ...safeInput(input), selectedName, selectedSource },
@@ -1143,9 +1225,10 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       writeAttempted: true,
       queryUsed,
       verification,
+      countDelta,
       retry: retryGuidanceForFoodLog(status),
-      visibleText: verification.status === "verified" ? undefined : compactText(await this.visibleText(page).catch(() => ""), 6000),
-    }, verification.status === "verified" ? undefined : "Food may have been written, but read-back verification did not find the exact entry. Do not blindly retry.");
+      visibleText: countVerified ? undefined : compactText(await this.visibleText(page).catch(() => ""), 6000),
+    }, countVerified ? undefined : countDelta?.reason ?? "Food may have been written, but a structured before/after row-count delta could not prove exactly one new entry. Do not blindly retry.");
   }
 
   async deleteDiaryFoodEntry(input: DiaryFoodDeleteInput & { confirmed?: boolean }) {
@@ -1158,6 +1241,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         name: target.name,
         amount: target.amount,
         unit: target.unit,
+        deleteCount: target.deleteCount,
         confirmName: input.confirmName,
       });
       const accepted = this.startBackgroundBrowserJob(
@@ -1252,60 +1336,75 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         }, "Diary food delete requires confirmName to match the target food name exactly.");
       }
 
-      if (matches.length > 1) {
+      if (matches.length > 1 && input.deleteCount === undefined) {
         return this.result("delete_diary_food_entry", "needs_manual_step", {
           input: safeInput(input),
           dateStatus,
           preview,
           browserOpened: true,
           writeAttempted: false,
-          nextStep: "Narrow the delete request with amount and unit, or delete manually from Cronometer.",
-        }, "Multiple matching diary entries were found in the requested meal. No delete was attempted.");
+          nextStep: "Preview the exact match count, then pass an explicit deleteCount to remove only that many indistinguishable rows.",
+        }, "Multiple matching diary entries were found. No delete was attempted without an explicit deleteCount.");
       }
-
-      const clicked = await clickDiaryFoodEntryRow(page, target, matches[0]);
-      if (!clicked.clicked) {
+      if (target.deleteCount > matches.length) {
         return this.result("delete_diary_food_entry", "needs_manual_step", {
           input: safeInput(input),
           dateStatus,
           preview,
-          click: clicked,
           browserOpened: true,
           writeAttempted: false,
-        }, clicked.warning ?? "Could not select the matching diary row with stable UI selectors.");
+        }, `deleteCount ${target.deleteCount} exceeds the ${matches.length} matching rows. No delete was attempted.`);
       }
 
-      const deleteTrigger = await triggerSelectedDiaryEntryDelete(page);
-      const confirmation = await confirmSelectedDiaryEntryDelete(page);
-      if (!confirmation.confirmed) {
-        return this.result("delete_diary_food_entry", "needs_manual_step", {
-          input: safeInput(input),
-          dateStatus,
-          preview,
-          click: clicked,
-          deleteTrigger,
-          deleteConfirmation: confirmation,
-          browserOpened: true,
-          writeAttempted: false,
-        }, confirmation.warning ?? "Cronometer did not show the expected selected-entry delete confirmation.");
+      let currentMatches = matches;
+      const deletions = [];
+      for (let index = 0; index < target.deleteCount; index += 1) {
+        const beforeCount = currentMatches.length;
+        const clicked = await clickDiaryFoodEntryRow(page, target, currentMatches[0]);
+        if (!clicked.clicked) {
+          return this.result("delete_diary_food_entry", "needs_manual_step", {
+            input: safeInput(input), dateStatus, preview, deletions, click: clicked,
+            browserOpened: true, writeAttempted: deletions.length > 0,
+          }, clicked.warning ?? "Could not select a matching diary row with stable UI selectors.");
+        }
+
+        const deleteTrigger = await triggerSelectedDiaryEntryDelete(page);
+        const confirmation = await confirmSelectedDiaryEntryDelete(page);
+        if (!confirmation.confirmed) {
+          return this.result("delete_diary_food_entry", deletions.length > 0 ? "possibly_written_verify_failed" : "needs_manual_step", {
+            input: safeInput(input), dateStatus, preview, deletions, click: clicked,
+            deleteTrigger, deleteConfirmation: confirmation,
+            browserOpened: true, writeAttempted: deletions.length > 0,
+          }, confirmation.warning ?? "Cronometer did not show the expected selected-entry delete confirmation.");
+        }
+
+        await page.waitForTimeout(2500);
+        const afterText = await this.waitForDiaryText(page).catch(async () => await this.visibleText(page).catch(() => ""));
+        currentMatches = findDiaryFoodEntryMatches(afterText, target);
+        const countDelta = foodLogCountDelta(beforeCount, currentMatches.length, -1);
+        deletions.push({ index, beforeCount, afterCount: currentMatches.length, clicked, deleteTrigger, deleteConfirmation: confirmation, countDelta });
+        if (!countDelta.verified) {
+          return this.result("delete_diary_food_entry", "possibly_written_verify_failed", {
+            input: safeInput(input), dateStatus, preview, deletions,
+            deletedCount: index,
+            remainingMatchCount: currentMatches.length,
+            browserOpened: true, writeAttempted: true,
+            afterText: compactText(afterText, 4000),
+          }, "A delete was attempted, but read-back did not prove that exactly one matching row disappeared. Stopped before deleting anything else.");
+        }
       }
 
-      await page.waitForTimeout(2500);
-      const afterText = await this.waitForDiaryText(page).catch(async () => await this.visibleText(page).catch(() => ""));
-      const remainingMatches = findDiaryFoodEntryMatches(afterText, target);
-      return this.result("delete_diary_food_entry", remainingMatches.length === 0 ? "ok" : "possibly_written_verify_failed", {
+      return this.result("delete_diary_food_entry", "ok", {
         input: safeInput(input),
         dateStatus,
         preview,
-        click: clicked,
-        deleteTrigger,
-        deleteConfirmation: confirmation,
-        deleted: remainingMatches.length === 0,
-        remainingMatchCount: remainingMatches.length,
+        deletions,
+        deleted: true,
+        deletedCount: target.deleteCount,
+        remainingMatchCount: currentMatches.length,
         browserOpened: true,
         writeAttempted: true,
-        afterText: remainingMatches.length === 0 ? undefined : compactText(afterText, 4000),
-      }, remainingMatches.length === 0 ? undefined : "Delete was attempted, but the matching diary entry still appears after read-back.");
+      });
     });
   }
 
@@ -1606,8 +1705,9 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       query: normalizedInput.name,
       selectedName: normalizedInput.name,
       selectedSource: "Custom Food",
-      amount: normalizedInput.amount ?? 1,
-      unit: normalizedInput.unit,
+      amount: normalizedInput.portion ? undefined : normalizedInput.amount ?? 1,
+      unit: normalizedInput.portion ? undefined : normalizedInput.unit,
+      portion: normalizedInput.portion,
       timestamp: normalizedInput.timestamp,
       matchPolicy: "selected_only",
       searchScope: "custom",
@@ -1961,22 +2061,16 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         }, "Cronometer showed a dependency warning, so deletion was stopped.");
       }
 
-      if (confirmation.retireInstead) {
-        const retiredName = retiredItemName(input.name ?? target.name, input.foodId, this.config.timeZone);
-        const retired = await retireOpenCustomFood(page, target, retiredName);
-        const status = retired.saved
-          ? "ok"
-          : retired.saveClicked
-            ? "possibly_written_verify_failed"
-            : "needs_manual_step";
+      if (confirmation.nativeRetired) {
+        const status = confirmation.retirementVerified ? "ok" : "possibly_written_verify_failed";
         return this.result("delete_custom_food", status, {
           deleted: false,
-          action: "retired_instead",
+          action: "retired_natively",
           target,
-          retiredName,
           deleteConfirmation: confirmation,
-          retired,
-        }, retired.saved ? "Cronometer warned about existing references, so the custom food was retired instead of deleted." : "Cronometer warned about existing references, and the retire fallback could not be saved.");
+        }, confirmation.retirementVerified
+          ? "Cronometer retired the custom food through its native Retire action, preserving historical usage."
+          : "Cronometer's native Retire action was clicked, but the success message could not be verified.");
       }
 
       await page.waitForTimeout(1200);
@@ -2130,11 +2224,40 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       trace("open_app_start", { ingredientCount: input.ingredients.length });
       await this.openApp(page, "#custom-recipes");
       trace("open_app_done");
+      trace("ensure_list_view_start");
+      const listView = await ensureCustomRecipeListView(page, this.config.navigationTimeoutMs);
+      trace("ensure_list_view_done", listView);
+      if (!listView.ready) {
+        return this.result("create_recipe", "needs_manual_step", {
+          input: safeInput(input),
+          listView,
+          browserOpened: true,
+          writeAttempted: false,
+        }, "Could not normalize Cronometer into the Custom Recipes list view.");
+      }
+      const exactExistingNames = listView.names.filter((name) => name.toLowerCase() === input.name.trim().toLowerCase());
+      if (exactExistingNames.length > 0) {
+        return this.result("create_recipe", "needs_manual_step", {
+          input: safeInput(input),
+          exactExistingNames,
+          browserOpened: true,
+          writeAttempted: false,
+          nextStep: "Use ensure_private_recipe to compare or repair the existing exact-named recipe instead of creating a duplicate.",
+        }, "An exact-named custom recipe already exists, so direct creation was refused to prevent a duplicate.");
+      }
       trace("create_button_click_start");
-      const opened = await clickByText(page, /^CREATE RECIPE$/i);
-      trace("create_button_click_done", { opened });
-      if (!opened) {
-        return this.result("create_recipe", "needs_manual_step", { input: safeInput(input) }, "Could not find CREATE RECIPE.");
+      const createButton = await clickUniqueCreateRecipeButton(page);
+      trace("create_button_click_done", createButton);
+      if (!createButton.clicked) {
+        return this.result("create_recipe", "needs_manual_step", {
+          input: safeInput(input),
+          listView,
+          createButton,
+          browserOpened: true,
+          writeAttempted: false,
+        }, createButton.candidateCount > 1
+          ? "Multiple visible CREATE RECIPE controls were found, so no ambiguous control was clicked."
+          : "Could not find a unique visible CREATE RECIPE control.");
       }
 
       await page.waitForTimeout(450);
@@ -2209,7 +2332,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         await clickOptionalSaveConfirmation(page).catch(() => false);
         await page.waitForTimeout(1000);
         trace("extract_final_detail_start");
-        finalDetail = await extractCustomRecipeDetail(page).catch(() => undefined);
+        finalDetail = await extractCustomRecipeDetailWithRetry(page, 4, 350).catch(() => undefined);
         postSaveText = await this.visibleText(page).catch(() => "");
         trace("extract_final_detail_done", { finalDetailName: finalDetail?.name, hasPostSaveText: Boolean(postSaveText) });
         trace("list_verify_start");
@@ -2324,7 +2447,8 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       }
       const allAdded = addedIngredients.length === (input.ingredientsToAdd?.length ?? 0)
         && addedIngredients.every((item) => item.status === "ok");
-      const basicsVerified = recipeBasicsVerified(basics, basicsInput);
+      const refilledBasics = allAdded ? await fillRecipeBasics(page, basicsInput) : undefined;
+      const basicsVerified = recipeBasicsVerified(refilledBasics ?? basics, basicsInput);
       if (!allAdded || !basicsVerified) {
         return this.result("update_custom_recipe", "needs_manual_step", {
           updated: false,
@@ -2332,6 +2456,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           before,
           plannedAfter: after,
           basics,
+          refilledBasics,
           basicsVerified,
           addedIngredients,
           browserOpened: true,
@@ -2348,6 +2473,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           before,
           plannedAfter: after,
           basics,
+          refilledBasics,
           basicsVerified,
           addedIngredients,
           browserOpened: true,
@@ -2355,7 +2481,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         }, "All requested recipe fields were filled, but Save was not available. Nothing was intentionally saved.");
       }
       await page.waitForTimeout(1000);
-      const finalDetail = await extractCustomRecipeDetail(page);
+      const finalDetail = await extractCustomRecipeDetailWithRetry(page, 4, 350);
       const nameVerified = normalizeCustomFoodName(finalDetail?.name ?? "") === normalizeCustomFoodName(basicsInput.name);
       const servingsVerified = recipeServingsVerified(finalDetail, basicsInput);
       const ingredientsVerified = recipeIngredientsVerified(finalDetail, addedIngredients);
@@ -2366,6 +2492,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         before,
         after: finalDetail ?? after,
         basics,
+        refilledBasics,
         basicsVerified,
         addedIngredients,
         saveClicked,
@@ -2379,7 +2506,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   async deleteCustomRecipe(input: RecipeDeleteInput & { confirmed?: boolean }) {
     const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
-    const ifUsed = input.ifUsed ?? "stop";
+    const ifUsed = input.ifUsed ?? "retire";
     return this.withPage("delete_custom_recipe", async (page) => {
       await this.openApp(page, "#custom-recipes");
       const resolved = await resolveCustomRecipeTargets(page, input, { maxDetails: 25, timeoutMs: this.config.navigationTimeoutMs });
@@ -2446,22 +2573,16 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         }, "Cronometer showed a dependency warning, so deletion was stopped.");
       }
 
-      if (confirmation.retireInstead) {
-        const retiredName = retiredItemName(input.name ?? target.name, input.recipeId, this.config.timeZone);
-        const retired = await retireOpenCustomRecipe(page, target, retiredName);
-        const status = retired.saved
-          ? "ok"
-          : retired.saveClicked
-            ? "possibly_written_verify_failed"
-            : "needs_manual_step";
+      if (confirmation.nativeRetired) {
+        const status = confirmation.retirementVerified ? "ok" : "possibly_written_verify_failed";
         return this.result("delete_custom_recipe", status, {
           deleted: false,
-          action: "retired_instead",
+          action: "retired_natively",
           target,
-          retiredName,
           deleteConfirmation: confirmation,
-          retired,
-        }, retired.saved ? "Cronometer warned about existing references, so the custom recipe was retired instead of deleted." : "Cronometer warned about existing references, and the retire fallback could not be saved.");
+        }, confirmation.retirementVerified
+          ? "Cronometer retired the custom recipe through its native Retire action, preserving historical usage."
+          : "Cronometer's native Retire action was clicked, but the success message could not be verified.");
       }
 
       await page.waitForTimeout(1200);
@@ -2493,14 +2614,12 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       }
 
       const target = resolved.targets[0];
-      const retiredName = input.retiredName ?? retiredItemName(target.name, target.recipeId, this.config.timeZone);
       if (!confirmedWrite) {
         return this.result("retire_custom_recipe", "dry_run", {
           input: safeInput(input),
           target,
-          retiredName,
           reason: writeGateReason(input, this.config.writeEnabled),
-          nextStep: "Review the exact target and retiredName, then call with confirmed=true to rename instead of delete.",
+          nextStep: "Review the exact target, then call with confirmed=true to use Cronometer's native Retire action. The recipe will not be renamed.",
         });
       }
 
@@ -2508,18 +2627,38 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       if (!opened) {
         return this.result("retire_custom_recipe", "needs_manual_step", { input: safeInput(input), target }, "Could not reopen the selected custom recipe.");
       }
-      const retired = await retireOpenCustomRecipe(page, target, retiredName);
-      const status = retired.saved
-        ? "ok"
-        : retired.saveClicked
-          ? "possibly_written_verify_failed"
-          : "needs_manual_step";
+      const menuClicked = await clickByText(page, /^more_horiz$/i) || await clickByText(page, /^(MORE|ACTIONS)$/i);
+      if (!menuClicked) {
+        return this.result("retire_custom_recipe", "needs_manual_step", {
+          input: safeInput(input),
+          target,
+          visibleText: compactText(await this.visibleText(page), 12000),
+        }, "Could not find the custom recipe actions menu.");
+      }
+      await page.waitForTimeout(500);
+      markPageWriteAttempted(page);
+      const deleteClicked = await clickByText(page, /^(DELETE|DELETE RECIPE|DELETE \/ RETIRE RECIPE(?:\.\.\.)?|REMOVE)$/i);
+      if (!deleteClicked) {
+        return this.result("retire_custom_recipe", "needs_manual_step", {
+          input: safeInput(input),
+          target,
+          visibleText: compactText(await this.visibleText(page), 12000),
+        }, "Opened the actions menu but could not find Cronometer's delete/retire action.");
+      }
+      await page.waitForTimeout(500);
+      const retirement = await handleNativeRetirementOnly(page, target.name);
+      const status = retirement.nativeRetired
+        ? retirement.retirementVerified ? "ok" : "possibly_written_verify_failed"
+        : "needs_manual_step";
       return this.result("retire_custom_recipe", status, {
-        action: "retired",
+        action: retirement.nativeRetired ? "retired_natively" : "not_retired",
         target,
-        retiredName,
-        retired,
-      }, retired.saved ? undefined : "The custom recipe editor opened, but the retired name could not be saved.");
+        retirement,
+      }, retirement.retirementVerified
+        ? undefined
+        : retirement.nativeRetired
+          ? "Cronometer's native Retire action was clicked, but the success message could not be verified."
+          : "Cronometer did not offer its native Retire action, so the recipe was left unchanged.");
     });
   }
 
@@ -3131,6 +3270,23 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
     const existingId = backgroundBrowserJobKeys.get(key);
     const existing = existingId ? backgroundBrowserJobs.get(existingId) : undefined;
+    const persistedExisting = Array.from(this.persistedOperations.values()).find((operation) => operation.key === key);
+    if (!existing && persistedExisting?.status === "indeterminate") {
+      return this.result(feature, "possibly_written_verify_failed", {
+        operationId: persistedExisting.id,
+        state: "indeterminate",
+        retryable: false,
+        nextAction: "inspect_diary",
+        operation: persistedExisting,
+      }, "A previous process started this same operation but restarted before recording a terminal result. Inspect the diary; the operation will not be replayed automatically.");
+    }
+    if (!existing && persistedExisting?.status === "completed" && persistedExisting.result && persistedExisting.result.status !== "busy") {
+      return this.result(feature, persistedExisting.result.status, {
+        ...resultDataObject(persistedExisting.result),
+        operationId: persistedExisting.id,
+        returnedFromJournal: true,
+      }, persistedExisting.result.warning, persistedExisting.result.source);
+    }
     if (existing?.status === "running") {
       return this.backgroundBrowserJobAcceptedResult(feature, existing, true);
     }
@@ -3160,6 +3316,8 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     };
     backgroundBrowserJobs.set(id, job);
     backgroundBrowserJobKeys.set(key, id);
+    this.persistedOperations.set(id, job);
+    this.persistOperationJournal();
 
     void Promise.resolve()
       .then(runner)
@@ -3168,18 +3326,30 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         job.result = result;
         job.error = result.status === "error" ? result.warning : undefined;
         job.updatedAt = Date.now();
+        this.persistedOperations.set(job.id, { ...job });
+        this.persistOperationJournal();
       })
       .catch((error) => {
         job.status = "failed";
         job.error = error instanceof Error ? error.message : String(error);
         job.updatedAt = Date.now();
+        this.persistedOperations.set(job.id, { ...job });
+        this.persistOperationJournal();
       });
 
     return this.backgroundBrowserJobAcceptedResult(feature, job, false);
   }
 
+  private persistOperationJournal() {
+    writeOperationJournal(this.config.operationJournalFile, Array.from(this.persistedOperations.values()));
+  }
+
   private backgroundBrowserJobAcceptedResult(feature: string, job: BackgroundBrowserJob, alreadyRunning: boolean): ProviderResult {
     return this.result(feature, "accepted", {
+      operationId: job.id,
+      state: "running",
+      retryable: false,
+      nextAction: "poll",
       input: job.input,
       browserOpened: false,
       writeAttempted: false,
@@ -3680,21 +3850,26 @@ interface DeleteConfirmationOutcome {
   clicked: boolean;
   cancelled: boolean;
   blocked: boolean;
-  retireInstead: boolean;
+  nativeRetired: boolean;
+  retirementVerified: boolean;
+  retirementMessage?: string;
 }
 
 async function handleOptionalDeleteConfirmation(page: Page, name: string, ifUsed: "stop" | "retire" | "force" = "stop"): Promise<DeleteConfirmationOutcome> {
   const dialog = page.locator(".gwt-DialogBox:visible, [role='dialog']:visible, .modal:visible, .popupContent:visible").last();
   if ((await dialog.count().catch(() => 0)) === 0 || !(await dialog.isVisible().catch(() => false))) {
-    return { dialogVisible: false, dependencyWarning: false, clicked: false, cancelled: false, blocked: false, retireInstead: false };
+    return { dialogVisible: false, dependencyWarning: false, clicked: false, cancelled: false, blocked: false, nativeRetired: false, retirementVerified: false };
   }
   const dialogText = await dialog.innerText().catch(() => "");
   if (dialogText && !dialogText.toLowerCase().includes(name.toLowerCase()) && !/\b(delete|remove)\b/i.test(dialogText)) {
-    return { dialogVisible: true, dialogText, dependencyWarning: false, clicked: false, cancelled: false, blocked: false, retireInstead: false };
+    return { dialogVisible: true, dialogText, dependencyWarning: false, clicked: false, cancelled: false, blocked: false, nativeRetired: false, retirementVerified: false };
   }
 
   const dependencyWarning = deleteDialogHasDependencyWarning(dialogText);
   if (dependencyWarning && ifUsed !== "force") {
+    if (ifUsed === "retire") {
+      return clickNativeRetireInDialog(page, dialog, dialogText);
+    }
     const cancelled = await cancelVisibleDialog(page, dialog);
     return {
       dialogVisible: true,
@@ -3702,14 +3877,87 @@ async function handleOptionalDeleteConfirmation(page: Page, name: string, ifUsed
       dependencyWarning,
       clicked: false,
       cancelled,
-      blocked: ifUsed === "stop",
-      retireInstead: ifUsed === "retire",
+      blocked: true,
+      nativeRetired: false,
+      retirementVerified: false,
     };
   }
 
   markPageWriteAttempted(page);
   const clicked = await clickFirstVisible(dialog.locator(clickableTextSelector()).filter({ hasText: /^(DELETE|REMOVE|YES|OK|CONFIRM)$/i }));
-  return { dialogVisible: true, dialogText, dependencyWarning, clicked, cancelled: false, blocked: false, retireInstead: false };
+  return { dialogVisible: true, dialogText, dependencyWarning, clicked, cancelled: false, blocked: false, nativeRetired: false, retirementVerified: false };
+}
+
+async function handleNativeRetirementOnly(page: Page, name: string): Promise<DeleteConfirmationOutcome> {
+  const dialog = page.locator(".gwt-DialogBox:visible, [role='dialog']:visible, .modal:visible, .popupContent:visible").last();
+  if ((await dialog.count().catch(() => 0)) === 0 || !(await dialog.isVisible().catch(() => false))) {
+    return { dialogVisible: false, dependencyWarning: false, clicked: false, cancelled: false, blocked: true, nativeRetired: false, retirementVerified: false };
+  }
+  const dialogText = await dialog.innerText().catch(() => "");
+  if (dialogText && !dialogText.toLowerCase().includes(name.toLowerCase()) && !/\b(delete|retire)\b/i.test(dialogText)) {
+    return { dialogVisible: true, dialogText, dependencyWarning: false, clicked: false, cancelled: false, blocked: true, nativeRetired: false, retirementVerified: false };
+  }
+  if (!deleteDialogHasDependencyWarning(dialogText)) {
+    const cancelled = await cancelVisibleDialog(page, dialog);
+    return { dialogVisible: true, dialogText, dependencyWarning: false, clicked: false, cancelled, blocked: true, nativeRetired: false, retirementVerified: false };
+  }
+  return clickNativeRetireInDialog(page, dialog, dialogText);
+}
+
+async function clickNativeRetireInDialog(
+  page: Page,
+  dialog: ReturnType<Page["locator"]>,
+  dialogText: string,
+): Promise<DeleteConfirmationOutcome> {
+  markPageWriteAttempted(page);
+  const clicked = await clickFirstVisible(dialog.locator(clickableTextSelector()).filter({ hasText: /^RETIRE$/i }));
+  if (!clicked) {
+    const cancelled = await cancelVisibleDialog(page, dialog);
+    return {
+      dialogVisible: true,
+      dialogText,
+      dependencyWarning: true,
+      clicked: false,
+      cancelled,
+      blocked: true,
+      nativeRetired: false,
+      retirementVerified: false,
+    };
+  }
+
+  const success = await waitForNativeRetirementMessage(page);
+  return {
+    dialogVisible: true,
+    dialogText,
+    dependencyWarning: true,
+    clicked: true,
+    cancelled: false,
+    blocked: false,
+    nativeRetired: true,
+    retirementVerified: success.verified,
+    retirementMessage: success.message,
+  };
+}
+
+async function waitForNativeRetirementMessage(page: Page) {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const dialogs = page.locator(".gwt-DialogBox:visible, [role='dialog']:visible, .modal:visible, .popupContent:visible");
+    const count = await dialogs.count().catch(() => 0);
+    for (let index = Math.max(0, count - 3); index < count; index += 1) {
+      const candidate = dialogs.nth(index);
+      const message = compactText(await candidate.innerText().catch(() => ""), 2000);
+      if (!isNativeRetirementSuccessMessage(message)) continue;
+      await clickFirstVisible(candidate.locator(clickableTextSelector()).filter({ hasText: /^(OK|CLOSE|DONE)$/i }));
+      return { verified: true, message };
+    }
+    await page.waitForTimeout(200);
+  }
+  return { verified: false, message: undefined };
+}
+
+export function isNativeRetirementSuccessMessage(message: string) {
+  return /\bsuccessfully\s+retired\b/i.test(message.replace(/\s+/g, " ").trim());
 }
 
 function markPageWriteAttempted(page: Page) {
@@ -3969,6 +4217,45 @@ export function __setActiveBrowserJobForTests(feature: string, startedAt: number
   activeBrowserJob = { id: ++browserJobSeq, feature, startedAt };
 }
 
+function readOperationJournal(filePath?: string): PersistedBackgroundBrowserJob[] {
+  if (!filePath || !existsSync(filePath)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(filePath, "utf8")) as { operations?: unknown };
+    if (!Array.isArray(parsed.operations)) return [];
+    return parsed.operations.filter((value): value is PersistedBackgroundBrowserJob => {
+      if (!value || typeof value !== "object") return false;
+      const item = value as Record<string, unknown>;
+      return typeof item.id === "string"
+        && typeof item.key === "string"
+        && typeof item.feature === "string"
+        && ["running", "completed", "failed", "indeterminate"].includes(String(item.status))
+        && typeof item.startedAt === "number"
+        && typeof item.updatedAt === "number";
+    });
+  } catch {
+    return [];
+  }
+}
+
+function writeOperationJournal(filePath: string | undefined, operations: PersistedBackgroundBrowserJob[]) {
+  if (!filePath) return;
+  const maxAgeMs = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const retained = operations
+    .filter((operation) => operation.status === "running" || operation.status === "indeterminate" || now - operation.updatedAt <= maxAgeMs)
+    .sort((left, right) => right.updatedAt - left.updatedAt || compareStringsOrdinal(left.id, right.id))
+    .slice(0, 100);
+  const temporaryPath = `${filePath}.tmp`;
+  try {
+    writeFileSync(temporaryPath, JSON.stringify({ version: 1, operations: retained }, null, 2), { mode: 0o600 });
+    chmodSync(temporaryPath, 0o600);
+    renameSync(temporaryPath, filePath);
+    chmodSync(filePath, 0o600);
+  } catch {
+    try { unlinkSync(temporaryPath); } catch { /* best effort */ }
+  }
+}
+
 function backgroundBrowserJobKey(feature: string, input: unknown) {
   const digest = createHash("sha256").update(stableJson(input)).digest("hex").slice(0, 24);
   return `${feature}:${digest}`;
@@ -4186,6 +4473,7 @@ function duplicateNormalizedFoodLogItems(items: ReturnType<typeof normalizeFoodL
       query: normalized.query,
       amount: normalized.amount,
       unit: normalized.unit,
+      portion: normalized.portion,
       timestamp: normalized.timestamp,
       selectedName: normalized.selectedName,
       selectedSource: normalized.selectedSource,
@@ -4203,8 +4491,8 @@ function normalizeFoodLogBatchItems(input: FoodLogBatchInput, timeZone: string) 
   return (input.items ?? []).map((item, index) => {
     const merged: FoodLogInput = {
       ...item,
-      date: item.date ?? input.date,
-      meal: item.meal ?? input.meal,
+      date: input.date,
+      meal: input.meal,
       dryRun: item.dryRun ?? input.dryRun,
       confirmed: item.confirmed ?? input.confirmed,
     };
@@ -4230,6 +4518,7 @@ function summarizeBatchFoodLogResult(index: number, normalized: NormalizedFoodLo
     meal: normalized.meal,
     amount: normalized.amount,
     unit: normalized.unit,
+    portion: normalized.portion,
     idempotencyKey: normalized.idempotencyKey,
     status: result.status,
     warning: result.warning,
@@ -4295,9 +4584,11 @@ function normalizeDiaryFoodDeleteInput(input: DiaryFoodDeleteInput, timeZone: st
     name: input.name?.replace(/\s+/g, " ").trim() ?? "",
     amount: input.amount,
     unit: normalizeFoodLogUnit(input.unit),
+    deleteCount: input.deleteCount ?? 1,
     validationIssues: [
       ...(!isValidFoodLogDate(normalizeFoodLogDate(input.date, timeZone)) ? ["Invalid diary date."] : []),
       ...(!isKnownFoodLogMeal(normalizeFoodLogMeal(input.meal)) ? [`Unsupported meal. Use one of: ${FOOD_LOG_MEALS.join(", ")}.`] : []),
+      ...(input.deleteCount !== undefined && (!Number.isSafeInteger(input.deleteCount) || input.deleteCount <= 0) ? ["deleteCount must be a positive integer."] : []),
     ],
   };
 }
@@ -4700,6 +4991,7 @@ async function accountIdentityText(page: Page) {
         const candidates = [
           "value" in element ? String((element as HTMLInputElement | HTMLTextAreaElement).value ?? "") : "",
           element.textContent ?? "",
+          element.getAttribute("placeholder") ?? "",
           element.getAttribute("data-email") ?? "",
           element.getAttribute("aria-label") ?? "",
           element.getAttribute("title") ?? "",
@@ -5289,7 +5581,10 @@ async function fillLikelyAmount(page: Page, amount?: number, selectedName?: stri
   if (/\bDescription\s+Source\b/i.test(dialogText) && !selectedPanel) {
     return { filled: false, warning: "Still on ingredient search results; refused to fill the search box as an amount." };
   }
-  const input = await editableAmountInput(page, 2500, selectedPanel);
+  const input = await firstVisibleLocator(page, [
+    activeDialog(page).getByRole("textbox", { name: /^Amount$/i }),
+    page.getByRole("textbox", { name: /^Amount$/i }),
+  ]) ?? await editableAmountInput(page, 2500, selectedPanel);
   if (!input) {
     return { filled: false, warning: "No editable amount input was found; refused to fill radio/checkbox controls." };
   }
@@ -5298,7 +5593,8 @@ async function fillLikelyAmount(page: Page, amount?: number, selectedName?: stri
     return { filled: false, warning: `Refused to fill non-text ingredient amount input: ${elementType}.` };
   }
   await input.fill(amountText);
-  await page.keyboard.press("Tab").catch(() => undefined);
+  await input.press("Tab").catch(() => page.keyboard.press("Tab").catch(() => undefined));
+  await page.waitForTimeout(120);
   const actualValue = await input.inputValue().catch(() => "");
   if (!numericInputMatches(actualValue, amount)) {
     return {
@@ -6659,7 +6955,7 @@ function parseCustomItemListNames(rawText: string, sectionTitle: string) {
     lines.findIndex((line) => /^Sorted by/i.test(line)),
     lines.findIndex((line) => line === sectionTitle),
   );
-  const navAndAction = /^(menu|Dashboard|Diary|Trends|Foods|Custom Meals|Custom Recipes|Custom Foods|Repeat Items|Suggest Food|Ask the Oracle|Search Foods|More|Plans|Support|About|Account|campaign|CREATE FOOD|CREATE RECIPE|IMPORT RECIPE|BACK TO FOODS LIST|BACK TO RECIPE LIST|Create a new food|Create a new recipe|Sorted by)/i;
+  const navAndAction = /^(menu|Dashboard|Diary|Trends|Foods|Custom Meals|Custom Recipes|Custom Foods|Repeat Items|Suggest Food|Ask the Oracle|Search Foods|More|Plans|Support|About|Account|campaign|CREATE FOOD|CREATE RECIPE|IMPORT RECIPE|BACK TO FOODS LIST|BACK TO RECIPES? LIST|Create a new food|Create a new recipe|Sorted by)/i;
   return lines
     .slice(Math.max(0, startIndex + 1))
     .filter((line) => !navAndAction.test(line))
@@ -6798,16 +7094,34 @@ async function customRecipeDetailsForNames(page: Page, names: string[], maxDetai
     occurrences.set(normalized, occurrence + 1);
     await page.goto(`${CRONOMETER_ORIGIN}/#custom-recipes`);
     await page.waitForLoadState("domcontentloaded").catch(() => undefined);
-    await waitForCustomItemListText(page, "Custom Recipes", 12000).catch(() => "");
+    const listText = await waitForCustomItemListText(page, "Custom Recipes", 12000).catch(() => "");
+    if (!customItemTextIsReady(listText, "Custom Recipes")) continue;
     const clicked = await clickCustomListItemByName(page, name, occurrence);
     if (!clicked) continue;
-    await page.waitForTimeout(1000);
-    const detail = await extractCustomRecipeDetail(page);
-    details.push({ ...(detail ?? { name }), name: detail?.name ?? name, listIndex, occurrence });
+    const opened = await waitForVisibleText(page, (text) =>
+      textHasFoodName(text, name) && /\b(BACK TO RECIPES? LIST|Recipe #|Ingredients|ADD TO DIARY)\b/i.test(text),
+      6000,
+    ).then(() => true).catch(() => false);
+    const detail = opened ? await extractCustomRecipeDetailWithRetry(page, 3, 350) : undefined;
+    details.push({
+      ...(detail ?? { name, ingredientsStatus: "extraction_failed" as const }),
+      name: detail?.name ?? name,
+      listIndex,
+      occurrence,
+    });
   }
-  await page.goto(`${CRONOMETER_ORIGIN}/#custom-recipes`).catch(() => undefined);
-  await page.waitForTimeout(700).catch(() => undefined);
+  await waitForCustomItemListText(page, "Custom Recipes", 12000).catch(() => undefined);
   return details;
+}
+
+async function extractCustomRecipeDetailWithRetry(page: Page, attempts: number, delayMs: number) {
+  let last: CustomRecipeDetail | undefined;
+  for (let attempt = 0; attempt < Math.max(1, attempts); attempt += 1) {
+    last = await extractCustomRecipeDetail(page).catch(() => undefined);
+    if (last?.ingredientsStatus === "parsed" || last?.ingredientsStatus === "empty_confirmed") return last;
+    if (attempt < attempts - 1) await page.waitForTimeout(delayMs);
+  }
+  return last;
 }
 
 async function resolveCustomRecipeTargets(page: Page, selector: CustomRecipeSelectorInput, options: { maxDetails: number; timeoutMs?: number }) {
@@ -6830,6 +7144,42 @@ async function customRecipeExistsInList(page: Page, name: string, timeoutMs: num
   await page.waitForLoadState("domcontentloaded").catch(() => undefined);
   const rawText = await waitForCustomItemListText(page, "Custom Recipes", timeoutMs);
   return parseCustomItemListNames(rawText, "Custom Recipes").some((candidate) => candidate.toLowerCase() === name.toLowerCase());
+}
+
+async function ensureCustomRecipeListView(page: Page, timeoutMs: number) {
+  const visibleText = await waitForCustomItemListText(page, "Custom Recipes", timeoutMs).catch(() => "");
+  const ready = customItemTextIsReady(visibleText, "Custom Recipes");
+  return {
+    ready,
+    names: ready ? parseCustomItemListNames(visibleText, "Custom Recipes") : [],
+    hasCreateRecipe: /\bCREATE RECIPE\b/i.test(visibleText),
+    hasBackToRecipes: /\bBACK TO RECIPES? LIST\b/i.test(visibleText),
+    visibleText: compactText(visibleText, 3000),
+  };
+}
+
+async function clickUniqueCreateRecipeButton(page: Page) {
+  await dismissCronometerMarketingOverlays(page);
+  const candidates = await page.evaluate(() => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
+    const isVisible = (element: Element) => {
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
+    return Array.from(document.querySelectorAll("button,a,[role='button']"))
+      .filter(isVisible)
+      .filter((element) => normalize(element.textContent).replace(/^[^A-Za-z]+/, "").toUpperCase() === "CREATE RECIPE")
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+      });
+  }).catch(() => [] as Array<{ x: number; y: number; width: number; height: number }>);
+  if (candidates.length !== 1) return { clicked: false, candidateCount: candidates.length };
+  const [box] = candidates;
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await page.waitForTimeout(350);
+  return { clicked: true, candidateCount: 1 };
 }
 
 function exactOrFuzzyCustomItemNames(names: string[], query: string) {
@@ -6879,12 +7229,12 @@ async function openCustomRecipeTarget(page: Page, target: CustomRecipeDetail) {
   const clicked = await clickCustomListItemByName(page, target.name, target.occurrence ?? 0);
   if (!clicked) return false;
   const openedDetail = await waitForVisibleText(page, (text) =>
-    textHasFoodName(text, target.name) && /\b(BACK TO RECIPE LIST|Recipe #|Ingredients|ADD TO DIARY)\b/i.test(text),
+    textHasFoodName(text, target.name) && /\b(BACK TO RECIPES? LIST|Recipe #|Ingredients|ADD TO DIARY)\b/i.test(text),
     5000,
   ).then(() => true).catch(() => false);
   if (!openedDetail) return false;
   if (!target.recipeId) return true;
-  const detail = await extractCustomRecipeDetail(page);
+  const detail = await extractCustomRecipeDetailWithRetry(page, 3, 300);
   return detail?.recipeId === target.recipeId;
 }
 
@@ -6965,29 +7315,54 @@ async function clickCustomListItemByName(page: Page, name: string, occurrence: n
 
 async function waitForCustomItemListText(page: Page, sectionTitle: string, timeoutMs: number) {
   const hash = sectionTitle === "Custom Foods" ? "#custom-foods" : "#custom-recipes";
-  const backPattern = sectionTitle === "Custom Foods" ? /^BACK TO FOODS LIST$/i : /^BACK TO RECIPE LIST$/i;
-  const hasBackLink = (value: string) => sectionTitle === "Custom Foods" ? /BACK TO FOODS LIST/i.test(value) : /BACK TO RECIPE LIST/i.test(value);
-  let text = await waitForVisibleText(page, (value) => customItemTextIsReady(value, sectionTitle), Math.min(timeoutMs, 14000));
+  const backPattern = sectionTitle === "Custom Foods" ? /^BACK TO FOODS LIST$/i : /^BACK TO RECIPES? LIST$/i;
+  const hasBackLink = (value: string) => sectionTitle === "Custom Foods" ? /BACK TO FOODS LIST/i.test(value) : /BACK TO RECIPES? LIST/i.test(value);
+  const budget = Math.max(4000, Math.min(timeoutMs, 20000));
+  const bodyText = () => page.locator("body").innerText({ timeout: 2000 }).catch(() => "");
+  const waitForListOrDetail = (waitMs: number) => waitForVisibleText(
+    page,
+    (value) => customItemTextIsReady(value, sectionTitle) || hasBackLink(value),
+    waitMs,
+  ).catch(bodyText);
+  let text = await waitForListOrDetail(Math.min(2500, budget));
 
-  if (!/Sorted by/i.test(text) && hasBackLink(text)) {
+  if (!customItemTextIsReady(text, sectionTitle) && hasBackLink(text)) {
     await clickByText(page, backPattern).catch(() => false);
-    await page.waitForTimeout(900);
-    text = await waitForVisibleText(page, (value) => customItemTextIsReady(value, sectionTitle), Math.min(timeoutMs, 14000));
+    await page.waitForTimeout(250);
+    await discardUnsavedCustomItemPrompt(page);
+    text = await waitForVisibleText(page, (value) => customItemTextIsReady(value, sectionTitle), Math.min(5000, budget)).catch(bodyText);
   }
 
-  if (!/Sorted by/i.test(text)) {
-    await page.goto(`${CRONOMETER_ORIGIN}/${hash}`).catch(() => undefined);
+  if (!customItemTextIsReady(text, sectionTitle)) {
+    // A same-hash SPA navigation can leave Cronometer inside the recipe editor.
+    // A cache-busting query forces a real document navigation back to the list.
+    await page.goto(`${CRONOMETER_ORIGIN}/?cronogpt_list=${Date.now()}${hash}`).catch(() => undefined);
     await page.waitForLoadState("domcontentloaded").catch(() => undefined);
-    await page.waitForTimeout(900);
-    text = await waitForVisibleText(page, (value) => customItemTextIsReady(value, sectionTitle), Math.min(timeoutMs, 14000));
-    if (!/Sorted by/i.test(text) && hasBackLink(text)) {
+    await page.waitForTimeout(600);
+    text = await waitForListOrDetail(Math.min(7000, budget));
+    if (!customItemTextIsReady(text, sectionTitle) && hasBackLink(text)) {
       await clickByText(page, backPattern).catch(() => false);
-      await page.waitForTimeout(900);
-      text = await waitForVisibleText(page, (value) => customItemTextIsReady(value, sectionTitle), Math.min(timeoutMs, 14000));
+      await page.waitForTimeout(250);
+      await discardUnsavedCustomItemPrompt(page);
+      text = await waitForVisibleText(page, (value) => customItemTextIsReady(value, sectionTitle), Math.min(5000, budget)).catch(bodyText);
     }
   }
 
+  if (!customItemTextIsReady(text, sectionTitle)) {
+    throw new Error(`Cronometer did not reach the ${sectionTitle} list view within ${budget}ms.`);
+  }
   return text;
+}
+
+async function discardUnsavedCustomItemPrompt(page: Page) {
+  const dialog = page.locator(".gwt-DialogBox:visible, [role='dialog']:visible, .modal:visible, .popupContent:visible").last();
+  if (!(await dialog.isVisible().catch(() => false))) return false;
+  const text = await dialog.innerText().catch(() => "");
+  if (!/Save Changes\?/i.test(text)) return false;
+  const discard = dialog.getByRole("button", { name: /^(No|Discard|Don't Save)$/i });
+  const clicked = await clickFirstVisible(discard);
+  if (clicked) await page.waitForTimeout(500);
+  return clicked;
 }
 
 function customItemTextIsReady(text: string, sectionTitle: string) {
@@ -7065,13 +7440,56 @@ async function extractCustomFoodDetail(page: Page): Promise<CustomFoodDetail | u
   }).catch(() => undefined);
 }
 
-async function extractCustomRecipeDetail(page: Page): Promise<CustomRecipeDetail | undefined> {
-  return page.evaluate(() => {
-    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
-    const numberFromText = (value: string | null | undefined) => {
-      const match = normalize(value).match(/-?[0-9]+(?:\.[0-9]+)?/);
-      return match ? Number(match[0]) : undefined;
+export function parseCustomRecipeIngredientTables(tables: string[][][]) {
+  const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
+  const numberFromText = (value: string | null | undefined) => {
+    const match = normalize(value).match(/-?[0-9]+(?:\.[0-9]+)?/);
+    return match ? Number(match[0]) : undefined;
+  };
+  const headerMatches = (value: string, pattern: RegExp) => pattern.test(normalize(value));
+  let ingredientsTableFound = false;
+  let ingredients: CustomRecipeIngredientDetail[] = [];
+
+  for (const rows of tables) {
+    const headerIndex = rows.findIndex((row) =>
+      row.some((cell) => headerMatches(cell, /^Description\b/i))
+      && row.some((cell) => headerMatches(cell, /^(Database|Source)\b/i))
+      && row.some((cell) => headerMatches(cell, /^Amount\b/i)));
+    if (headerIndex < 0) continue;
+    ingredientsTableFound = true;
+    const header = rows[headerIndex] ?? [];
+    const columnIndex = (pattern: RegExp, fallback: number) => {
+      const index = header.findIndex((cell) => headerMatches(cell, pattern));
+      return index >= 0 ? index : fallback;
     };
+    const descriptionIndex = columnIndex(/^Description\b/i, 0);
+    const databaseIndex = columnIndex(/^(Database|Source)\b/i, 1);
+    const amountIndex = columnIndex(/^Amount\b/i, 2);
+    const unitIndex = columnIndex(/^Unit\b/i, 3);
+    const energyIndex = columnIndex(/^Energy\b/i, 4);
+    const weightIndex = columnIndex(/^Weight\b/i, 5);
+    const parsed = rows.slice(headerIndex + 1).flatMap((cells) => {
+      const name = normalize(cells[descriptionIndex]);
+      if (!name || /^Description$/i.test(name)) return [];
+      const databaseCell = normalize(cells[databaseIndex]);
+      return [{
+        name,
+        database: /^Custom$/i.test(databaseCell) ? "Custom Food" : databaseCell || undefined,
+        amount: numberFromText(cells[amountIndex]),
+        unit: normalize(cells[unitIndex]) || undefined,
+        energyKcal: numberFromText(cells[energyIndex]),
+        weight: normalize(cells[weightIndex]) || undefined,
+      } satisfies CustomRecipeIngredientDetail];
+    });
+    if (parsed.length > ingredients.length) ingredients = parsed;
+  }
+
+  return { ingredientsTableFound, ingredients };
+}
+
+async function extractCustomRecipeDetail(page: Page): Promise<CustomRecipeDetail | undefined> {
+  const snapshot = await page.evaluate(() => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
     const isVisible = (element: Element) => {
       const style = window.getComputedStyle(element);
       const rect = element.getBoundingClientRect();
@@ -7081,60 +7499,53 @@ async function extractCustomRecipeDetail(page: Page): Promise<CustomRecipeDetail
     const recipeId = bodyText.match(/Recipe\s+#(\d+)/i)?.[1];
     const nameInput = Array.from(document.querySelectorAll("input.text-box"))
       .find((element): element is HTMLInputElement => element instanceof HTMLInputElement && isVisible(element) && Boolean(normalize(element.value)));
-    const titleName = bodyText.match(/BACK TO RECIPE LIST\s+(.+?)\s+(?:ADD TO DIARY|more_horiz|Recipe #|Info)/i)?.[1];
+    const titleName = bodyText.match(/BACK TO RECIPES? LIST\s+(.+?)\s+(?:ADD TO DIARY|more_horiz|Recipe #|Info)/i)?.[1];
     const name = normalize(nameInput?.value || titleName || "");
-    if (!name) return undefined;
 
-    const editorInputs = Array.from(document.querySelectorAll("input.text-box, input.number-box"))
+    const editorValues = Array.from(document.querySelectorAll("input.text-box, input.number-box"))
       .filter((element): element is HTMLInputElement => element instanceof HTMLInputElement && isVisible(element))
       .filter((element) => !String(element.className ?? "").includes("search-field"))
       .filter((element) => !element.closest(".popupContent,.gwt-DialogBox,[role='dialog']"))
       .map((element) => ({ element, rect: element.getBoundingClientRect() }))
       .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x)
-      .map((candidate) => candidate.element);
-    const servingName = normalize(editorInputs[1]?.value) || undefined;
-    const servings = numberFromText(editorInputs[2]?.value);
-
-    const ingredients: Array<{
-      name: string;
-      database?: string;
-      amount?: number;
-      unit?: string;
-      energyKcal?: number;
-      weight?: string;
-    }> = [];
-    const tables = Array.from(document.querySelectorAll("table"));
-    for (const table of tables) {
-      const rows = Array.from(table.querySelectorAll("tr")).filter(isVisible);
-      const header = rows.find((row) => /Description/i.test(normalize(row.textContent)) && /\b(Database|Source)\b/i.test(normalize(row.textContent)) && /Amount/i.test(normalize(row.textContent)));
-      if (!header) continue;
-      for (const row of rows) {
-        if (row === header || row.classList.contains("table-header")) continue;
-        const cells = Array.from(row.querySelectorAll("td")).map((cell) => normalize(cell.textContent));
-        if (cells.length < 4) continue;
-        const ingredientName = cells[0];
-        if (!ingredientName || /^Description$/i.test(ingredientName)) continue;
-        ingredients.push({
-          name: ingredientName,
-          database: cells[1] || undefined,
-          amount: numberFromText(cells[2]),
-          unit: cells[3] || undefined,
-          energyKcal: numberFromText(cells[4]),
-          weight: cells[5] || undefined,
-        });
-      }
-      if (ingredients.length) break;
-    }
-
-    return {
-      recipeId,
-      name,
-      servingName,
-      servings,
-      ingredients,
-      rawText: bodyText.slice(0, 8000),
-    };
+      .map((candidate) => candidate.element.value);
+    const tables = Array.from(document.querySelectorAll("table"))
+      .map((table) => Array.from(table.querySelectorAll("tr"))
+        .filter(isVisible)
+        .map((row) => Array.from(row.querySelectorAll("td,th")).map((cell) => {
+          const input = cell.querySelector("input");
+          const inputValue = input instanceof HTMLInputElement ? input.value : "";
+          return normalize(cell.textContent) || normalize(inputValue);
+        })))
+      .filter((rows) => rows.length > 0);
+    const ingredientsSectionVisible = /\bIngredients\b/i.test(bodyText) && /\badd ingredients\b/i.test(bodyText);
+    return { bodyText, recipeId, name, editorValues, tables, ingredientsSectionVisible };
   }).catch(() => undefined);
+  if (!snapshot?.name) return undefined;
+
+  const numberFromText = (value: string | null | undefined) => {
+    const match = (value ?? "").replace(/\s+/g, " ").trim().match(/-?[0-9]+(?:\.[0-9]+)?/);
+    return match ? Number(match[0]) : undefined;
+  };
+  const parsedIngredients = parseCustomRecipeIngredientTables(snapshot.tables);
+  const cookedWeightMatch = snapshot.bodyText.match(/(?:Cooked|Final|Total|Recipe)\s+Weight\s*:?[ ]*([0-9]+(?:\.[0-9]+)?)\s*(g|kg|oz|lb)?/i);
+  const ingredientsStatus = parsedIngredients.ingredients.length > 0
+    ? "parsed" as const
+    : parsedIngredients.ingredientsTableFound
+      ? "empty_confirmed" as const
+      : "extraction_failed" as const;
+
+  return {
+    recipeId: snapshot.recipeId,
+    name: snapshot.name,
+    servingName: snapshot.editorValues[1]?.replace(/\s+/g, " ").trim() || undefined,
+    servings: numberFromText(snapshot.editorValues[2]),
+    cookedWeight: cookedWeightMatch ? Number(cookedWeightMatch[1]) : undefined,
+    cookedWeightUnit: cookedWeightMatch?.[2],
+    ingredientsStatus,
+    ingredients: parsedIngredients.ingredients,
+    rawText: snapshot.bodyText.slice(0, 8000),
+  };
 }
 
 function recipeServingsVerified(detail: CustomRecipeDetail | undefined, input: RecipeInput) {
@@ -7149,15 +7560,68 @@ function recipeIngredientsVerified(
 ) {
   const expected = addedIngredients
     .filter((item) => item.status === "ok")
-    .map((item) => item.selectedCandidate?.name)
-    .filter((name): name is string => Boolean(name));
+    .map((item) => ({
+      name: item.selectedCandidate?.name,
+      source: item.selectedCandidate?.source,
+      amount: (item.ingredient as RecipeInput["ingredients"][number] | undefined)?.amount,
+      unit: (item.ingredient as RecipeInput["ingredients"][number] | undefined)?.unit,
+    }))
+    .filter((item): item is { name: string; source: string | undefined; amount: number | undefined; unit: string | undefined } => Boolean(item.name));
+  if (detail?.ingredientsStatus === "extraction_failed") return false;
   if (expected.length === 0) return true;
-  const actual = detail?.ingredients?.map((ingredient) => normalizeFoodName(ingredient.name)) ?? [];
-  if (actual.length < expected.length) return false;
-  return expected.every((name) => {
-    const normalized = normalizeFoodName(name);
-    return actual.some((candidate) => candidate === normalized || candidate.includes(normalized) || normalized.includes(candidate));
+  if ((detail?.ingredients?.length ?? 0) < expected.length) return false;
+  return expected.every((item) => {
+    const normalized = normalizeFoodName(item.name);
+    return (detail?.ingredients ?? []).some((candidate) =>
+      normalizeFoodName(candidate.name) === normalized
+      && recipeIngredientSourceMatches(candidate.database, item.source)
+      && recipeIngredientAmountMatches(candidate.amount, candidate.unit, item.amount, item.unit, candidate.weight));
   });
+}
+
+function recipeIngredientSourceMatches(actual?: string, expected?: string) {
+  if (!expected) return true;
+  const normalize = (value: string) => value.replace(/\s+/g, " ").trim().toLowerCase().replace(/^custom$/, "custom food");
+  return Boolean(actual && normalize(actual) === normalize(expected));
+}
+
+export function recipeIngredientAmountMatches(
+  actualAmount?: number,
+  actualUnit?: string,
+  expectedAmount?: number,
+  expectedUnit?: string,
+  actualWeight?: string,
+) {
+  if (expectedAmount === undefined) return true;
+  if (actualAmount === undefined) return false;
+  const expectedNormalizedUnit = expectedUnit?.replace(/\s+/g, " ").trim().toLowerCase();
+  const actualNormalizedUnit = actualUnit?.replace(/\s+/g, " ").trim().toLowerCase();
+  if (expectedNormalizedUnit === "g" && actualWeight) {
+    const weightMatch = actualWeight.replace(/\s+/g, " ").trim().toLowerCase().match(/(-?[0-9]+(?:\.[0-9]+)?)\s*(kg|g|oz|lb)\b/);
+    if (weightMatch) {
+      const weightAmount = Number(weightMatch[1]);
+      const gramsPerUnit = weightMatch[2] === "kg" ? 1000
+        : weightMatch[2] === "oz" ? 28.349523125
+          : weightMatch[2] === "lb" ? 453.59237
+            : 1;
+      const weightInGrams = weightAmount * gramsPerUnit;
+      if (Number.isFinite(weightInGrams)
+        && Math.abs(weightInGrams - expectedAmount) <= Math.max(0.0001, Math.abs(expectedAmount) * 0.00001)) return true;
+    }
+  }
+  const actualInExpectedUnit = expectedNormalizedUnit === "g"
+    ? actualAmount * (gramsPerServingUnit(actualNormalizedUnit ?? "") ?? (actualNormalizedUnit === "g" ? 1 : Number.NaN))
+    : actualAmount;
+  if (!Number.isFinite(actualInExpectedUnit)) return false;
+  if (expectedNormalizedUnit && expectedNormalizedUnit !== "g" && actualNormalizedUnit !== expectedNormalizedUnit) return false;
+  // Cronometer stores converted serving counts to four decimal places. A
+  // 65 g serving can therefore differ from the requested gram weight by up
+  // to a few thousandths of a gram after UI rounding (for example 56 g is
+  // stored as 0.8615 servings = 55.9975 g).
+  const tolerance = expectedNormalizedUnit === "g"
+    ? Math.max(0.01, Math.abs(expectedAmount) * 0.00001)
+    : Math.max(0.0001, Math.abs(expectedAmount) * 0.00001);
+  return Math.abs(actualInExpectedUnit - expectedAmount) <= tolerance;
 }
 
 async function retireOpenCustomFood(page: Page, target: CustomFoodDetail, retiredName: string) {
@@ -7178,26 +7642,6 @@ async function retireOpenCustomFood(page: Page, target: CustomFoodDetail, retire
     saveClicked: saved,
     saved: Boolean(saved && nameFilled && nameVerified),
     nameVerified,
-    finalDetail,
-    visibleText: compactText(await page.locator("body").innerText().catch(() => ""), 8000),
-  };
-}
-
-async function retireOpenCustomRecipe(page: Page, target: CustomRecipeDetail, retiredName: string) {
-  const basics = await fillRecipeBasics(page, { name: retiredName, ingredients: [] });
-  markPageWriteAttempted(page);
-  const saveClicked = await clickByText(page, /^SAVE CHANGES$/i) || await clickByText(page, /^SAVE$/i);
-  await page.waitForTimeout(1000);
-  const finalDetail = await extractCustomRecipeDetail(page).catch(() => undefined);
-  const nameVerified = normalizeCustomFoodName(finalDetail?.name ?? "") === normalizeCustomFoodName(retiredName);
-  const saved = basics.nameFilled && Boolean(saveClicked) && nameVerified;
-  return {
-    target,
-    retiredName,
-    basics,
-    saveClicked,
-    nameVerified,
-    saved,
     finalDetail,
     visibleText: compactText(await page.locator("body").innerText().catch(() => ""), 8000),
   };
@@ -7539,15 +7983,28 @@ async function addRecipeIngredient(page: Page, ingredient: RecipeInput["ingredie
 
   options.trace?.("ingredient_confirm_add_start");
   const added = await clickDialogButton(page, /^(ADD|ADD INGREDIENT|ADD TO RECIPE|ADD SERVING|SAVE|DONE|OK)$/i);
-  const addVerified = added ? await waitForRecipeIngredientAdded(page, selectedCandidate.name, 3500) : false;
+  const addVerified = added ? await waitForRecipeIngredientAdded(
+    page,
+    selectedCandidate.name,
+    3500,
+    ingredient.amount,
+    ingredient.unit,
+    selectedSource,
+  ) : false;
   options.trace?.("ingredient_confirm_add_done", { added, addVerified });
-  if (!added) return {
-    status: "add_button_not_found",
-    warning: "Could not find the ingredient add/save button after selecting amount.",
+  const verificationCandidates = added && !addVerified
+    ? await readVisibleRecipeIngredientRows(page, selectedCandidate.name).catch(() => [])
+    : undefined;
+  if (!added || !addVerified) return {
+    status: !added ? "add_button_not_found" : "added_ingredient_not_verified",
+    warning: !added
+      ? "Could not find the ingredient add/save button after selecting amount."
+      : "Cronometer added the ingredient, but its exact source, amount, and unit did not read back as requested. Save was not clicked.",
     selectedCandidate,
     amount,
     unit,
     convertedAmount,
+    verificationCandidates,
     editorDebug: await recipeIngredientEditorDebug(page),
   };
 
@@ -7750,7 +8207,14 @@ async function waitForRecipeIngredientEditor(page: Page, timeoutMs: number, sele
   return false;
 }
 
-async function waitForRecipeIngredientAdded(page: Page, selectedName: string, timeoutMs: number) {
+async function waitForRecipeIngredientAdded(
+  page: Page,
+  selectedName: string,
+  timeoutMs: number,
+  expectedAmount?: number,
+  expectedUnit?: string,
+  expectedSource?: string,
+) {
   const deadline = Date.now() + timeoutMs;
   const target = normalizeFoodName(selectedName);
   while (Date.now() < deadline) {
@@ -7758,10 +8222,55 @@ async function waitForRecipeIngredientAdded(page: Page, selectedName: string, ti
     const bodyText = await page.locator("body").innerText({ timeout: 800 }).catch(() => "");
     const dialogStillSearching = /\bDescription\s+Source\b/i.test(dialogText);
     const visibleInRecipe = normalizeFoodName(bodyText).includes(target);
-    if (!dialogStillSearching && visibleInRecipe) return true;
+    if (!dialogStillSearching && visibleInRecipe) {
+      // Verify against every visible ingredient row. Cronometer can retain a
+      // previous search-results table in the DOM ahead of the recipe table,
+      // which makes a single-table detail extraction reject a correct row.
+      const visibleIngredients = await readVisibleRecipeIngredientRows(page, selectedName).catch(() => []);
+      const exactIngredient = visibleIngredients.find((ingredient) =>
+        normalizeFoodName(ingredient.name) === target
+        && recipeIngredientSourceMatches(ingredient.database, expectedSource)
+        && recipeIngredientAmountMatches(ingredient.amount, ingredient.unit, expectedAmount, expectedUnit, ingredient.weight));
+      if (exactIngredient || (expectedAmount === undefined && expectedUnit === undefined && expectedSource === undefined)) return true;
+    }
     await page.waitForTimeout(150);
   }
   return false;
+}
+
+async function readVisibleRecipeIngredientRows(page: Page, selectedName?: string) {
+  return page.evaluate((selectedName) => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
+    const normalizeName = (value: string | null | undefined) => normalize(value).toLowerCase();
+    const target = normalizeName(selectedName);
+    const numberFromText = (value: string | null | undefined) => {
+      const match = normalize(value).match(/-?[0-9]+(?:\.[0-9]+)?/);
+      return match ? Number(match[0]) : undefined;
+    };
+    const isVisible = (element: Element) => {
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
+
+    return Array.from(document.querySelectorAll("tr"))
+      .filter(isVisible)
+      .map((row) => Array.from(row.querySelectorAll("td,th")).map((cell) => {
+        const input = cell.querySelector("input");
+        const inputValue = input instanceof HTMLInputElement ? input.value : "";
+        return normalize(cell.textContent) || normalize(inputValue);
+      }))
+      .filter((cells) => cells.length >= 4)
+      .filter((cells) => !target || normalizeName(cells[0]) === target)
+      .map((cells) => ({
+        name: cells[0],
+        database: /^Custom$/i.test(cells[1] ?? "") ? "Custom Food" : cells[1] || undefined,
+        amount: numberFromText(cells[2]),
+        unit: cells[3] || undefined,
+        energyKcal: numberFromText(cells[4]),
+        weight: cells[5] || undefined,
+      }));
+  }, selectedName);
 }
 
 async function recipeIngredientSelectedPanel(page: Page, selectedName?: string) {
@@ -7827,14 +8336,20 @@ async function convertGramAmountForCurrentServingUnit(page: Page, amount?: numbe
   if (!gramsPerServing) return { converted: false, unitText, warning: "Current serving unit does not expose a gram weight for conversion." };
   const convertedAmount = Number((amount / gramsPerServing).toFixed(6));
   const filled = await fillLikelyAmount(page, convertedAmount, selectedName);
+  const roundedActualValue = Number((filled as { actualValue?: string } | undefined)?.actualValue);
+  const acceptedUiRounding = Number.isFinite(roundedActualValue)
+    && recipeIngredientAmountMatches(roundedActualValue, unitText, amount, "g");
+  const amountResult = acceptedUiRounding && filled?.filled !== true
+    ? { ...filled, filled: true, acceptedUiRounding: true }
+    : filled;
   return {
-    converted: filled?.filled === true,
+    converted: filled?.filled === true || acceptedUiRounding,
     originalAmount: amount,
     originalUnit: unit,
     convertedAmount,
     currentUnitText: unitText,
     gramsPerServing,
-    amount: filled,
+    amount: amountResult,
   };
 }
 
@@ -8275,7 +8790,7 @@ function isProbeTimeoutError(message: string) {
 function isLoggedInText(text: string) {
   if (/\bWelcome Back\b|\bLog In\b|\bSign Up\b|Too Many Attempts|captcha|robot|verify|Science-backed nutrition tracking|Sign Up For Free/i.test(text)) return false;
   return (/\bDashboard\b/i.test(text) && /\b(Diary|Trends|Foods)\b/i.test(text))
-    || /\bCustom Recipes\b/i.test(text) && /\b(CREATE RECIPE|IMPORT RECIPE|Sorted by|BACK TO RECIPE LIST)\b/i.test(text)
+    || /\bCustom Recipes\b/i.test(text) && /\b(CREATE RECIPE|IMPORT RECIPE|Sorted by|BACK TO RECIPES? LIST)\b/i.test(text)
     || /\bCustom Foods\b/i.test(text) && /\b(CREATE FOOD|Sorted by|BACK TO FOODS LIST)\b/i.test(text)
     || /\bEnergy Summary\b/i.test(text) && /\b(Nutrient Targets|Diary)\b/i.test(text);
 }

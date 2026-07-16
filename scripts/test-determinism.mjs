@@ -4,7 +4,7 @@ import { stableJson } from "../dist/determinism.js";
 import { createProviderFromEnv } from "../dist/providers/index.js";
 import { MockCronometerProvider } from "../dist/providers/mock.js";
 import { TerraCronometerProvider } from "../dist/providers/terra.js";
-import { customFoodNutrientEntries, rankFoodResults, retiredItemName } from "../dist/providers/browser.js";
+import { customFoodNutrientEntries, isNativeRetirementSuccessMessage, rankFoodResults, retiredItemName } from "../dist/providers/browser.js";
 import { normalizeDateRange } from "../dist/date-range.js";
 import { validateRuntimeConfiguration } from "../dist/runtime-config.js";
 
@@ -21,6 +21,8 @@ assert.equal((await mock.getDailySummary({})).data.date, "2026-01-02");
 assert.equal((await mock.getDailySummary({ date: "2024-03-04" })).data.date, "2024-03-04");
 assert.equal((await mock.createAndLogCustomFood({ name: "Mock food", meal: "Lunch" })).feature, "create_and_log_custom_food");
 assert.equal(retiredItemName("Protein Cookie", "42", "Asia/Jerusalem", fixedInstant), "Retired - Protein Cookie #42 - 2026-01-02");
+assert.equal(isNativeRetirementSuccessMessage("Message\nSuccessfully retired Banana cream\nOK"), true);
+assert.equal(isNativeRetirementSuccessMessage("Retire this recipe?"), false);
 assert.deepEqual(normalizeDateRange(
   { startDate: "yesterday", endDate: "today" },
   "Asia/Jerusalem",

@@ -288,7 +288,7 @@ export const FEATURE_DEFINITIONS: FeatureDefinition[] = [
     title: "Retire custom recipe",
     preferredBackend: "browser",
     supportedModes: ["mock"],
-    notes: "Safer cleanup path that renames an exact custom recipe instead of deleting it.",
+    notes: "Uses Cronometer's native Retire action for an exact used custom recipe, preserving diary history without renaming it.",
   },
   {
     id: "get_targets",
@@ -524,7 +524,7 @@ const BROWSER_FEATURE_STATUS: Record<string, ProviderStatus> = {
   list_custom_recipes: "ok",
   create_recipe: "needs_manual_step",
   delete_custom_recipe: "needs_manual_step",
-  update_custom_recipe: "needs_manual_step",
+  update_custom_recipe: "ok",
   retire_custom_recipe: "needs_manual_step",
   get_targets: "needs_manual_step",
   get_profile: "ok",

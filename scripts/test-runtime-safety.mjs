@@ -12,6 +12,7 @@ import {
   __setActiveBrowserJobForTests,
   releaseAndSnapshotBrowserQueue,
 } from "../dist/providers/browser.js";
+import { MockCronometerProvider } from "../dist/providers/mock.js";
 import { createCronoServer, MCP_SERVER_VERSION, STABLE_MODEL_VISIBLE_TOOLS } from "../dist/mcp.js";
 import { capabilitiesForMode } from "../dist/features.js";
 import { toMcpToolResponse } from "../dist/tool-response.js";
@@ -19,10 +20,15 @@ import { runCooldownCommand } from "./cronometer-login-cooldown.mjs";
 
 const tempDir = mkdtempSync(join(tmpdir(), "cronogpt-runtime-safety-"));
 const cooldownFile = join(tempDir, "cooldown.json");
+const operationJournalFile = join(tempDir, "operations.json");
 const fixedNow = Date.parse("2200-05-18T03:33:20.000Z");
 
 try {
   const packageVersion = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+  const browserSource = readFileSync(new URL("../src/providers/browser.ts", import.meta.url), "utf8");
+  assert.match(browserSource, /element\.getAttribute\("placeholder"\)/, "account verification must inspect Cronometer's email placeholder");
+  assert.match(browserSource, /getByRole\("textbox", \{ name: \/\^Amount\$\/i \}\)/, "recipe ingredients must target Cronometer's labeled Amount field");
+  assert.match(browserSource, /added_ingredient_not_verified/, "recipe creation must refuse Save when an amount does not read back");
   assert.equal(MCP_SERVER_VERSION, packageVersion, "MCP server identity must change whenever the app package version changes");
 
   let status = runCooldown(["status"]);
@@ -57,6 +63,9 @@ try {
     "find_private_recipe",
     "resolve_recipe_ingredients",
     "ensure_private_recipe",
+    "create_recipe",
+    "update_custom_recipe",
+    "delete_custom_recipe",
   ]) {
     assert.ok(STABLE_MODEL_VISIBLE_TOOLS.includes(toolName), `${toolName} should be ChatGPT-visible by default`);
   }
@@ -64,6 +73,7 @@ try {
   const browserCapabilities = new Map(capabilitiesForMode("browser").map((capability) => [capability.id, capability.currentBackendStatus]));
   assert.equal(browserCapabilities.get("create_and_log_custom_food"), "ok");
   assert.equal(browserCapabilities.get("delete_diary_food_entry"), "ok");
+  assert.equal(browserCapabilities.get("update_custom_recipe"), "ok");
   assert.equal(browserCapabilities.get("get_targets"), "needs_manual_step");
 
   const scopedServer = createCronoServer({ grantedScopes: ["cronometer:read"] });
@@ -82,11 +92,23 @@ try {
   assert.ok(ensureRecipeTool?.inputSchema?.required?.includes("name"));
   assert.ok(ensureRecipeTool?.inputSchema?.required?.includes("ingredients"));
   assert.match(ensureRecipeTool?.description ?? "", /preferred recipe-writing workflow/i);
+  assert.match(ensureRecipeTool?.description ?? "", /semantic match/i);
+  const updateRecipeTool = listedTools.tools.find((tool) => tool.name === "update_custom_recipe");
+  assert.deepEqual(updateRecipeTool?._meta?.ui?.visibility, ["model"]);
   const resolveRecipeTool = listedTools.tools.find((tool) => tool.name === "resolve_recipe_ingredients");
   assert.match(resolveRecipeTool?.description ?? "", /ensure_private_recipe/);
-  assert.doesNotMatch(resolveRecipeTool?.description ?? "", /\bcreate_recipe\b/);
-  const appOnlyCreateRecipeTool = listedTools.tools.find((tool) => tool.name === "create_recipe");
-  assert.deepEqual(appOnlyCreateRecipeTool?._meta?.ui?.visibility, ["app"]);
+  const directCreateRecipeTool = listedTools.tools.find((tool) => tool.name === "create_recipe");
+  assert.deepEqual(directCreateRecipeTool?._meta?.ui?.visibility, ["model"]);
+  assert.match(directCreateRecipeTool?.description ?? "", /only after find_private_recipe has confirmed/i);
+  const deleteRecipeTool = listedTools.tools.find((tool) => tool.name === "delete_custom_recipe");
+  assert.deepEqual(deleteRecipeTool?._meta?.ui?.visibility, ["model"]);
+  assert.equal(deleteRecipeTool?.annotations?.destructiveHint, true);
+  assert.match(deleteRecipeTool?.description ?? "", /default behavior is to click Cronometer's native Retire action/i);
+  assert.match(deleteRecipeTool?.description ?? "", /native Retire action/i);
+  assert.match(deleteRecipeTool?.inputSchema?.properties?.ifUsed?.description ?? "", /defaults to retire/i);
+  const retireRecipeTool = listedTools.tools.find((tool) => tool.name === "retire_custom_recipe");
+  assert.match(retireRecipeTool?.description ?? "", /native Retire action/i);
+  assert.equal(retireRecipeTool?.inputSchema?.properties?.retiredName, undefined);
   const preferredCustomFoodTool = listedTools.tools.find((tool) => tool.name === "create_and_log_custom_food");
   assert.ok(preferredCustomFoodTool);
   assert.match(preferredCustomFoodTool.description ?? "", /preferred one-call workflow/i);
@@ -98,6 +120,13 @@ try {
   assert.ok(logFoodTool?.inputSchema?.required?.includes("meal"));
   assert.deepEqual(logFoodTool?.inputSchema?.properties?.meal?.enum, ["Breakfast", "Lunch", "Dinner", "Snacks", "Supplements"]);
   assert.deepEqual(logFoodTool?.inputSchema?.properties?.matchPolicy?.enum, ["high_confidence", "selected_only"]);
+  assert.ok(logFoodTool?.inputSchema?.properties?.portion, "log_food must expose explicit whole-package portion semantics");
+  const logFoodsTool = listedTools.tools.find((tool) => tool.name === "log_foods");
+  assert.ok(logFoodsTool?.inputSchema?.properties?.items?.items?.properties?.portion, "log_foods items must expose whole-package portions");
+  const operationTool = listedTools.tools.find((tool) => tool.name === "get_cronometer_operation");
+  assert.ok(operationTool?.inputSchema?.required?.includes("operationId"));
+  const deleteDiaryTool = listedTools.tools.find((tool) => tool.name === "delete_diary_food_entry");
+  assert.ok(deleteDiaryTool?.inputSchema?.properties?.deleteCount);
   const createCustomFoodTool = listedTools.tools.find((tool) => tool.name === "create_custom_food");
   assert.ok(createCustomFoodTool?.inputSchema?.required?.includes("servingSize"));
   assert.ok(createCustomFoodTool?.inputSchema?.required?.includes("nutrients"));
@@ -148,6 +177,147 @@ try {
   await recipePreviewClient.close();
   await recipePreviewServer.close();
 
+  class RecipeWorkflowProvider extends MockCronometerProvider {
+    constructor(recipes) {
+      super();
+      this.recipes = recipes;
+      this.created = [];
+      this.updated = [];
+    }
+
+    async listCustomRecipes(input) {
+      const names = this.recipes.map((recipe) => recipe.name);
+      return {
+        provider: "recipe-workflow-test",
+        mode: "mock",
+        feature: "list_custom_recipes",
+        status: "ok",
+        data: { query: input.query, count: names.length, names, recipes: this.recipes, duplicateGroups: [] },
+      };
+    }
+
+    async createRecipe(input) {
+      this.created.push(input);
+      return { provider: "recipe-workflow-test", mode: "mock", feature: "create_recipe", status: "ok", data: { recipe: input } };
+    }
+
+    async updateCustomRecipe(input) {
+      this.updated.push(input);
+      return { provider: "recipe-workflow-test", mode: "mock", feature: "update_custom_recipe", status: "ok", data: { update: input } };
+    }
+  }
+
+  const runEnsureRecipe = async (recipeProvider, arguments_) => {
+    const server = createCronoServer({
+      grantedScopes: ["cronometer:read", "cronometer:write"],
+      provider: recipeProvider,
+    });
+    const client = new Client({ name: "cronogpt-recipe-ensure-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    try {
+      return await client.callTool({ name: "ensure_private_recipe", arguments: arguments_ });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  };
+
+  const targetRecipe = {
+    name: "Reese's Protein Ice Cream Base",
+    servings: 2,
+    servingName: "Ninja Creami pint",
+    ingredients: [
+      { query: "Milk", selectedName: "Milk, 1% Fat, Lowfat", selectedSource: "NCCDB", amount: 600, unit: "g" },
+      { query: "PB2", selectedName: "PB2, Powdered Peanut Butter, Original", selectedSource: "CRDB", amount: 26, unit: "g" },
+    ],
+    confirmed: true,
+    dryRun: false,
+  };
+  const identicalProvider = new RecipeWorkflowProvider([{
+    recipeId: "same-1",
+    name: targetRecipe.name,
+    servings: 2,
+    servingName: "Ninja Creami pint",
+    ingredientsStatus: "parsed",
+    ingredients: [
+      { name: "Milk, 1% Fat, Lowfat", database: "NCCDB", amount: 600, unit: "grams" },
+      { name: "PB2, Powdered Peanut Butter, Original", database: "CRDB", amount: 26, unit: "g" },
+    ],
+  }]);
+  const identicalRecipe = await runEnsureRecipe(identicalProvider, targetRecipe);
+  assert.equal(identicalRecipe.structuredContent?.status, "already_exists");
+  assert.equal(identicalRecipe.structuredContent?.data?.stage, "verified_existing");
+  assert.equal(identicalProvider.created.length, 0);
+  assert.equal(identicalProvider.updated.length, 0);
+
+  const partialProvider = new RecipeWorkflowProvider([{
+    recipeId: "partial-1",
+    name: targetRecipe.name,
+    servings: 2,
+    servingName: "Ninja Creami pint",
+    ingredientsStatus: "parsed",
+    ingredients: [{ name: "Milk, 1% Fat, Lowfat", database: "NCCDB", amount: 600, unit: "g" }],
+  }]);
+  const repairedRecipe = await runEnsureRecipe(partialProvider, targetRecipe);
+  assert.equal(repairedRecipe.structuredContent?.status, "ok");
+  assert.equal(repairedRecipe.structuredContent?.data?.stage, "repair");
+  assert.equal(partialProvider.created.length, 0);
+  assert.equal(partialProvider.updated.length, 1);
+  assert.deepEqual(partialProvider.updated[0].ingredientsToAdd, [targetRecipe.ingredients[1]]);
+  assert.equal(partialProvider.updated[0].recipeId, "partial-1");
+
+  const emptyProvider = new RecipeWorkflowProvider([{
+    recipeId: "empty-1",
+    name: targetRecipe.name,
+    servings: 1,
+    servingName: "Serving",
+    ingredientsStatus: "empty_confirmed",
+    ingredients: [],
+  }]);
+  const repairedEmptyRecipe = await runEnsureRecipe(emptyProvider, targetRecipe);
+  assert.equal(repairedEmptyRecipe.structuredContent?.status, "ok");
+  assert.equal(emptyProvider.updated.length, 1);
+  assert.equal(emptyProvider.updated[0].servings, 2);
+  assert.equal(emptyProvider.updated[0].servingName, "Ninja Creami pint");
+  assert.deepEqual(emptyProvider.updated[0].ingredientsToAdd, targetRecipe.ingredients);
+
+  const extractionFailureProvider = new RecipeWorkflowProvider([{
+    recipeId: "unparsed-1",
+    name: targetRecipe.name,
+    servings: 2,
+    servingName: "Ninja Creami pint",
+    ingredientsStatus: "extraction_failed",
+  }]);
+  const extractionFailure = await runEnsureRecipe(extractionFailureProvider, targetRecipe);
+  assert.equal(extractionFailure.structuredContent?.status, "needs_manual_step");
+  assert.equal(extractionFailure.structuredContent?.data?.conflict, "ingredient_extraction_failed");
+  assert.equal(extractionFailureProvider.updated.length, 0);
+
+  const changedProvider = new RecipeWorkflowProvider([{
+    recipeId: "changed-1",
+    name: targetRecipe.name,
+    servings: 2,
+    servingName: "Ninja Creami pint",
+    ingredientsStatus: "parsed",
+    ingredients: [
+      { name: "Milk, 1% Fat, Lowfat", database: "NCCDB", amount: 500, unit: "g" },
+      { name: "PB2, Powdered Peanut Butter, Original", database: "CRDB", amount: 26, unit: "g" },
+    ],
+  }]);
+  const changedRecipe = await runEnsureRecipe(changedProvider, targetRecipe);
+  assert.equal(changedRecipe.structuredContent?.status, "needs_manual_step");
+  assert.equal(changedRecipe.structuredContent?.data?.conflict, "semantic_mismatch");
+  assert.equal(changedProvider.updated.length, 0);
+
+  const newProvider = new RecipeWorkflowProvider([]);
+  const createdRecipe = await runEnsureRecipe(newProvider, targetRecipe);
+  assert.equal(createdRecipe.structuredContent?.status, "ok");
+  assert.equal(createdRecipe.structuredContent?.data?.stage, "create");
+  assert.equal(newProvider.created.length, 1);
+  assert.equal(newProvider.updated.length, 0);
+
   const provider = new BrowserCronometerProvider({
     email: "test@example.com",
     password: "secret",
@@ -158,6 +328,7 @@ try {
     navigationTimeoutMs: 1000,
     loginBackoffMs: 900000,
     loginBackoffFile: cooldownFile,
+    operationJournalFile,
     operationTimeoutMs: 1000,
     browserRetryCount: 0,
     timeZone: "Asia/Jerusalem",
@@ -254,6 +425,9 @@ try {
   assert.equal(acceptedResponse.structuredContent.ok, false);
   assert.equal(acceptedResponse.structuredContent.completed, false);
   assert.equal(acceptedResponse.structuredContent.intentSatisfied, false);
+  assert.equal(acceptedResponse.structuredContent.state, "running");
+  assert.equal(acceptedResponse.structuredContent.retryable, false);
+  assert.equal(acceptedResponse.structuredContent.nextAction, "poll");
 
   const dryRunResponse = toMcpToolResponse({
     provider: "mock",

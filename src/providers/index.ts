@@ -61,6 +61,7 @@ export function createProviderFromEnv(source: Environment = process.env): Cronom
       navigationTimeoutMs: numberEnv(source, "CRONOMETER_NAVIGATION_TIMEOUT_MS", 20000, 1),
       loginBackoffMs: numberEnv(source, "CRONOMETER_LOGIN_BACKOFF_MS", 15 * 60 * 1000, 1),
       loginBackoffFile: env(source, "CRONOMETER_LOGIN_BACKOFF_FILE") ?? ".cronometer-login-backoff.json",
+      operationJournalFile: env(source, "CRONOMETER_OPERATION_JOURNAL_FILE") ?? ".cronometer-operation-journal.json",
       operationTimeoutMs: numberEnv(source, "CRONOMETER_OPERATION_TIMEOUT_MS", 600000, 1),
       browserRetryCount: numberEnv(source, "CRONOMETER_BROWSER_RETRY_COUNT", 1, 0),
       timeZone,
