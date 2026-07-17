@@ -1,6 +1,6 @@
 {
   "name": "cronogpt",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "private": true,
   "type": "module",
   "engines": {
@@ -23,6 +23,7 @@
     "smoke:production": "node scripts/smoke-production.mjs",
     "smoke:oracle": "ORACLE_DOMAIN=cronogpt.129-159-156-186.sslip.io node scripts/smoke-production.mjs",
     "smoke:live-custom-food": "npm run build && node scripts/smoke-live-custom-food.mjs",
+    "mcp:call": "node scripts/call-mcp-tool.mjs",
     "oracle:deploy": "bash scripts/oracle/deploy.sh",
     "oracle:wipe-local-env": "bash scripts/oracle/wipe-local-env-preserve-cronometer.sh",
     "inspect": "mcp-inspector --server-url http://localhost:${PORT:-8787}/mcp --transport http"

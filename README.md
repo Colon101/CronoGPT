@@ -110,9 +110,13 @@ Browser-backed tools are serialized inside the hosted process to reduce Chromium
 
 For multi-ingredient meals, use `log_foods` instead of several separate `log_food` calls. It accepts an `items` array, derives one batch idempotency key, logs the foods sequentially in one browser job, verifies each item by proving the exact matching-row count increased by one, and returns a per-item status table. By default it waits briefly for the batch to finish; if Cronometer is slow, call `get_cronometer_operation` with the returned operation ID. An `accepted` result means the write is in progress, not failed—never submit the same batch again as a polling mechanism.
 
+For one bounded intent spanning several dates or meal sections, use `log_food_plan`. Every item carries its own explicit date and meal. CronoGPT groups the plan into deterministic `log_foods` transactions, derives stable group/item idempotency keys, and stops before later groups after any accepted, ambiguous, or failed result. The response identifies untouched item indexes so a caller can continue safely without replaying completed groups.
+
 When the user consumes a whole bag, can, bottle, or other package, pass `portion: { kind: "whole_package", portion: { name, weightGrams }, count }`. A food can have multiple portions, each represented by its own name-to-weight mapping (for example `piece: 10 g`, `serving: 30 g`, and `bag: 130 g`); use the exact package mapping and do not also pass `amount`/`unit`. CronoGPT resolves the requested package to grams for an unambiguous diary write and refuses missing or guessed weights. The explicit diary `meal` always wins over product/search categories: an energy drink requested for Lunch is logged to Lunch, never inferred as Supplements.
 
 `delete_diary_food_entry` remains conservative for normal use. If accidental rows are indistinguishable, preview the exact date/meal/name/amount match count and then pass an explicit `deleteCount`; CronoGPT deletes one row at a time and stops unless read-back proves the count dropped by exactly one. There is intentionally no delete-all mode.
+
+Use `delete_diary_food_entries` for a bounded multi-day cleanup. Each item still requires an explicit date, meal, exact visible name, and matching `confirmName`; the server runs the conservative single-row transaction sequentially and stops on unresolved outcomes. It does not accept a date-range delete or wildcard.
 
 If Cronometer returns `Too Many Attempts`, stop live browser checks and seed the shared cooldown before retrying later:
 
@@ -200,8 +204,10 @@ By default, only these tools are model-visible:
 
 - `log_food`
 - `log_foods`
+- `log_food_plan`
 - `get_cronometer_operation`
 - `delete_diary_food_entry`
+- `delete_diary_food_entries`
 - `get_daily_summary`
 - `list_food_entries`
 - `list_biometrics`
@@ -218,9 +224,13 @@ By default, only these tools are model-visible:
 - `retire_custom_food`
 - `list_private_recipe_names`
 - `find_private_recipe`
+- `list_custom_recipes`
 - `resolve_recipe_ingredients`
 - `ensure_private_recipe`
+- `create_recipe`
 - `update_custom_recipe`
+- `delete_custom_recipe`
+- `retire_custom_recipe`
 - `cronometer_runtime_status`
 - `cronometer_stability_check`
 - `refresh_cronometer_session`
@@ -260,6 +270,9 @@ The existing lowercase `email` and `password` keys are supported only for local 
 - `resolve_recipe_ingredients`
 - `log_food`
 - `log_foods`
+- `log_food_plan`
+- `delete_diary_food_entry`
+- `delete_diary_food_entries`
 - `log_exercise`
 - `log_biometric`
 - `log_note`

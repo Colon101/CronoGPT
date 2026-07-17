@@ -954,7 +954,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       stoppedEarly,
       elapsedMs: Date.now() - startedAt,
       browserOpened: true,
-      writeAttempted: true,
+      writeAttempted: itemResults.some((item) => item.writeAttempted === true),
       counts,
       items: itemResults,
       retry: status === "written"
@@ -3033,6 +3033,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     };
 
     const initialDisplayedDateLabel = await readDiaryDateLabel(page);
+    const initialDisplayedDate = diaryDateLabelToIso(initialDisplayedDateLabel, currentDate);
     if (!requestedDate) {
       const selected = diaryDateLabelMatches(initialDisplayedDateLabel, currentDate, currentDate);
       return {
@@ -3053,7 +3054,17 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       };
     }
 
-    const days = daysBetweenIso(currentDate, parsed.date);
+    if (!initialDisplayedDate) {
+      return {
+        ...base,
+        selected: false,
+        strategy: "not_verified",
+        displayedDateLabel: initialDisplayedDateLabel,
+        warning: `Cronometer's current diary date label ${initialDisplayedDateLabel || "could not be read"} was not an understood date. No date-specific write was attempted.`,
+      };
+    }
+
+    const days = daysBetweenIso(initialDisplayedDate, parsed.date);
     if (days === 0) {
       const selected = diaryDateLabelMatches(initialDisplayedDateLabel, parsed.date, currentDate);
       return {
@@ -3071,7 +3082,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         selected: false,
         strategy: "out_of_range",
         steps: Math.abs(days),
-        warning: `Requested diary date is ${Math.abs(days)} days from today. This hosted browser flow only auto-navigates up to ${MAX_DIARY_ARROW_DAYS} days by Cronometer's day arrows.`,
+        warning: `Requested diary date is ${Math.abs(days)} days from the displayed diary date. This hosted browser flow only auto-navigates up to ${MAX_DIARY_ARROW_DAYS} days by Cronometer's day arrows.`,
       };
     }
 
@@ -3087,7 +3098,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           warning: "Could not find Cronometer's diary date arrow. No date-specific write was attempted.",
         };
       }
-      const expectedStepDate = addDaysIso(currentDate, direction === "next" ? index + 1 : -(index + 1));
+      const expectedStepDate = addDaysIso(initialDisplayedDate, direction === "next" ? index + 1 : -(index + 1));
       const displayedDateLabel = await waitForDiaryDateLabel(page, expectedStepDate, currentDate, 3000);
       if (!diaryDateLabelMatches(displayedDateLabel, expectedStepDate, currentDate)) {
         return {
@@ -3391,7 +3402,8 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       && operation.semanticKey === semanticKey
       && ["running", "indeterminate", "completed"].includes(operation.status)
       && operation.result?.status !== "written"
-      && operation.result?.status !== "already_exists",
+      && operation.result?.status !== "already_exists"
+      && !persistedOperationDefinitelyDidNotWrite(operation),
     );
     if (conflictingSemanticOperation && expectedCount === undefined) {
       return this.result(feature, "possibly_written_verify_failed", {
@@ -3415,7 +3427,8 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     const existingId = backgroundBrowserJobKeys.get(key);
     const existing = existingId ? backgroundBrowserJobs.get(existingId) : undefined;
     const persistedExisting = Array.from(this.persistedOperations.values()).find((operation) => operation.key === key);
-    if (persistedExisting && persistedExisting.canonicalPayload && persistedExisting.canonicalPayload !== canonicalPayload) {
+    const persistedExistingDidNotWrite = persistedOperationDefinitelyDidNotWrite(persistedExisting);
+    if (persistedExisting && !persistedExistingDidNotWrite && persistedExisting.canonicalPayload && persistedExisting.canonicalPayload !== canonicalPayload) {
       return this.result(feature, "needs_manual_step", {
         operationId: persistedExisting.id,
         idempotencyKey: safety?.callerIdempotencyKey,
@@ -3432,7 +3445,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         operation: persistedExisting,
       }, "A previous process started this same operation but restarted before recording a terminal result. Inspect the diary; the operation will not be replayed automatically.");
     }
-    if (!existing && persistedExisting?.status === "completed" && persistedExisting.result && persistedExisting.result.status !== "busy") {
+    if (!existing && !persistedExistingDidNotWrite && persistedExisting?.status === "completed" && persistedExisting.result && persistedExisting.result.status !== "busy") {
       return this.result(feature, persistedExisting.result.status, {
         ...resultDataObject(persistedExisting.result),
         operationId: persistedExisting.id,
@@ -3442,7 +3455,8 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     if (existing?.status === "running") {
       return this.backgroundBrowserJobAcceptedResult(feature, existing, true);
     }
-    if (existing?.status === "completed" && existing.result && existing.result.status !== "busy") {
+    const existingDidNotWrite = existing?.status === "completed" && providerResultDefinitelyDidNotWrite(existing.result);
+    if (existing?.status === "completed" && !existingDidNotWrite && existing.result && existing.result.status !== "busy") {
       return this.result(feature, existing.result.status, {
         ...resultDataObject(existing.result),
         backgroundJob: summarizeBackgroundBrowserJob(existing, Date.now()),
@@ -3453,6 +3467,14 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       return this.result(feature, "error", {
         backgroundJob: summarizeBackgroundBrowserJob(existing, Date.now()),
       }, existing.error ?? "Background Cronometer browser job failed.", "browser");
+    }
+
+    if (persistedExistingDidNotWrite && persistedExisting) {
+      this.persistedOperations.delete(persistedExisting.id);
+    }
+    if (existingDidNotWrite && existing) {
+      backgroundBrowserJobs.delete(existing.id);
+      if (backgroundBrowserJobKeys.get(key) === existing.id) backgroundBrowserJobKeys.delete(key);
     }
 
     const now = Date.now();
@@ -4541,6 +4563,17 @@ function resultDataObject(result: ProviderResult): Record<string, unknown> {
     : {};
 }
 
+export function providerResultDefinitelyDidNotWrite(result: ProviderResult | undefined) {
+  if (!result || result.status === "written" || result.status === "already_exists" || result.status === "possibly_written_verify_failed") {
+    return false;
+  }
+  return resultDataObject(result).writeAttempted === false;
+}
+
+function persistedOperationDefinitelyDidNotWrite(operation: PersistedBackgroundBrowserJob | undefined) {
+  return operation?.status === "completed" && providerResultDefinitelyDidNotWrite(operation.result);
+}
+
 function compactBackgroundResultData(data: Record<string, unknown>) {
   const compacted: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(data)) {
@@ -4741,6 +4774,7 @@ function summarizeBatchFoodLogResult(index: number, normalized: NormalizedFoodLo
     selectedName: stringValue(logged?.selectedName) ?? stringValue(selectedResult?.name) ?? normalized.selectedName,
     selectedSource: stringValue(logged?.selectedSource) ?? stringValue(selectedResult?.source) ?? normalized.selectedSource,
     queryUsed: stringValue(data.queryUsed),
+    writeAttempted: data.writeAttempted === true,
     verification: data.verification,
     retry: data.retry,
   };
@@ -5104,20 +5138,34 @@ async function waitForDiaryDateLabel(page: Page, expectedDate: string, currentDa
   return label;
 }
 
-function diaryDateLabelMatches(label: string, expectedDate: string, currentDate: string) {
+export function diaryDateLabelToIso(label: string, currentDate: string) {
   const normalized = label.replace(/\s+/g, " ").trim().toLowerCase();
-  if (!normalized) return false;
-  if (expectedDate === currentDate && normalized === "today") return true;
-  if (normalized === expectedDate.toLowerCase()) return true;
+  if (!normalized) return undefined;
+  if (normalized === "today") return currentDate;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(normalized) && isValidIsoDate(normalized)) return normalized;
 
-  const [year, month, day] = expectedDate.split("-").map(Number);
-  const date = new Date(Date.UTC(year, month - 1, day));
-  const shortDate = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", timeZone: "UTC" }).format(date).toLowerCase();
-  const longDate = new Intl.DateTimeFormat("en-US", { month: "long", day: "numeric", timeZone: "UTC" }).format(date).toLowerCase();
-  return normalized === shortDate
-    || normalized === longDate
-    || normalized === `${shortDate}, ${year}`
-    || normalized === `${longDate}, ${year}`;
+  const match = normalized.match(/^([a-z]+)\s+(\d{1,2})(?:,\s*(\d{4}))?$/);
+  if (!match) return undefined;
+  const monthNames = [
+    ["jan", "january"], ["feb", "february"], ["mar", "march"], ["apr", "april"],
+    ["may"], ["jun", "june"], ["jul", "july"], ["aug", "august"],
+    ["sep", "sept", "september"], ["oct", "october"], ["nov", "november"], ["dec", "december"],
+  ];
+  const month = monthNames.findIndex((names) => names.includes(match[1])) + 1;
+  const day = Number(match[2]);
+  if (month <= 0 || !Number.isInteger(day)) return undefined;
+
+  const explicitYear = match[3] ? Number(match[3]) : undefined;
+  const currentYear = Number(currentDate.slice(0, 4));
+  const candidates = (explicitYear ? [explicitYear] : [currentYear - 1, currentYear, currentYear + 1])
+    .map((year) => `${year.toString().padStart(4, "0")}-${month.toString().padStart(2, "0")}-${day.toString().padStart(2, "0")}`)
+    .filter(isValidIsoDate)
+    .sort((left, right) => Math.abs(daysBetweenIso(currentDate, left)) - Math.abs(daysBetweenIso(currentDate, right)));
+  return candidates[0];
+}
+
+function diaryDateLabelMatches(label: string, expectedDate: string, currentDate: string) {
+  return diaryDateLabelToIso(label, currentDate) === expectedDate;
 }
 
 function normalizeDiaryDateInput(value: string | undefined, today: string): { date?: string; warning?: string } {
@@ -5744,7 +5792,8 @@ async function fillFoodUnit(page: Page, editor: ReturnType<Page["locator"]>, uni
     return { filled: true as const, unit: normalizedUnit, strategy: "already-selected" as const, currentUnitText };
   }
   await unitButton.click();
-  const clicked = await clickExactFoodLogUnitOption(page, normalizedUnit);
+  const clicked = await clickExactFoodLogUnitOption(page, normalizedUnit)
+    || await clickVisibleUnitOption(page, normalizedUnit);
   if (!clicked) {
     await page.keyboard.press("Escape").catch(() => undefined);
     return {
@@ -5788,9 +5837,10 @@ async function foodLogUnitDropdownButton(scope: ReturnType<Page["locator"]>) {
   return undefined;
 }
 
-function foodLogUnitTextLooksSelectable(text: string) {
+export function foodLogUnitTextLooksSelectable(text: string) {
   const normalized = text.replace(/\s+/g, " ").trim();
-  return /\b(g|gram|grams|oz|ounce|ounces|lb|pound|pounds|ml|milliliter|millilitre|cup|tbsp|tablespoon|tsp|teaspoon|serving|size|pint|pt|quart|liter|litre|piece|slice)\b/i.test(normalized);
+  return gramsPerServingUnit(normalized) !== undefined
+    || /\b(g|gram|grams|oz|ounce|ounces|lb|pound|pounds|ml|milliliter|millilitre|cup|tbsp|tablespoon|tsp|teaspoon|serving|size|pint|pt|quart|liter|litre|piece|slice|bar|clove|scoop|bottle|can|container|package|packet|pouch|pat|large|medium|small)\b/i.test(normalized);
 }
 
 async function waitForFoodLogUnitText(page: Page, unitButton: ReturnType<Page["locator"]>, unit: string, timeoutMs: number) {
@@ -5823,10 +5873,22 @@ async function clickExactFoodLogUnitOption(page: Page, unit: string) {
   return false;
 }
 
-function foodLogUnitTextMatches(text: string, unit: string) {
+export function foodLogUnitTextMatches(text: string, unit: string) {
   const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
-  const labels = [unit.trim().toLowerCase(), ...unitAliases(unit)];
-  return labels.some((label) => normalized === label || normalized === `1 ${label}`);
+  const normalizedUnit = unit.trim().toLowerCase();
+  const labels = [normalizedUnit, ...unitAliases(unit)];
+  const withoutServingPrefix = normalized
+    .replace(/^(?:1(?:\.0+)?|×)\s+/, "")
+    .trim();
+  if (normalizedUnit === "g" && gramsPerServingUnit(normalized) === 1) return true;
+  return labels.some((label) =>
+    withoutServingPrefix === label
+    || withoutServingPrefix.startsWith(`${label} `)
+    || withoutServingPrefix.startsWith(`${label}—`)
+    || withoutServingPrefix.startsWith(`${label} —`)
+    || withoutServingPrefix.startsWith(`${label}-`)
+    || withoutServingPrefix.startsWith(`${label} -`)
+  );
 }
 
 async function fillLikelyAmount(page: Page, amount?: number, selectedName?: string) {
@@ -7184,11 +7246,18 @@ async function nutritionLabelText(page: Page, label: string) {
 async function scrollNutrientRowIntoView(page: Page, label: string) {
   await page.evaluate((label) => {
     const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
+    const isVisible = (element: Element) => {
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
     const isHeader = (cells: Element[]) => normalize(cells[1]?.textContent).toLowerCase() === "amount";
     const expected = normalize(label).toLowerCase();
-    const rows = Array.from(document.querySelectorAll(".food-editor-nutrition-summary table.crono-table tr"));
+    const rows = Array.from(document.querySelectorAll(".food-editor-nutrition-summary table.crono-table tr"))
+      .filter((row) => isVisible(row));
     for (const row of rows) {
-      const cells = Array.from(row.querySelectorAll("td"));
+      const cells = Array.from(row.children)
+        .filter((child): child is HTMLTableCellElement => child instanceof HTMLTableCellElement && child.tagName === "TD");
       if (cells.length < 3 || normalize(cells[0]?.textContent).toLowerCase() !== expected) continue;
       if (isHeader(cells)) continue;
       const rect = (cells[1] ?? cells[0]).getBoundingClientRect();
@@ -7204,11 +7273,18 @@ async function scrollNutrientRowIntoView(page: Page, label: string) {
 async function nutrientAmountCellBox(page: Page, label: string) {
   return page.evaluate((label) => {
     const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
+    const isVisible = (element: Element) => {
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
     const isHeader = (cells: Element[]) => normalize(cells[1]?.textContent).toLowerCase() === "amount";
     const expected = normalize(label).toLowerCase();
-    const rows = Array.from(document.querySelectorAll(".food-editor-nutrition-summary table.crono-table tr"));
+    const rows = Array.from(document.querySelectorAll(".food-editor-nutrition-summary table.crono-table tr"))
+      .filter((row) => isVisible(row));
     for (const row of rows) {
-      const cells = Array.from(row.querySelectorAll("td"));
+      const cells = Array.from(row.children)
+        .filter((child): child is HTMLTableCellElement => child instanceof HTMLTableCellElement && child.tagName === "TD");
       if (cells.length < 3 || normalize(cells[0]?.textContent).toLowerCase() !== expected) continue;
       if (isHeader(cells)) continue;
       const target = cells[1] ?? cells[0];
@@ -7379,7 +7455,8 @@ async function customFoodDetailsForNames(page: Page, names: string[], maxDetails
     occurrences.set(normalized, occurrence + 1);
     await page.goto(`${CRONOMETER_ORIGIN}/#custom-foods`);
     await page.waitForLoadState("domcontentloaded").catch(() => undefined);
-    await page.waitForTimeout(900);
+    const listText = await waitForCustomItemListText(page, "Custom Foods", 12000).catch(() => "");
+    if (!customItemTextIsReady(listText, "Custom Foods")) continue;
     const clicked = await clickCustomListItemByName(page, name, occurrence);
     if (!clicked) {
       continue;
@@ -7389,7 +7466,7 @@ async function customFoodDetailsForNames(page: Page, names: string[], maxDetails
     details.push({ ...(detail ?? { name }), name: detail?.name ?? name, listIndex, occurrence });
   }
   await page.goto(`${CRONOMETER_ORIGIN}/#custom-foods`).catch(() => undefined);
-  await page.waitForTimeout(700).catch(() => undefined);
+  await waitForCustomItemListText(page, "Custom Foods", 12000).catch(() => undefined);
   return details;
 }
 
@@ -7800,9 +7877,11 @@ async function extractCustomFoodDetail(page: Page): Promise<CustomFoodDetail | u
     }
 
     const nutrients: Record<string, { value: number; unit: string; percentDailyValue?: number }> = {};
-    const rows = Array.from(document.querySelectorAll(".food-editor-nutrition-summary table.crono-table tr"));
+    const rows = Array.from(document.querySelectorAll(".food-editor-nutrition-summary table.crono-table tr"))
+      .filter((row) => isVisible(row));
     for (const row of rows) {
-      const cells = Array.from(row.querySelectorAll("td"));
+      const cells = Array.from(row.children)
+        .filter((child): child is HTMLTableCellElement => child instanceof HTMLTableCellElement && child.tagName === "TD");
       if (cells.length < 3) continue;
       const label = normalize(cells[0]?.textContent);
       const amountText = normalize(cells[1]?.textContent);

@@ -6,7 +6,10 @@ import {
   customFoodNutrientEntries,
   customFoodUpdatePreview,
   customFoodWritePreview,
+  diaryDateLabelToIso,
   foodSearchTabAttempts,
+  foodLogUnitTextLooksSelectable,
+  foodLogUnitTextMatches,
   parseFoodSearchResults,
   parseCustomRecipeIngredientTables,
   parseCustomFoodServingTables,
@@ -16,6 +19,7 @@ import {
   servingSizeRowMatches,
   verifyCustomFoodWrite,
 } from "../dist/providers/browser.js";
+
 import {
   customFoodServingPreview,
   customFoodTransactionPreview,
@@ -38,6 +42,21 @@ import {
   verifyFoodLogInDiaryEntries,
   verifyFoodLogInDiaryText,
 } from "../dist/food-log-transaction.js";
+
+assert.equal(diaryDateLabelToIso("Today", "2026-07-17"), "2026-07-17");
+assert.equal(diaryDateLabelToIso("Jul 16", "2026-07-17"), "2026-07-16");
+assert.equal(diaryDateLabelToIso("December 31", "2026-01-02"), "2025-12-31");
+assert.equal(diaryDateLabelToIso("Jan 1, 2027", "2026-12-31"), "2027-01-01");
+assert.equal(diaryDateLabelToIso("not a date", "2026-07-17"), undefined);
+
+assert.equal(foodLogUnitTextLooksSelectable("bar — 46g"), true);
+assert.equal(foodLogUnitTextLooksSelectable("Ninja Creami pint — 341g"), true);
+assert.equal(foodLogUnitTextLooksSelectable("Breakfast"), false);
+assert.equal(foodLogUnitTextMatches("bar — 46g", "bar"), true);
+assert.equal(foodLogUnitTextMatches("1 Ninja Creami pint — 341g", "Ninja Creami pint"), true);
+assert.equal(foodLogUnitTextMatches("× 250 g", "250 g"), true);
+assert.equal(foodLogUnitTextMatches("clove — 3g", "clove"), true);
+assert.equal(foodLogUnitTextMatches("tbsp — 15g", "tsp"), false);
 
 assert.equal(recipeIngredientAmountMatches(600, "g", 600, "g", "600.0 g"), true);
 assert.equal(recipeIngredientAmountMatches(2, "2 tbsp", 26, "g", "26.0 g"), true);
@@ -514,6 +533,32 @@ assert.equal(verifyFoodLogInDiaryEntries([
   { query: "Bananas, Raw", meal: "Dinner", amount: 46, unit: "g", selectedName: "Bananas, Raw" },
   "Asia/Jerusalem",
   new Date("2026-06-09T08:00:00.000Z"),
+)).status, "verified");
+assert.equal(verifyFoodLogInDiaryEntries([
+  { meal: "Breakfast", name: "Chef Robert Irvine's, Fit Crunch, High Protein Baked Bar, Chocolate Peanut Butter", amount: 1, unit: "bar — 46g" },
+], normalizeFoodLogInput(
+  {
+    query: "Chef Robert Irvine's, Fit Crunch, High Protein Baked Bar, Chocolate Peanut Butter",
+    meal: "Breakfast",
+    amount: 1,
+    unit: "bar",
+    selectedName: "Chef Robert Irvine's, Fit Crunch, High Protein Baked Bar, Chocolate Peanut Butter",
+  },
+  "Asia/Jerusalem",
+  new Date("2026-07-17T08:00:00.000Z"),
+)).status, "verified");
+assert.equal(verifyFoodLogInDiaryEntries([
+  { meal: "Breakfast", name: "Chocolate Peanut Butter Protein Ice Cream Base", amount: 2, unit: "Ninja Creami pint — 341g" },
+], normalizeFoodLogInput(
+  {
+    query: "Chocolate Peanut Butter Protein Ice Cream Base",
+    meal: "Breakfast",
+    amount: 2,
+    unit: "Ninja Creami pint",
+    selectedName: "Chocolate Peanut Butter Protein Ice Cream Base",
+  },
+  "Asia/Jerusalem",
+  new Date("2026-07-17T08:00:00.000Z"),
 )).status, "verified");
 
 const breakfastOnlyMilk = verifyFoodLogInDiaryText(

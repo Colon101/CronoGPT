@@ -27,7 +27,9 @@ const chatGptActionToolNames = [
   "list_notes",
   "log_food",
   "log_foods",
+  "log_food_plan",
   "delete_diary_food_entry",
+  "delete_diary_food_entries",
   "search_foods",
   "custom_food_nutrient_schema",
   "list_custom_foods",
@@ -39,11 +41,13 @@ const chatGptActionToolNames = [
   "retire_custom_food",
   "list_private_recipe_names",
   "find_private_recipe",
+  "list_custom_recipes",
   "resolve_recipe_ingredients",
   "ensure_private_recipe",
   "create_recipe",
   "update_custom_recipe",
   "delete_custom_recipe",
+  "retire_custom_recipe",
   "cronometer_runtime_status",
   "get_cronometer_operation",
   "cronometer_stability_check",
@@ -88,6 +92,8 @@ await withClient(async (client) => {
   const createAndLogCustomFoodTool = tools.tools.find((tool) => tool.name === "create_and_log_custom_food");
   const logFoodTool = tools.tools.find((tool) => tool.name === "log_food");
   const logFoodsTool = tools.tools.find((tool) => tool.name === "log_foods");
+  const logFoodPlanTool = tools.tools.find((tool) => tool.name === "log_food_plan");
+  const deleteDiaryEntriesTool = tools.tools.find((tool) => tool.name === "delete_diary_food_entries");
   const deleteCountSchema = deleteDiaryTool?.inputSchema?.properties?.deleteCount;
   const portionsSchema = createCustomFoodTool?.inputSchema?.properties?.portions;
   const expectedMatchCountSchema = logFoodTool?.inputSchema?.properties?.expectedExistingMatchCount;
@@ -100,7 +106,10 @@ await withClient(async (client) => {
     createAndLogCustomFoodTool?.inputSchema?.properties?.portions?.type === "array" &&
     expectedMatchCountSchema?.type === "integer" &&
     expectedMatchCountSchema?.minimum === 0 &&
-    logFoodsTool?.inputSchema?.properties?.items?.items?.properties?.expectedExistingMatchCount?.type === "integer";
+    logFoodsTool?.inputSchema?.properties?.items?.items?.properties?.expectedExistingMatchCount?.type === "integer" &&
+    logFoodPlanTool?.inputSchema?.properties?.items?.items?.properties?.date?.type === "string" &&
+    logFoodPlanTool?.inputSchema?.properties?.items?.items?.properties?.meal?.type === "string" &&
+    deleteDiaryEntriesTool?.inputSchema?.properties?.items?.items?.properties?.confirmName?.type === "string";
   checks.push({
     name: "tools",
     ok: tools.tools.length >= 50 &&
@@ -126,6 +135,9 @@ await withClient(async (client) => {
         createAndLogPortions: createAndLogCustomFoodTool?.inputSchema?.properties?.portions,
         expectedExistingMatchCount: expectedMatchCountSchema,
         batchExpectedExistingMatchCount: logFoodsTool?.inputSchema?.properties?.items?.items?.properties?.expectedExistingMatchCount,
+        planDate: logFoodPlanTool?.inputSchema?.properties?.items?.items?.properties?.date,
+        planMeal: logFoodPlanTool?.inputSchema?.properties?.items?.items?.properties?.meal,
+        deletePlanConfirmName: deleteDiaryEntriesTool?.inputSchema?.properties?.items?.items?.properties?.confirmName,
       },
       runtimeHasOauthMetadata: Array.isArray(runtimeSecuritySchemes) &&
         runtimeSecuritySchemes.some((scheme) => scheme?.type === "oauth2"),
@@ -237,6 +249,26 @@ await withClient(async (client) => {
       browserOpened: batchDryRun.structuredContent?.data?.browserOpened,
       writeAttempted: batchDryRun.structuredContent?.data?.writeAttempted,
     },
+  });
+
+  const multiDayPlanDryRun = await client.callTool({
+    name: "log_food_plan",
+    arguments: {
+      items: [
+        { date: "yesterday", meal: "Breakfast", query: "Banana", amount: 100, unit: "g" },
+        { date: "today", meal: "Lunch", query: "Milk, 1 % Fat, Lowfat", amount: 62, unit: "g" },
+      ],
+      dryRun: true,
+      confirmed: false,
+    },
+  });
+  checks.push({
+    name: "log_food_plan_dry_run",
+    ok: multiDayPlanDryRun.structuredContent?.status === "dry_run" &&
+      multiDayPlanDryRun.structuredContent?.data?.count === 2 &&
+      multiDayPlanDryRun.structuredContent?.data?.groupCount === 2 &&
+      multiDayPlanDryRun.structuredContent?.data?.groups?.every((group) => group?.data?.browserOpened === false),
+    data: multiDayPlanDryRun.structuredContent,
   });
 
   const recipeDryRun = await client.callTool({

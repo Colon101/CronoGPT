@@ -16,7 +16,14 @@ import { CUSTOM_FOOD_NUTRIENT_SCHEMA, customFoodNutrientSchemaSummary } from "./
 import { validateBarcode } from "./barcode.js";
 import { FOOD_LOG_MEALS, isValidFoodLogDate, parseFoodLogTimestamp } from "./food-log-transaction.js";
 import { customFoodTransactionPreview } from "./domain.js";
-import type { CronometerProvider, RecipeInput } from "./domain.js";
+import type {
+  CronometerProvider,
+  DiaryFoodDeleteInput,
+  FoodLogInput,
+  ProviderResult,
+  ProviderStatus,
+  RecipeInput,
+} from "./domain.js";
 import { comparePrivateRecipe, type ExistingRecipeSummary } from "./recipe-semantics.js";
 import {
   authorizeMcpRequest,
@@ -28,7 +35,7 @@ import {
 const widgetHtml = readFileSync(join(process.cwd(), "public/cronometer-widget.html"), "utf8");
 const widgetUri = "ui://widget/cronometer-dashboard.html";
 
-const provider = createProviderFromEnv();
+const defaultProvider = createProviderFromEnv();
 
 const dateValueInputSchema = z.string()
   .refine((value) => {
@@ -124,7 +131,7 @@ const wholePackagePortionSchema = z.object({
 }).describe("Use when the user consumed a whole package. CronoGPT logs count × portion.weightGrams, so multiple portions on the same food remain unambiguous.");
 
 export const MCP_PATH = "/mcp";
-export const MCP_SERVER_VERSION = "0.1.17";
+export const MCP_SERVER_VERSION = "0.1.18";
 const readToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read"] }];
 const writeToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read", "cronometer:write"] }];
 export const STABLE_MODEL_VISIBLE_TOOLS = [
@@ -135,7 +142,9 @@ export const STABLE_MODEL_VISIBLE_TOOLS = [
   "list_notes",
   "log_food",
   "log_foods",
+  "log_food_plan",
   "delete_diary_food_entry",
+  "delete_diary_food_entries",
   "search_foods",
   "custom_food_nutrient_schema",
   "list_custom_foods",
@@ -147,11 +156,13 @@ export const STABLE_MODEL_VISIBLE_TOOLS = [
   "retire_custom_food",
   "list_private_recipe_names",
   "find_private_recipe",
+  "list_custom_recipes",
   "resolve_recipe_ingredients",
   "ensure_private_recipe",
   "create_recipe",
   "update_custom_recipe",
   "delete_custom_recipe",
+  "retire_custom_recipe",
   "cronometer_runtime_status",
   "get_cronometer_operation",
   "cronometer_stability_check",
@@ -167,11 +178,13 @@ const MCP_SERVER_INSTRUCTIONS = [
   "For every diary food write or delete, pass the user's exact meal section explicitly. A product or search category never chooses the meal: if the user says Lunch, pass Lunch even for an energy drink or supplement-like product.",
   "For a whole bag, can, bottle, or package, pass portion={kind:'whole_package',portion:{name,weightGrams},count}. A custom food can have multiple named portions; use the exact name-to-weight mapping for the consumed package and never guess its weight. Do not also pass amount/unit.",
   "Submit one multi-food user intent once through log_foods. For a confirmed background write, accepted means the write is in progress, not failed: never resubmit it; poll get_cronometer_operation with the returned operation ID.",
+  "Use log_food_plan for one bounded intent that spans multiple dates or meal sections, and delete_diary_food_entries for a bounded exact multi-day cleanup. These tools stop before later groups after an unresolved or ambiguous result; inspect their per-group or per-item results instead of blindly retrying the whole plan.",
   "Treat possibly_written_verify_failed as an ambiguous write: inspect the custom-food list or diary before retrying so a duplicate is not created.",
   "Treat ok=false or completed=false as not completed, even when the tool call itself returned normally. accepted means a background job is still pending, not that the requested write succeeded.",
 ].join("\n");
 
 export function createCronoServer(options: { grantedScopes?: readonly string[]; provider?: CronometerProvider } = {}) {
+  const provider = options.provider ?? defaultProvider;
   const server = new McpServer(
     { name: "cronogpt", version: MCP_SERVER_VERSION },
     { instructions: MCP_SERVER_INSTRUCTIONS },
@@ -702,6 +715,36 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   );
 
   register(
+    "log_food_plan",
+    "Log a multi-day food plan",
+    "Adds a bounded set of foods across multiple explicit Cronometer dates and meal sections. The server groups items by date and meal, submits each group through the verified idempotent log_foods transaction, and stops before later groups after any accepted, ambiguous, or failed result. Use this for one user intent that cannot fit in a single meal batch.",
+    {
+      items: z.array(z.object({
+        date: diaryDateInputSchema,
+        meal: diaryMealInputSchema,
+        query: z.string().min(1),
+        selectedName: z.string().optional(),
+        selectedSource: z.string().optional().describe("Optional exact Cronometer source from search_foods, such as CRDB, NCCDB, Custom Food, or Custom Recipe."),
+        amount: z.number().positive().optional(),
+        unit: z.string().min(1).optional(),
+        portion: wholePackagePortionSchema.optional(),
+        timestamp: foodTimestampInputSchema.optional(),
+        matchPolicy: z.enum(["high_confidence", "selected_only"]).optional(),
+        searchScope: z.enum(["auto", "all", "custom", "favorites"]).optional(),
+        expectedExistingMatchCount: expectedExistingMatchCountSchema.optional(),
+        idempotencyKey: z.string().optional(),
+      })).min(1).max(100),
+      dryRun: z.boolean().optional(),
+      confirmed: z.boolean().optional(),
+      idempotencyKey: z.string().optional().describe("Optional plan-level idempotency key. CronoGPT derives deterministic group and item keys from it."),
+      stopOnFirstFailure: z.boolean().optional().describe("Defaults to true across date/meal groups. Later groups are never started after an accepted, ambiguous, or failed result."),
+      waitForCompletionSeconds: z.number().int().min(0).max(600).optional(),
+    },
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    async (args) => toMcpToolResponse(await runFoodLogPlan(provider, args)),
+  );
+
+  register(
     "delete_diary_food_entry",
     "Delete diary food entry",
     "Deletes a bounded number of matching food entries from one explicit Cronometer diary meal. By default it preserves the conservative unique-match behavior. For indistinguishable duplicate rows, first preview the match count, then pass an explicit deleteCount with confirmation; the server deletes one at a time and verifies the count drops by exactly one after each action.",
@@ -719,6 +762,29 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
     },
     { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     async (args) => toMcpToolResponse(await provider.deleteDiaryFoodEntry(args as never)),
+  );
+
+  register(
+    "delete_diary_food_entries",
+    "Delete exact diary food entries across days",
+    "Deletes a bounded explicit list of diary rows across multiple dates and meal sections. Every item requires its exact visible name and matching confirmation name. The server invokes the conservative verified single-entry delete sequentially and stops before later items after any accepted, ambiguous, or failed result; there is no delete-all mode.",
+    {
+      items: z.array(z.object({
+        date: diaryDateInputSchema,
+        meal: diaryMealInputSchema,
+        name: z.string().min(1),
+        amount: z.number().positive().optional(),
+        unit: z.string().min(1).optional(),
+        deleteCount: z.number().int().positive().optional(),
+        confirmName: z.string().min(1).describe("Must exactly match this item's name."),
+      })).min(1).max(100),
+      dryRun: z.boolean().optional(),
+      confirmed: z.boolean().optional(),
+      stopOnFirstFailure: z.boolean().optional().describe("Defaults to true. Later deletes are not attempted after an unresolved result."),
+      waitForCompletionSeconds: z.number().int().min(0).max(600).optional(),
+    },
+    { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    async (args) => toMcpToolResponse(await runDiaryDeletePlan(provider, args)),
   );
 
   register(
@@ -984,7 +1050,12 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
       maxDetails: z.number().int().nonnegative().max(25).optional(),
     },
     { readOnlyHint: true, openWorldHint: false },
-    async (args) => toMcpToolResponse(await provider.listCustomRecipes(args as never)),
+    async (args) => toMcpToolResponse(
+      sanitizedRecipeListResult(
+        "list_custom_recipes",
+        await provider.listCustomRecipes(args as never),
+      ),
+    ),
   );
 
   register(
@@ -1037,7 +1108,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     async (args) => {
-      const ensureProvider = options.provider ?? provider;
+      const ensureProvider = provider;
       if (args.dryRun === true || args.confirmed !== true) {
         const preview = await ensureProvider.createRecipe({
           ...args,
@@ -1544,6 +1615,217 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   return server;
 }
 
+type MultiDayFoodPlanItem = FoodLogInput & { date: string; meal: string };
+
+async function runFoodLogPlan(provider: CronometerProvider, args: Record<string, unknown>): Promise<ProviderResult> {
+  const items = (args.items ?? []) as MultiDayFoodPlanItem[];
+  const planIdempotencyKey = typeof args.idempotencyKey === "string" && args.idempotencyKey.trim()
+    ? args.idempotencyKey.trim()
+    : deterministicPlanKey("food", items);
+  const groups = groupFoodPlanItems(items);
+  const groupResults: Array<Record<string, unknown>> = [];
+  let attemptedCount = 0;
+  let stoppedEarly = false;
+
+  for (const [groupIndex, group] of groups.entries()) {
+    const result = await provider.logFoods({
+      date: group.date,
+      meal: group.meal,
+      items: group.items.map(({ date: _date, meal: _meal, ...item }, itemIndex) => ({
+        ...item,
+        idempotencyKey: item.idempotencyKey ?? `${planIdempotencyKey}:item:${group.itemIndices[itemIndex]}`,
+      })),
+      dryRun: args.dryRun as boolean | undefined,
+      confirmed: args.confirmed as boolean | undefined,
+      idempotencyKey: `${planIdempotencyKey}:group:${groupIndex}`,
+      stopOnFirstFailure: args.stopOnFirstFailure as boolean | undefined,
+      waitForCompletionSeconds: args.waitForCompletionSeconds as number | undefined,
+    });
+    const data = resultData(result);
+    const attemptedInGroup = typeof data.attemptedCount === "number"
+      ? Math.min(group.items.length, Math.max(0, Math.trunc(data.attemptedCount)))
+      : group.items.length;
+    attemptedCount += attemptedInGroup;
+    groupResults.push({
+      groupIndex,
+      date: group.date,
+      meal: group.meal,
+      itemIndices: group.itemIndices,
+      status: result.status,
+      warning: result.warning,
+      operationId: data.operationId,
+      data,
+      attemptedItemCount: attemptedInGroup,
+    });
+
+    if (mustStopOrchestratedPlan(result.status)
+      || (args.stopOnFirstFailure !== false && !successfulFoodPlanStatus(result.status) && result.status !== "dry_run")) {
+      stoppedEarly = groupIndex < groups.length - 1;
+      break;
+    }
+  }
+
+  const statuses = groupResults.map((result) => result.status as ProviderStatus);
+  const status = aggregateOrchestratedStatus(statuses, groups.length, successfulFoodPlanStatus);
+  const acceptedOperationId = status === "accepted"
+    ? [...groupResults].reverse().find((result) => result.status === "accepted")?.operationId
+    : undefined;
+  const previewCompleted = groupResults.length === groups.length && statuses.every((candidate) => candidate === "dry_run");
+  const completed = groupResults.length === groups.length && statuses.every(successfulFoodPlanStatus);
+  const currentPartialGroup = groupResults.length > 0
+    ? groups[groupResults.length - 1]
+    : undefined;
+  const currentPartialAttempted = groupResults.length > 0
+    ? Number(groupResults[groupResults.length - 1]?.attemptedItemCount ?? currentPartialGroup?.items.length ?? 0)
+    : 0;
+  const remainingItemIndices = [
+    ...(currentPartialGroup ? currentPartialGroup.itemIndices.slice(currentPartialAttempted) : []),
+    ...groups.slice(groupResults.length).flatMap((group) => group.itemIndices),
+  ];
+  return {
+    provider: provider.name,
+    mode: provider.mode,
+    feature: "log_food_plan",
+    status,
+    source: "mcp-multi-day-orchestrator",
+    warning: completed || previewCompleted
+      ? undefined
+      : "The multi-day food plan did not fully complete. Inspect group statuses and continue only with untouched or definitively unwritten items; never blindly replay an ambiguous group.",
+    data: {
+      planIdempotencyKey,
+      count: items.length,
+      attemptedCount,
+      groupCount: groups.length,
+      attemptedGroupCount: groupResults.length,
+      completed,
+      previewCompleted,
+      stoppedEarly,
+      operationId: acceptedOperationId,
+      groups: groupResults,
+      remainingItemIndices,
+    },
+  };
+}
+
+async function runDiaryDeletePlan(provider: CronometerProvider, args: Record<string, unknown>): Promise<ProviderResult> {
+  const items = (args.items ?? []) as Array<DiaryFoodDeleteInput & { date: string; meal: string; confirmName: string }>;
+  const results: Array<Record<string, unknown>> = [];
+  let stoppedEarly = false;
+
+  for (const [index, item] of items.entries()) {
+    const result = await provider.deleteDiaryFoodEntry({
+      ...item,
+      dryRun: args.dryRun === undefined && args.confirmed === true ? false : args.dryRun as boolean | undefined,
+      confirmed: args.confirmed as boolean | undefined,
+      waitForCompletionSeconds: args.waitForCompletionSeconds as number | undefined,
+    });
+    const data = resultData(result);
+    results.push({
+      index,
+      target: { date: item.date, meal: item.meal, name: item.name, amount: item.amount, unit: item.unit, deleteCount: item.deleteCount ?? 1 },
+      status: result.status,
+      warning: result.warning,
+      operationId: data.operationId,
+      data,
+    });
+    if (mustStopOrchestratedPlan(result.status)
+      || (args.stopOnFirstFailure !== false && result.status !== "ok" && result.status !== "dry_run")) {
+      stoppedEarly = index < items.length - 1;
+      break;
+    }
+  }
+
+  const statuses = results.map((result) => result.status as ProviderStatus);
+  const status = aggregateOrchestratedStatus(statuses, items.length, (candidate) => candidate === "ok");
+  const acceptedOperationId = status === "accepted"
+    ? [...results].reverse().find((result) => result.status === "accepted")?.operationId
+    : undefined;
+  const previewCompleted = results.length === items.length && statuses.every((candidate) => candidate === "dry_run");
+  const completed = results.length === items.length && statuses.every((candidate) => candidate === "ok");
+  return {
+    provider: provider.name,
+    mode: provider.mode,
+    feature: "delete_diary_food_entries",
+    status,
+    source: "mcp-multi-day-orchestrator",
+    warning: completed || previewCompleted
+      ? undefined
+      : "The exact diary cleanup did not fully complete. Inspect per-item statuses before continuing; ambiguous deletes must be checked with list_food_entries.",
+    data: {
+      count: items.length,
+      attemptedCount: results.length,
+      completed,
+      previewCompleted,
+      stoppedEarly,
+      operationId: acceptedOperationId,
+      items: results,
+      remainingItemIndices: items.slice(results.length).map((_item, offset) => results.length + offset),
+    },
+  };
+}
+
+function groupFoodPlanItems(items: MultiDayFoodPlanItem[]) {
+  const groups = new Map<string, { date: string; meal: string; items: MultiDayFoodPlanItem[]; itemIndices: number[] }>();
+  items.forEach((item, index) => {
+    const key = JSON.stringify([item.date, item.meal]);
+    const group = groups.get(key) ?? { date: item.date, meal: item.meal, items: [], itemIndices: [] };
+    group.items.push(item);
+    group.itemIndices.push(index);
+    groups.set(key, group);
+  });
+  return Array.from(groups.values());
+}
+
+function deterministicPlanKey(kind: string, value: unknown) {
+  let hash = 2166136261;
+  for (const character of JSON.stringify(value)) {
+    hash ^= character.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${kind}-plan-${(hash >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+function resultData(result: ProviderResult) {
+  return result.data && typeof result.data === "object" ? result.data as Record<string, unknown> : {};
+}
+
+function successfulFoodPlanStatus(status: ProviderStatus) {
+  return status === "written" || status === "already_exists";
+}
+
+function mustStopOrchestratedPlan(status: ProviderStatus) {
+  return status === "accepted"
+    || status === "possibly_written_verify_failed"
+    || status === "busy"
+    || status === "error";
+}
+
+function aggregateOrchestratedStatus(
+  statuses: ProviderStatus[],
+  expectedCount: number,
+  succeeded: (status: ProviderStatus) => boolean,
+): ProviderStatus {
+  if (statuses.length === expectedCount && statuses.every(succeeded)) {
+    return statuses.every((status) => status === "ok") ? "ok" : "written";
+  }
+  if (statuses.length === expectedCount && statuses.every((status) => status === "dry_run")) return "dry_run";
+  for (const candidate of [
+    "accepted",
+    "possibly_written_verify_failed",
+    "error",
+    "busy",
+    "not_written_login_paused",
+    "not_written_ambiguous",
+    "not_written_not_found",
+    "needs_manual_step",
+    "not_configured",
+    "unsupported",
+  ] as const) {
+    if (statuses.includes(candidate)) return candidate;
+  }
+  return "needs_manual_step";
+}
+
 export async function handleMcpHttpRequest(req: IncomingMessage, res: ServerResponse) {
   if (!req.url) {
     res.writeHead(400).end("Missing URL");
@@ -1572,8 +1854,8 @@ export async function handleMcpHttpRequest(req: IncomingMessage, res: ServerResp
       .writeHead(200, { "content-type": "application/json" })
       .end(JSON.stringify({
         name: "cronogpt",
-        provider: provider.name,
-        mode: provider.mode,
+        provider: defaultProvider.name,
+        mode: defaultProvider.mode,
         mcp: MCP_PATH,
         authConfigured: Boolean(getAuthToken()),
         publicOrigin: process.env.APP_PUBLIC_ORIGIN,

@@ -487,7 +487,13 @@ function foodLogUnitsMatch(actual: string | undefined, expected: string) {
   const normalizedExpected = normalizeFoodLogUnit(expectedDisplay)?.toLowerCase();
   if (normalizedActual === normalizedExpected) return true;
   const expectedLabels = new Set([normalizedExpected, ...unitAliases(normalizedExpected ?? "")].map((value) => normalizeComparable(value ?? "")));
-  return expectedLabels.has(normalizeComparable(actualDisplay));
+  const comparableActual = normalizeComparable(actualDisplay);
+  if (expectedLabels.has(comparableActual)) return true;
+  return Array.from(expectedLabels).some((label) => {
+    if (!label) return false;
+    const rawLabel = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
+    return new RegExp(`^${rawLabel}\\s*(?:[—–-]|\\()`, "i").test(actualDisplay);
+  });
 }
 
 function foodEntryAmountMatches(entry: DiaryFoodEntry, requestedAmount: number, requestedUnit?: string) {

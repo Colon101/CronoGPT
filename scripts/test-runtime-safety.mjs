@@ -11,6 +11,7 @@ import {
   __runBrowserQueueJobForTests,
   __setActiveBrowserJobForTests,
   releaseAndSnapshotBrowserQueue,
+  providerResultDefinitelyDidNotWrite,
 } from "../dist/providers/browser.js";
 import { MockCronometerProvider } from "../dist/providers/mock.js";
 import { createCronoServer, MCP_SERVER_VERSION, STABLE_MODEL_VISIBLE_TOOLS } from "../dist/mcp.js";
@@ -29,6 +30,8 @@ try {
   assert.match(browserSource, /element\.getAttribute\("placeholder"\)/, "account verification must inspect Cronometer's email placeholder");
   assert.match(browserSource, /getByRole\("textbox", \{ name: \/\^Amount\$\/i \}\)/, "recipe ingredients must target Cronometer's labeled Amount field");
   assert.match(browserSource, /added_ingredient_not_verified/, "recipe creation must refuse Save when an amount does not read back");
+  assert.equal(providerResultDefinitelyDidNotWrite({ provider: "browser", mode: "browser", feature: "delete", status: "needs_manual_step", data: { writeAttempted: false } }), true);
+  assert.equal(providerResultDefinitelyDidNotWrite({ provider: "browser", mode: "browser", feature: "delete", status: "possibly_written_verify_failed", data: { writeAttempted: false } }), false);
   assert.equal(MCP_SERVER_VERSION, packageVersion, "MCP server identity must change whenever the app package version changes");
 
   let status = runCooldown(["status"]);
@@ -57,15 +60,19 @@ try {
     "list_biometrics",
     "list_exercises",
     "list_notes",
+    "log_food_plan",
+    "delete_diary_food_entries",
     "list_custom_foods",
     "find_duplicate_custom_foods",
     "list_private_recipe_names",
     "find_private_recipe",
+    "list_custom_recipes",
     "resolve_recipe_ingredients",
     "ensure_private_recipe",
     "create_recipe",
     "update_custom_recipe",
     "delete_custom_recipe",
+    "retire_custom_recipe",
   ]) {
     assert.ok(STABLE_MODEL_VISIBLE_TOOLS.includes(toolName), `${toolName} should be ChatGPT-visible by default`);
   }
@@ -123,10 +130,18 @@ try {
   assert.ok(logFoodTool?.inputSchema?.properties?.portion, "log_food must expose explicit whole-package portion semantics");
   const logFoodsTool = listedTools.tools.find((tool) => tool.name === "log_foods");
   assert.ok(logFoodsTool?.inputSchema?.properties?.items?.items?.properties?.portion, "log_foods items must expose whole-package portions");
+  const logFoodPlanTool = listedTools.tools.find((tool) => tool.name === "log_food_plan");
+  assert.ok(logFoodPlanTool?.inputSchema?.required?.includes("items"));
+  assert.ok(logFoodPlanTool?.inputSchema?.properties?.items?.items?.required?.includes("date"));
+  assert.ok(logFoodPlanTool?.inputSchema?.properties?.items?.items?.required?.includes("meal"));
+  assert.equal(logFoodPlanTool?.annotations?.idempotentHint, true);
   const operationTool = listedTools.tools.find((tool) => tool.name === "get_cronometer_operation");
   assert.ok(operationTool?.inputSchema?.required?.includes("operationId"));
   const deleteDiaryTool = listedTools.tools.find((tool) => tool.name === "delete_diary_food_entry");
   assert.ok(deleteDiaryTool?.inputSchema?.properties?.deleteCount);
+  const deleteDiaryEntriesTool = listedTools.tools.find((tool) => tool.name === "delete_diary_food_entries");
+  assert.equal(deleteDiaryEntriesTool?.annotations?.destructiveHint, true);
+  assert.ok(deleteDiaryEntriesTool?.inputSchema?.properties?.items?.items?.required?.includes("confirmName"));
   const createCustomFoodTool = listedTools.tools.find((tool) => tool.name === "create_custom_food");
   const createAndLogTool = listedTools.tools.find((tool) => tool.name === "create_and_log_custom_food");
   assert.ok(createCustomFoodTool?.inputSchema?.required?.includes("nutrients"));
@@ -183,6 +198,95 @@ try {
   assert.equal(recipePreview.structuredContent?.data?.writeAttempted, false);
   await recipePreviewClient.close();
   await recipePreviewServer.close();
+
+  class MultiDayPlanProvider extends MockCronometerProvider {
+    constructor() {
+      super();
+      this.foodGroups = [];
+      this.deletes = [];
+    }
+
+    async logFoods(input) {
+      this.foodGroups.push(input);
+      return { provider: "multi-day-test", mode: "mock", feature: "log_foods", status: "written", data: { count: input.items.length } };
+    }
+
+    async deleteDiaryFoodEntry(input) {
+      this.deletes.push(input);
+      return { provider: "multi-day-test", mode: "mock", feature: "delete_diary_food_entry", status: "ok", data: { deleted: true } };
+    }
+  }
+
+  const multiDayProvider = new MultiDayPlanProvider();
+  const multiDayServer = createCronoServer({ grantedScopes: ["cronometer:read", "cronometer:write"], provider: multiDayProvider });
+  const multiDayClient = new Client({ name: "cronogpt-multi-day-test", version: "1.0.0" });
+  const [multiDayClientTransport, multiDayServerTransport] = InMemoryTransport.createLinkedPair();
+  await multiDayServer.connect(multiDayServerTransport);
+  await multiDayClient.connect(multiDayClientTransport);
+  const foodPlan = await multiDayClient.callTool({
+    name: "log_food_plan",
+    arguments: {
+      idempotencyKey: "test-plan",
+      confirmed: true,
+      items: [
+        { date: "2026-07-16", meal: "Breakfast", query: "Banana", amount: 100, unit: "g" },
+        { date: "2026-07-17", meal: "Lunch", query: "Milk", amount: 200, unit: "g" },
+        { date: "2026-07-16", meal: "Breakfast", query: "Cocoa", amount: 20, unit: "g" },
+      ],
+    },
+  });
+  assert.equal(foodPlan.structuredContent?.status, "written");
+  assert.equal(foodPlan.structuredContent?.data?.completed, true);
+  assert.equal(multiDayProvider.foodGroups.length, 2);
+  assert.deepEqual(multiDayProvider.foodGroups.map((group) => [group.date, group.meal, group.items.length]), [
+    ["2026-07-16", "Breakfast", 2],
+    ["2026-07-17", "Lunch", 1],
+  ]);
+  assert.equal(multiDayProvider.foodGroups[0].idempotencyKey, "test-plan:group:0");
+  assert.equal(multiDayProvider.foodGroups[0].items[1].idempotencyKey, "test-plan:item:2");
+
+  multiDayProvider.logFoods = async (input) => {
+    multiDayProvider.foodGroups.push(input);
+    return {
+      provider: "multi-day-test",
+      mode: "mock",
+      feature: "log_foods",
+      status: "needs_manual_step",
+      data: { attemptedCount: 1, writeAttempted: false },
+    };
+  };
+  const partialFoodPlan = await multiDayClient.callTool({
+    name: "log_food_plan",
+    arguments: {
+      idempotencyKey: "partial-plan",
+      confirmed: true,
+      items: [
+        { date: "2026-07-16", meal: "Breakfast", query: "One", amount: 1, unit: "g" },
+        { date: "2026-07-16", meal: "Breakfast", query: "Two", amount: 2, unit: "g" },
+        { date: "2026-07-17", meal: "Lunch", query: "Three", amount: 3, unit: "g" },
+      ],
+    },
+  });
+  assert.equal(partialFoodPlan.structuredContent?.status, "needs_manual_step");
+  assert.equal(partialFoodPlan.structuredContent?.data?.attemptedCount, 1);
+  assert.deepEqual(partialFoodPlan.structuredContent?.data?.remainingItemIndices, [1, 2]);
+
+  const deletePlan = await multiDayClient.callTool({
+    name: "delete_diary_food_entries",
+    arguments: {
+      confirmed: true,
+      items: [
+        { date: "2026-07-16", meal: "Breakfast", name: "Banana", confirmName: "Banana", amount: 100, unit: "g" },
+        { date: "2026-07-17", meal: "Lunch", name: "Milk", confirmName: "Milk", amount: 200, unit: "g" },
+      ],
+    },
+  });
+  assert.equal(deletePlan.structuredContent?.status, "ok");
+  assert.equal(deletePlan.structuredContent?.data?.completed, true);
+  assert.equal(multiDayProvider.deletes.length, 2);
+  assert.equal(multiDayProvider.deletes[0].dryRun, false);
+  await multiDayClient.close();
+  await multiDayServer.close();
 
   class RecipeWorkflowProvider extends MockCronometerProvider {
     constructor(recipes) {
