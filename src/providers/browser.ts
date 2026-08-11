@@ -244,10 +244,12 @@ let lastLoginFailure: string | undefined;
 let browserQueue: Promise<void> = Promise.resolve();
 let activeBrowserJobs = 0;
 let queuedBrowserJobs = 0;
+export const MAX_QUEUED_BROWSER_JOBS = 8;
 let browserJobSeq = 0;
 let browserQueueEpoch = 0;
 let activeBrowserJob: { id: number; feature: string; startedAt: number; staleJobMs?: number } | undefined;
 const queuedBrowserJobEntries = new Map<number, { feature: string; enqueuedAt: number }>();
+const admittedBrowserQueueEntries = new Set<number>();
 let backgroundBrowserJobSeq = 0;
 const backgroundBrowserJobs = new Map<string, BackgroundBrowserJob>();
 const backgroundBrowserJobKeys = new Map<string, string>();
@@ -3627,7 +3629,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     ).catch((error) => {
       const message = error instanceof Error ? error.message : "Browser automation job failed before starting.";
       const queue = releaseAndSnapshotBrowserQueue(operationTimeoutMs + queueWaitMs);
-      if (/Timed out waiting .* browser queue/i.test(message)) {
+      if (/Timed out waiting .* browser queue|browser queue capacity/i.test(message)) {
         return this.browserBusyResult(feature, queue, operationTimeoutMs, message);
       }
       return this.result(feature, "error", {
@@ -4304,8 +4306,12 @@ async function enqueueBrowserJob<T>(
   options: { feature: string; maxQueueWaitMs: number; staleJobMs?: number },
 ): Promise<T> {
   releaseAndSnapshotBrowserQueue(options.staleJobMs);
+  if (admittedBrowserQueueEntries.size >= MAX_QUEUED_BROWSER_JOBS) {
+    throw new Error(`Cronometer browser queue capacity of ${MAX_QUEUED_BROWSER_JOBS} waiting jobs has been reached. Try again after an active job finishes.`);
+  }
   const epoch = browserQueueEpoch;
   const id = ++browserJobSeq;
+  admittedBrowserQueueEntries.add(id);
   const enqueuedAt = Date.now();
   let started = false;
   let canceled = false;
@@ -4319,6 +4325,9 @@ async function enqueueBrowserJob<T>(
     queuedBrowserJobs = Math.max(0, queuedBrowserJobs - 1);
     queuedBrowserJobEntries.delete(id);
   };
+  const releaseAdmission = () => {
+    admittedBrowserQueueEntries.delete(id);
+  };
 
   const result = new Promise<T>((resolve, reject) => {
     const queueTimer = setTimeout(() => {
@@ -4331,6 +4340,7 @@ async function enqueueBrowserJob<T>(
     browserQueue = browserQueue
       .catch(() => undefined)
       .then(async () => {
+        releaseAdmission();
         if (canceled) return;
         if (epoch !== browserQueueEpoch) {
           clearTimeout(queueTimer);
@@ -4368,6 +4378,7 @@ export function releaseAndSnapshotBrowserQueue(staleJobMs = 240000, now = Date.n
   return {
     activeBrowserJobs,
     queuedBrowserJobs,
+    admittedBrowserQueueEntries: admittedBrowserQueueEntries.size,
     activeBrowserJob: activeBrowserJob
       ? {
         ...activeBrowserJob,
@@ -4390,6 +4401,7 @@ export function __resetBrowserQueueForTests() {
   queuedBrowserJobs = 0;
   activeBrowserJob = undefined;
   queuedBrowserJobEntries.clear();
+  admittedBrowserQueueEntries.clear();
 }
 
 export function __runBrowserQueueJobForTests<T>(

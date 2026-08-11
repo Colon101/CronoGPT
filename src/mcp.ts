@@ -31,9 +31,13 @@ import {
   handleOAuthRequest,
   rejectUnauthorized,
 } from "./oauth.js";
+import { applyCorsResponseHeaders, validateRequestAuthority } from "./http-security.js";
 
 const widgetHtml = readFileSync(join(process.cwd(), "public/cronometer-widget.html"), "utf8");
 const widgetUri = "ui://widget/cronometer-dashboard.html";
+export const MAX_MCP_REQUEST_BODY_BYTES = 256 * 1024;
+export const MAX_CONCURRENT_MCP_REQUESTS = 16;
+let activeMcpRequests = 0;
 
 const defaultProvider = createProviderFromEnv();
 
@@ -1827,12 +1831,16 @@ function aggregateOrchestratedStatus(
 }
 
 export async function handleMcpHttpRequest(req: IncomingMessage, res: ServerResponse) {
-  if (!req.url) {
-    res.writeHead(400).end("Missing URL");
+  const authority = validateRequestAuthority(req);
+  if (!authority.ok) {
+    req.resume();
+    res.writeHead(authority.status, { "content-type": "application/json; charset=utf-8" })
+      .end(JSON.stringify({ error: "invalid_request_authority", message: authority.message }));
     return;
   }
+  applyCorsResponseHeaders(req, res);
 
-  const url = new URL(req.url, `http://${req.headers.host ?? "localhost"}`);
+  const url = new URL(req.url!, `http://${req.headers.host ?? "localhost"}`);
 
   if (await handleOAuthRequest(req, res, url)) {
     return;
@@ -1840,7 +1848,6 @@ export async function handleMcpHttpRequest(req: IncomingMessage, res: ServerResp
 
   if (req.method === "OPTIONS" && url.pathname === MCP_PATH) {
     res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "POST, GET, DELETE, OPTIONS",
       "Access-Control-Allow-Headers": "authorization, content-type, mcp-session-id",
       "Access-Control-Expose-Headers": "Mcp-Session-Id",
@@ -1871,7 +1878,6 @@ export async function handleMcpHttpRequest(req: IncomingMessage, res: ServerResp
 
   const MCP_METHODS = new Set(["POST", "GET", "DELETE"]);
   if (url.pathname === MCP_PATH && req.method && MCP_METHODS.has(req.method)) {
-    res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Headers", "authorization, content-type, mcp-session-id");
     res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
 
@@ -1880,6 +1886,21 @@ export async function handleMcpHttpRequest(req: IncomingMessage, res: ServerResp
       rejectUnauthorized(req, res, auth.reason ?? "Unauthorized.");
       return;
     }
+
+    const releaseRequestSlot = acquireMcpRequestSlot();
+    if (!releaseRequestSlot) {
+      req.resume();
+      res.writeHead(503, {
+        "content-type": "application/json; charset=utf-8",
+        "Retry-After": "1",
+      }).end(JSON.stringify({
+        error: "server_busy",
+        message: `At most ${MAX_CONCURRENT_MCP_REQUESTS} MCP requests may run concurrently.`,
+      }));
+      return;
+    }
+    res.once("finish", releaseRequestSlot);
+    res.once("close", releaseRequestSlot);
 
     const server = createCronoServer({ grantedScopes: auth.scopes });
     const transport = new StreamableHTTPServerTransport({
@@ -1893,13 +1914,23 @@ export async function handleMcpHttpRequest(req: IncomingMessage, res: ServerResp
     });
 
     try {
+      let parsedBody: unknown;
+      if (req.method === "POST") {
+        const body = await readBoundedMcpJsonBody(req, res);
+        if (!body.ok) return;
+        parsedBody = body.value;
+      }
       await server.connect(transport);
-      await transport.handleRequest(req, res);
+      await transport.handleRequest(req, res, parsedBody);
     } catch (error) {
       console.error("Error handling MCP request:", error);
       if (!res.headersSent) {
         res.writeHead(500).end("Internal server error");
+      } else if (!res.writableEnded) {
+        res.end();
       }
+    } finally {
+      if (res.writableEnded || res.destroyed) releaseRequestSlot();
     }
     return;
   }
@@ -1908,5 +1939,110 @@ export async function handleMcpHttpRequest(req: IncomingMessage, res: ServerResp
 }
 
 export function createCronoHttpServer() {
-  return createServer(handleMcpHttpRequest);
+  const server = createServer(handleMcpHttpRequest);
+  server.requestTimeout = 30_000;
+  server.headersTimeout = 15_000;
+  return server;
+}
+
+function acquireMcpRequestSlot() {
+  if (activeMcpRequests >= MAX_CONCURRENT_MCP_REQUESTS) return undefined;
+  activeMcpRequests += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    activeMcpRequests = Math.max(0, activeMcpRequests - 1);
+  };
+}
+
+async function readBoundedMcpJsonBody(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<{ ok: true; value: unknown } | { ok: false }> {
+  const rawContentLength = headerValue(req.headers["content-length"]);
+  if (rawContentLength !== undefined) {
+    if (!/^\d+$/.test(rawContentLength)) {
+      req.resume();
+      writeMcpInputError(res, 400, "invalid_content_length", "Content-Length must be a non-negative integer.");
+      return { ok: false };
+    }
+    const contentLength = Number(rawContentLength);
+    if (!Number.isSafeInteger(contentLength) || contentLength > MAX_MCP_REQUEST_BODY_BYTES) {
+      req.resume();
+      writeMcpInputError(res, 413, "request_too_large", `MCP request body exceeds ${MAX_MCP_REQUEST_BODY_BYTES} bytes.`);
+      return { ok: false };
+    }
+  }
+
+  return new Promise((resolve, reject) => {
+    const buffer = Buffer.allocUnsafe(MAX_MCP_REQUEST_BODY_BYTES);
+    let size = 0;
+    let settled = false;
+
+    const cleanup = () => {
+      req.off("data", onData);
+      req.off("end", onEnd);
+      req.off("error", onError);
+      req.off("aborted", onAborted);
+    };
+    const finish = (result: { ok: true; value: unknown } | { ok: false }) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
+    const onData = (chunk: Buffer | string) => {
+      const chunkBuffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const nextSize = size + chunkBuffer.length;
+      if (nextSize > MAX_MCP_REQUEST_BODY_BYTES) {
+        cleanup();
+        req.resume();
+        writeMcpInputError(res, 413, "request_too_large", `MCP request body exceeds ${MAX_MCP_REQUEST_BODY_BYTES} bytes.`);
+        finish({ ok: false });
+        return;
+      }
+      chunkBuffer.copy(buffer, size);
+      size = nextSize;
+    };
+    const onEnd = () => {
+      try {
+        const body = buffer.subarray(0, size).toString("utf8");
+        finish({ ok: true, value: JSON.parse(body) });
+      } catch {
+        writeMcpInputError(res, 400, "parse_error", "MCP request body must contain valid JSON.");
+        finish({ ok: false });
+      }
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onAborted = () => {
+      cleanup();
+      reject(new Error("MCP request body was aborted."));
+    };
+
+    req.on("data", onData);
+    req.once("end", onEnd);
+    req.once("error", onError);
+    req.once("aborted", onAborted);
+  });
+}
+
+function writeMcpInputError(res: ServerResponse, status: number, error: string, message: string) {
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8" })
+    .end(JSON.stringify({ error, message }));
+}
+
+function headerValue(value: string | string[] | undefined) {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+export function __acquireMcpRequestSlotForTests() {
+  return acquireMcpRequestSlot();
+}
+
+export function __resetMcpConcurrencyForTests() {
+  activeMcpRequests = 0;
 }

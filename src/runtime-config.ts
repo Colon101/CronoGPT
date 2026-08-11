@@ -1,4 +1,13 @@
+import { parseConfiguredAllowedOrigins } from "./http-security.js";
+
 type Environment = Record<string, string | undefined>;
+
+export function isInsecureDevNoAuthAllowed(env: Environment = process.env) {
+  return env.NODE_ENV?.trim() !== "production"
+    && env.CRONOGPT_INSECURE_DEV_ALLOW_NO_AUTH?.trim() === "true"
+    && env.CRONOMETER_BACKEND?.trim() === "mock"
+    && env.CRONOMETER_ENABLE_WRITES?.trim() === "false";
+}
 
 export function validateRuntimeConfiguration(env: Environment = process.env) {
   const issues: string[] = [];
@@ -23,6 +32,11 @@ export function validateRuntimeConfiguration(env: Environment = process.env) {
     issues.push("APP_PUBLIC_ORIGIN is required in production so OAuth does not trust caller-controlled forwarding headers.");
   }
 
+  const configuredAllowedOrigins = parseConfiguredAllowedOrigins(env.CRONOGPT_ALLOWED_ORIGINS);
+  if (configuredAllowedOrigins.invalid.length > 0) {
+    issues.push(`CRONOGPT_ALLOWED_ORIGINS entries must each be a bare HTTP(S) origin; invalid: ${configuredAllowedOrigins.invalid.join(", ")}.`);
+  }
+
   const apiToken = env.CRONOGPT_API_TOKEN?.trim();
   const linkSecret = env.CRONOGPT_LINK_SECRET?.trim();
   if (production && (!apiToken || apiToken.length < 32)) {
@@ -39,6 +53,22 @@ export function validateRuntimeConfiguration(env: Environment = process.env) {
     issues.push("CRONOGPT_OAUTH_STATE_FILE must be an absolute persistent path in production.");
   }
 
+  const insecureDevNoAuth = env.CRONOGPT_INSECURE_DEV_ALLOW_NO_AUTH?.trim();
+  if (insecureDevNoAuth && !["true", "false"].includes(insecureDevNoAuth)) {
+    issues.push('CRONOGPT_INSECURE_DEV_ALLOW_NO_AUTH must be either "true" or "false".');
+  }
+  if (insecureDevNoAuth === "true") {
+    if (production) {
+      issues.push("CRONOGPT_INSECURE_DEV_ALLOW_NO_AUTH cannot be enabled in production.");
+    }
+    if (env.CRONOMETER_BACKEND?.trim() !== "mock") {
+      issues.push("CRONOGPT_INSECURE_DEV_ALLOW_NO_AUTH requires CRONOMETER_BACKEND=mock.");
+    }
+    if (env.CRONOMETER_ENABLE_WRITES?.trim() !== "false") {
+      issues.push("CRONOGPT_INSECURE_DEV_ALLOW_NO_AUTH requires CRONOMETER_ENABLE_WRITES=false.");
+    }
+  }
+
   if (issues.length > 0) {
     throw new Error(`Invalid cronogpt runtime configuration: ${issues.join(" ")}`);
   }
@@ -48,5 +78,7 @@ export function validateRuntimeConfiguration(env: Environment = process.env) {
     authConfigured: Boolean(apiToken),
     separateLinkSecretConfigured: Boolean(linkSecret && linkSecret !== apiToken),
     oauthStateFile,
+    allowedOrigins: configuredAllowedOrigins.origins,
+    insecureDevNoAuth: isInsecureDevNoAuthAllowed(env),
   };
 }
