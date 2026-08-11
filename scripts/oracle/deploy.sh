@@ -4,14 +4,24 @@ set -euo pipefail
 ORACLE_USER="${ORACLE_USER:-ubuntu}"
 : "${ORACLE_HOST:?Set ORACLE_HOST to the Oracle VM public IP or hostname.}"
 : "${ORACLE_DOMAIN:?Set ORACLE_DOMAIN, for example cronogpt.203-0-113-10.sslip.io.}"
+: "${ORACLE_SSH_KNOWN_HOSTS:?Set ORACLE_SSH_KNOWN_HOSTS to an independently verified known_hosts file for ORACLE_HOST.}"
+if [[ ! -r "$ORACLE_SSH_KNOWN_HOSTS" ]]; then
+  echo "ORACLE_SSH_KNOWN_HOSTS is not a readable file: $ORACLE_SSH_KNOWN_HOSTS" >&2
+  exit 1
+fi
 
 SSH_TARGET="${ORACLE_USER}@${ORACLE_HOST}"
-SSH_ARGS=()
-RSYNC_SSH="ssh"
+SSH_ARGS=(
+  -o BatchMode=yes
+  -o StrictHostKeyChecking=yes
+  -o GlobalKnownHostsFile=/dev/null
+  -o "UserKnownHostsFile=$ORACLE_SSH_KNOWN_HOSTS"
+)
 if [[ -n "${ORACLE_SSH_KEY:-}" ]]; then
-  SSH_ARGS=(-i "$ORACLE_SSH_KEY")
-  RSYNC_SSH="ssh -i $ORACLE_SSH_KEY"
+  SSH_ARGS+=(-i "$ORACLE_SSH_KEY")
 fi
+printf -v RSYNC_SSH '%q ' ssh "${SSH_ARGS[@]}"
+RSYNC_SSH="${RSYNC_SSH% }"
 
 sync_app_source() {
   if command -v rsync >/dev/null 2>&1; then
@@ -99,6 +109,7 @@ sync_app_source
 ssh "${SSH_ARGS[@]}" "$SSH_TARGET" "cat > /opt/cronogpt/config/oracle.env" <<EOF_REMOTE_CONFIG
 CRONOGPT_DOMAIN=${ORACLE_DOMAIN}
 APP_PUBLIC_ORIGIN=https://${ORACLE_DOMAIN}
+CRONOGPT_ALLOWED_ORIGINS=https://chatgpt.com,https://chat.openai.com
 CRONOGPT_OAUTH_STATE_FILE=/opt/cronogpt/state/oauth-state.json
 CRONOMETER_BACKEND=browser
 CRONOMETER_ENABLE_WRITES=true

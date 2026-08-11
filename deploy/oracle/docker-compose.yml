@@ -16,7 +16,7 @@ services:
     expose:
       - "8787"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "require('node:http').get({host:'127.0.0.1',port:8787,path:'/',headers:{host:process.env.CRONOGPT_DOMAIN}},r=>{if(r.statusCode!==200)process.exit(1);r.resume()}).on('error',()=>process.exit(1))"]
       interval: 30s
       timeout: 10s
       retries: 5

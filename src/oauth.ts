@@ -2,6 +2,7 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypt
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { dirname } from "node:path";
+import { isInsecureDevNoAuthAllowed } from "./runtime-config.js";
 
 const AUTH_REALM = "cronogpt MCP";
 const MCP_PATH = "/mcp";
@@ -66,11 +67,13 @@ export function isLocalRequest(req: IncomingMessage) {
 export function authorizeMcpRequest(req: IncomingMessage) {
   const token = getAuthToken();
   if (!token) {
-    const ok = process.env.NODE_ENV !== "production" && isLocalRequest(req);
+    const ok = isInsecureDevNoAuthAllowed() && isLocalRequest(req);
     return {
       ok,
       scopes: ok ? [...SCOPES] : [],
-      reason: ok ? undefined : "CRONOGPT_API_TOKEN is not configured.",
+      reason: ok
+        ? undefined
+        : "CRONOGPT_API_TOKEN is not configured. Authentication-free access requires the explicit mock-only CRONOGPT_INSECURE_DEV_ALLOW_NO_AUTH opt-in.",
     };
   }
 
@@ -103,11 +106,11 @@ export function authorizeMcpRequest(req: IncomingMessage) {
 }
 
 export function rejectUnauthorized(req: IncomingMessage, res: ServerResponse, reason: string) {
+  req.resume();
   const metadataUrl = `${publicOrigin(req)}/.well-known/oauth-protected-resource`;
   res.writeHead(401, {
     "content-type": "application/json",
     "WWW-Authenticate": `Bearer realm="${AUTH_REALM}", resource_metadata="${metadataUrl}", scope="${SCOPES.join(" ")}"`,
-    "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "authorization, content-type, mcp-session-id",
   });
   res.end(JSON.stringify({ error: "unauthorized", message: reason }));
@@ -116,7 +119,6 @@ export function rejectUnauthorized(req: IncomingMessage, res: ServerResponse, re
 export async function handleOAuthRequest(req: IncomingMessage, res: ServerResponse, url: URL) {
   if (req.method === "OPTIONS" && isOAuthPath(url.pathname)) {
     res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "authorization, content-type",
     });
@@ -697,7 +699,6 @@ function parseJsonParams(body: string) {
 function writeJson(res: ServerResponse, data: unknown, status = 200, headers: Record<string, string> = {}) {
   res.writeHead(status, {
     "content-type": "application/json",
-    "Access-Control-Allow-Origin": "*",
     ...headers,
   });
   res.end(JSON.stringify(data));

@@ -7,6 +7,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import {
   BrowserCronometerProvider,
+  MAX_QUEUED_BROWSER_JOBS,
   __resetBrowserQueueForTests,
   __runBrowserQueueJobForTests,
   __setActiveBrowserJobForTests,
@@ -620,6 +621,66 @@ try {
   releaseFirst();
   assert.deepEqual(await Promise.all([first, second]), ["first", "second"]);
   assert.deepEqual(starts, ["first", "second"]);
+  __resetBrowserQueueForTests();
+
+  let signalCapacityFirstStarted;
+  let releaseCapacityFirst;
+  const capacityFirstStarted = new Promise((resolve) => {
+    signalCapacityFirstStarted = resolve;
+  });
+  const capacityFirstCanFinish = new Promise((resolve) => {
+    releaseCapacityFirst = resolve;
+  });
+  const capacityFirst = __runBrowserQueueJobForTests("capacity-first", async () => {
+    signalCapacityFirstStarted();
+    await capacityFirstCanFinish;
+    return "capacity-first";
+  }, { maxQueueWaitMs: 10_000 });
+  await capacityFirstStarted;
+  const capacityQueued = Array.from({ length: MAX_QUEUED_BROWSER_JOBS }, (_value, index) => (
+    __runBrowserQueueJobForTests(`capacity-queued-${index}`, async () => `capacity-queued-${index}`, { maxQueueWaitMs: 10_000 })
+  ));
+  queue = releaseAndSnapshotBrowserQueue(1000);
+  assert.equal(queue.queuedBrowserJobs, MAX_QUEUED_BROWSER_JOBS);
+  await assert.rejects(
+    __runBrowserQueueJobForTests("capacity-rejected", async () => "must-not-run"),
+    /browser queue capacity/i,
+  );
+  releaseCapacityFirst();
+  assert.equal(await capacityFirst, "capacity-first");
+  assert.equal((await Promise.all(capacityQueued)).length, MAX_QUEUED_BROWSER_JOBS);
+  __resetBrowserQueueForTests();
+
+  let signalTimeoutCapacityFirstStarted;
+  let releaseTimeoutCapacityFirst;
+  const timeoutCapacityFirstStarted = new Promise((resolve) => {
+    signalTimeoutCapacityFirstStarted = resolve;
+  });
+  const timeoutCapacityFirstCanFinish = new Promise((resolve) => {
+    releaseTimeoutCapacityFirst = resolve;
+  });
+  const timeoutCapacityFirst = __runBrowserQueueJobForTests("timeout-capacity-first", async () => {
+    signalTimeoutCapacityFirstStarted();
+    await timeoutCapacityFirstCanFinish;
+    return "timeout-capacity-first";
+  }, { maxQueueWaitMs: 1000 });
+  await timeoutCapacityFirstStarted;
+  const timeoutCapacityQueued = Array.from({ length: MAX_QUEUED_BROWSER_JOBS }, (_value, index) => (
+    __runBrowserQueueJobForTests(`timeout-capacity-queued-${index}`, async () => "must-not-run", { maxQueueWaitMs: 10 })
+  ));
+  await Promise.all(timeoutCapacityQueued.map((job) => assert.rejects(job, /Timed out waiting/)));
+  queue = releaseAndSnapshotBrowserQueue(1000);
+  assert.equal(queue.queuedBrowserJobs, 0);
+  assert.equal(queue.admittedBrowserQueueEntries, MAX_QUEUED_BROWSER_JOBS);
+  await assert.rejects(
+    __runBrowserQueueJobForTests("timeout-capacity-rejected", async () => "must-not-run"),
+    /browser queue capacity/i,
+  );
+  releaseTimeoutCapacityFirst();
+  assert.equal(await timeoutCapacityFirst, "timeout-capacity-first");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(releaseAndSnapshotBrowserQueue(1000).admittedBrowserQueueEntries, 0);
+  assert.equal(await __runBrowserQueueJobForTests("timeout-capacity-recovered", async () => "recovered"), "recovered");
   __resetBrowserQueueForTests();
 
   let releaseResetFirst;

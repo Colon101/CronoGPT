@@ -28,6 +28,8 @@ ChatGPT connects to an Apps SDK app by calling an HTTPS MCP endpoint, usually `/
 ```bash
 npm ci
 npm run build
+cp .env.example .env
+# Set CRONOGPT_API_TOKEN in .env to a strong random value.
 npm start
 ```
 
@@ -37,17 +39,37 @@ The local MCP endpoint is:
 http://localhost:8787/mcp
 ```
 
-Use the inspector while developing:
+Even loopback clients must authenticate. Use the API token as a bearer credential
+or complete the OAuth flow when using the inspector:
 
 ```bash
 npm run inspect
 ```
 
-To connect from ChatGPT, expose the server over HTTPS with a tunnel, then create a connector in ChatGPT developer mode using:
+For mock-only local inspection without authentication, explicitly set all three
+of the following. Startup rejects this mode for a real provider, enabled writes,
+or production:
+
+```text
+CRONOGPT_INSECURE_DEV_ALLOW_NO_AUTH=true
+CRONOMETER_BACKEND=mock
+CRONOMETER_ENABLE_WRITES=false
+```
+
+Never expose that insecure mode through a tunnel. To connect from ChatGPT, first
+set a strong `CRONOGPT_API_TOKEN`, set `APP_PUBLIC_ORIGIN` to the exact HTTPS
+tunnel origin, keep `CRONOGPT_INSECURE_DEV_ALLOW_NO_AUTH=false`, and then create
+a connector in ChatGPT developer mode using:
 
 ```text
 https://your-tunnel.example/mcp
 ```
+
+`Host` and browser `Origin` values are checked against exact configured origins.
+Add only required browser origins to `CRONOGPT_ALLOWED_ORIGINS`; native MCP
+clients normally omit `Origin`. MCP POST bodies are capped at 256 KiB, the
+server admits at most 16 concurrent MCP requests, and at most eight browser jobs
+may wait in the serialized queue.
 
 ## Oracle Always Free setup
 
@@ -70,8 +92,14 @@ export ORACLE_HOST=129.159.156.186
 export ORACLE_DOMAIN=cronogpt.129-159-156-186.sslip.io
 export ORACLE_USER=ubuntu
 export ORACLE_SSH_KEY=/home/kfir/.ssh/cronogpt_oracle_ed25519
+export ORACLE_SSH_KNOWN_HOSTS=/home/kfir/.ssh/cronogpt_oracle_known_hosts
 npm run oracle:deploy
 ```
+
+The known-hosts file must contain the Oracle host key obtained through the
+Oracle console or another independently authenticated channel; do not populate
+it with `ssh-keyscan` over the same network used for deployment. The deploy
+script enforces strict host-key verification for SSH and rsync.
 
 The deploy script writes non-secret config to `/opt/cronogpt/config/oracle.env` and secrets to `/opt/cronogpt/secrets/cronogpt.env` with mode `0600`. It generates fresh `CRONOGPT_API_TOKEN` and `CRONOGPT_LINK_SECRET` when they are not exported locally.
 
@@ -79,6 +107,7 @@ Hosted browser config:
 
 ```text
 APP_PUBLIC_ORIGIN=https://cronogpt.129-159-156-186.sslip.io
+CRONOGPT_ALLOWED_ORIGINS=https://chatgpt.com,https://chat.openai.com
 CRONOGPT_API_TOKEN=generate-a-long-random-token
 CRONOGPT_LINK_SECRET=optional-separate-chatgpt-link-code
 CRONOGPT_OAUTH_STATE_FILE=/opt/cronogpt/state/oauth-state.json

@@ -12,7 +12,7 @@
     "dev": "tsx src/server.ts",
     "start": "node dist/server.js",
     "test": "npm run build && npm run test:compiled",
-    "test:compiled": "node scripts/test-food-logic.mjs && node scripts/test-runtime-safety.mjs && node scripts/test-determinism.mjs && node scripts/test-oauth.mjs && node scripts/test-food-editor-dom.mjs",
+    "test:compiled": "node scripts/test-food-logic.mjs && node scripts/test-runtime-safety.mjs && node scripts/test-determinism.mjs && node scripts/test-oauth.mjs && node scripts/test-http-security.mjs && node scripts/test-deploy-security.mjs && node scripts/test-food-editor-dom.mjs",
     "test:food-editor-dom": "npm run build && node scripts/test-food-editor-dom.mjs",
     "test:food-logic": "npm run build && node scripts/test-food-logic.mjs",
     "test:runtime-safety": "npm run build && node scripts/test-runtime-safety.mjs",

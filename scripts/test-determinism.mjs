@@ -115,6 +115,35 @@ assert.throws(() => validateRuntimeConfiguration({
   CRONOGPT_LINK_SECRET: "b".repeat(64),
   CRONOGPT_OAUTH_STATE_FILE: "/var/lib/cronogpt/oauth-state.json",
 }), /bare HTTP\(S\) origin/);
+assert.throws(() => validateRuntimeConfiguration({
+  CRONOGPT_INSECURE_DEV_ALLOW_NO_AUTH: "true",
+  CRONOMETER_BACKEND: "browser",
+  CRONOMETER_ENABLE_WRITES: "false",
+}), /requires CRONOMETER_BACKEND=mock/);
+assert.throws(() => validateRuntimeConfiguration({
+  CRONOGPT_INSECURE_DEV_ALLOW_NO_AUTH: "true",
+  CRONOMETER_BACKEND: "mock",
+  CRONOMETER_ENABLE_WRITES: "true",
+}), /requires CRONOMETER_ENABLE_WRITES=false/);
+assert.throws(() => validateRuntimeConfiguration({
+  NODE_ENV: "production",
+  APP_PUBLIC_ORIGIN: "https://cronogpt.example.com",
+  CRONOGPT_API_TOKEN: "a".repeat(64),
+  CRONOGPT_LINK_SECRET: "b".repeat(64),
+  CRONOGPT_OAUTH_STATE_FILE: "/var/lib/cronogpt/oauth-state.json",
+  CRONOGPT_INSECURE_DEV_ALLOW_NO_AUTH: "true",
+  CRONOMETER_BACKEND: "mock",
+  CRONOMETER_ENABLE_WRITES: "false",
+}), /cannot be enabled in production/);
+assert.throws(() => validateRuntimeConfiguration({
+  CRONOGPT_ALLOWED_ORIGINS: "https://chatgpt.com/path",
+}), /ALLOWED_ORIGINS.*bare HTTP\(S\) origin/);
+assert.doesNotThrow(() => validateRuntimeConfiguration({
+  CRONOGPT_INSECURE_DEV_ALLOW_NO_AUTH: "true",
+  CRONOMETER_BACKEND: "mock",
+  CRONOMETER_ENABLE_WRITES: "false",
+  CRONOGPT_ALLOWED_ORIGINS: "http://localhost:6274, https://chatgpt.com",
+}));
 assert.throws(
   () => createProviderFromEnv({ CRONOMETER_BACKEND: "terra" }),
   /requires TERRA_API_KEY/,

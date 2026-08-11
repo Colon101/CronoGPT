@@ -34,9 +34,17 @@ deploys the exact pushed commit to the Oracle VM with
 `npm run oracle:deploy`, then runs `npm run smoke:oracle` against the public
 Oracle URL.
 
-Required GitHub Actions secret:
+Required GitHub Actions secrets:
 
 - `ORACLE_SSH_PRIVATE_KEY`: private key for `ubuntu@129.159.156.186`.
+- `ORACLE_SSH_HOST_KEY`: a complete known_hosts entry for the reserved IP,
+  obtained through the Oracle console or another independently authenticated
+  channel (for example `129.159.156.186 ssh-ed25519 AAAA...`).
+
+Never generate `ORACLE_SSH_HOST_KEY` with `ssh-keyscan` in the workflow or
+over the same untrusted path used for deployment. The workflow validates its
+format, and every SSH/rsync call uses `StrictHostKeyChecking=yes` with only
+that pinned known_hosts file.
 
 Optional GitHub Actions secrets:
 
@@ -61,7 +69,8 @@ High-level flow:
 
 1. Create the VM and reserved public IP in Oracle Cloud.
 2. SSH to the VM and run `scripts/oracle/bootstrap-host.sh`.
-3. From this repo, export `ORACLE_HOST`, `ORACLE_DOMAIN`, and optionally `ORACLE_USER`/`ORACLE_SSH_KEY`.
+3. From this repo, export `ORACLE_HOST`, `ORACLE_DOMAIN`,
+   `ORACLE_SSH_KNOWN_HOSTS`, and optionally `ORACLE_USER`/`ORACLE_SSH_KEY`.
 4. Run `npm run oracle:deploy`; it waits for the app container to become healthy and runs the production smoke unless `ORACLE_SKIP_SMOKE=true` is explicitly set.
 5. Optionally rerun `npm run smoke:oracle` for an independent read-only check.
 6. Reconnect ChatGPT to the Oracle `/mcp` URL.
@@ -74,7 +83,14 @@ export ORACLE_HOST=129.159.156.186
 export ORACLE_DOMAIN=cronogpt.129-159-156-186.sslip.io
 export ORACLE_USER=ubuntu
 export ORACLE_SSH_KEY=/home/kfir/.ssh/cronogpt_oracle_ed25519
+export ORACLE_SSH_KNOWN_HOSTS=/home/kfir/.ssh/cronogpt_oracle_known_hosts
 ```
+
+Create `cronogpt_oracle_known_hosts` from the host's
+`/etc/ssh/ssh_host_ed25519_key.pub` as viewed through the trusted Oracle
+console, prefixed with the reserved IP. Verify the displayed fingerprint
+out-of-band before the first deploy and whenever the host key is intentionally
+rotated.
 
 Quick health check:
 

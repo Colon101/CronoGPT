@@ -63,10 +63,11 @@ jobs:
       - name: Validate required secrets
         env:
           ORACLE_SSH_PRIVATE_KEY: ${{ secrets.ORACLE_SSH_PRIVATE_KEY }}
+          ORACLE_SSH_HOST_KEY: ${{ secrets.ORACLE_SSH_HOST_KEY }}
         run: |
           set -euo pipefail
           missing=()
-          for key in ORACLE_SSH_PRIVATE_KEY; do
+          for key in ORACLE_SSH_PRIVATE_KEY ORACLE_SSH_HOST_KEY; do
             if [[ -z "${!key:-}" ]]; then
               missing+=("$key")
             fi
@@ -79,17 +80,24 @@ jobs:
       - name: Configure SSH
         env:
           ORACLE_SSH_PRIVATE_KEY: ${{ secrets.ORACLE_SSH_PRIVATE_KEY }}
+          ORACLE_SSH_HOST_KEY: ${{ secrets.ORACLE_SSH_HOST_KEY }}
         run: |
           set -euo pipefail
           key_path="$RUNNER_TEMP/cronogpt_oracle_ed25519"
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
+          known_hosts_path="$RUNNER_TEMP/cronogpt_oracle_known_hosts"
           printf '%s\n' "$ORACLE_SSH_PRIVATE_KEY" > "$key_path"
+          printf '%s\n' "$ORACLE_SSH_HOST_KEY" > "$known_hosts_path"
           chmod 600 "$key_path"
+          chmod 600 "$known_hosts_path"
+          ssh-keygen -l -f "$known_hosts_path" >/dev/null
           echo "ORACLE_SSH_KEY=$key_path" >> "$GITHUB_ENV"
-          ssh-keyscan -H "$ORACLE_HOST" >> ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
-          ssh -i "$key_path" -o BatchMode=yes "$ORACLE_USER@$ORACLE_HOST" "true"
+          echo "ORACLE_SSH_KNOWN_HOSTS=$known_hosts_path" >> "$GITHUB_ENV"
+          ssh -i "$key_path" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            -o GlobalKnownHostsFile=/dev/null \
+            -o UserKnownHostsFile="$known_hosts_path" \
+            "$ORACLE_USER@$ORACLE_HOST" "true"
 
       - name: Deploy to Oracle
         env:
@@ -106,7 +114,12 @@ jobs:
         run: |
           set -euo pipefail
           token="$(
-            ssh -i "$ORACLE_SSH_KEY" -o BatchMode=yes "$ORACLE_USER@$ORACLE_HOST" \
+            ssh -i "$ORACLE_SSH_KEY" \
+              -o BatchMode=yes \
+              -o StrictHostKeyChecking=yes \
+              -o GlobalKnownHostsFile=/dev/null \
+              -o UserKnownHostsFile="$ORACLE_SSH_KNOWN_HOSTS" \
+              "$ORACLE_USER@$ORACLE_HOST" \
               "awk -F= '\$1 == \"CRONOGPT_API_TOKEN\" { sub(/^[^=]*=/, \"\"); print; exit }' /opt/cronogpt/secrets/cronogpt.env"
           )"
           if [[ -z "$token" ]]; then
