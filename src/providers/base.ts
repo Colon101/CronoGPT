@@ -16,6 +16,7 @@ import type {
   FastInput,
   FoodLogBatchInput,
   FoodLogInput,
+  FoodLogPlanInput,
   NoteLogInput,
   ProviderResult,
   RecipeDeleteInput,
@@ -30,6 +31,7 @@ import type {
   BackendMode,
   UiFlowInput,
 } from "../domain.js";
+import { runFoodLogPlan } from "../food-plan.js";
 import { capabilitiesForMode } from "../features.js";
 
 export class BaseCronometerProvider implements CronometerProvider {
@@ -123,6 +125,10 @@ export class BaseCronometerProvider implements CronometerProvider {
 
   async logFoods(input: FoodLogBatchInput): Promise<ProviderResult> {
     return this.unsupported("log_foods", input);
+  }
+
+  async logFoodPlan(input: FoodLogPlanInput): Promise<ProviderResult> {
+    return runFoodLogPlan(this, input);
   }
 
   async deleteDiaryFoodEntry(input: DiaryFoodDeleteInput): Promise<ProviderResult> {

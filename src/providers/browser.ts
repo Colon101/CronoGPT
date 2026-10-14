@@ -21,6 +21,7 @@ import type {
   FastInput,
   FoodLogBatchInput,
   FoodLogInput,
+  FoodLogPlanInput,
   NoteLogInput,
   ProviderResult,
   RecipeDeleteInput,
@@ -37,6 +38,7 @@ import type {
 } from "../domain.js";
 import { customFoodServingPreview } from "../domain.js";
 import { BaseCronometerProvider } from "./base.js";
+import { deterministicPlanKey, runFoodLogPlan } from "../food-plan.js";
 import { capabilitiesForMode } from "../features.js";
 import { compareStringsOrdinal, isoDateInTimeZone, stableJson } from "../determinism.js";
 import { customFoodNutrientMetadataForKey } from "../nutrients.js";
@@ -193,6 +195,7 @@ interface PersistedBackgroundBrowserJob {
   input: unknown;
   canonicalPayload?: string;
   callerIdempotencyKey?: string;
+  progress?: Record<string, unknown>;
   semanticKey?: string;
   effectVerifierVersion?: number;
   legacyVerifierQuarantined?: boolean;
@@ -411,7 +414,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     });
   }
 
-  async getOperation(operationId: string): Promise<ProviderResult> {
+  async getOperation(operationId: string, waitForCompletionSeconds = 0): Promise<ProviderResult> {
     pruneBackgroundBrowserJobs();
     const job = backgroundBrowserJobs.get(operationId);
     const persisted = this.persistedOperations.get(operationId);
@@ -456,7 +459,13 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         nextAction: "inspect_diary",
       }, "That operation is not available in this process. Inspect the diary before considering any retry.");
     }
-    if (job.status === "running") return this.backgroundBrowserJobAcceptedResult(job.feature, job, true);
+    if (job.status === "running") {
+      if (waitForCompletionSeconds > 0) {
+        await this.waitForAcceptedBackgroundJob(job.feature, this.backgroundBrowserJobAcceptedResult(job.feature, job, true), Math.min(30, waitForCompletionSeconds));
+        return this.getOperation(operationId);
+      }
+      return this.backgroundBrowserJobAcceptedResult(job.feature, job, true);
+    }
     if (job.status === "completed" && job.result) {
       return this.result("get_cronometer_operation", job.result.status, {
         ...resultDataObject(job.result),
@@ -872,6 +881,52 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     }
 
     return this.withPage("log_food", (page) => this.logFoodOnPage(page, input, normalized, preflightData));
+  }
+
+  async logFoodPlan(input: FoodLogPlanInput): Promise<ProviderResult> {
+    // Normalize and validate the entire plan before admitting any writes.
+    // Relative dates are fixed here so a long plan cannot cross midnight.
+    const now = new Date();
+    const normalizedItems = (input.items ?? []).map((item, index) => {
+      const merged = { ...item, confirmed: input.confirmed, dryRun: input.dryRun };
+      return { index, input: merged, normalized: normalizeFoodLogInput(merged, this.config.timeZone, now) };
+    });
+    const invalidItems = normalizedItems.filter((item) => item.normalized.validationIssues.length > 0)
+      .map((item) => ({ index: item.index, issues: item.normalized.validationIssues }));
+    const duplicateItems = duplicateNormalizedFoodLogItems(normalizedItems);
+    const explicitKeys = normalizedItems.map((item) => item.input.idempotencyKey?.trim()).filter((key): key is string => Boolean(key));
+    const duplicateKeys = explicitKeys.filter((key, index) => explicitKeys.indexOf(key) !== index);
+    if (!normalizedItems.length || invalidItems.length || duplicateItems.length || duplicateKeys.length) {
+      return this.result("log_food_plan", "needs_manual_step", {
+        invalidItems, duplicateItems, duplicateKeys, browserOpened: false, writeAttempted: false,
+      }, "The full plan failed validation. No meal was started.");
+    }
+    const items = normalizedItems.map(({ input: item, normalized }) => ({
+      ...item, date: normalized.date, meal: normalized.meal,
+    }));
+    const planIdempotencyKey = input.idempotencyKey?.trim() || deterministicPlanKey("food", items);
+    const normalizedInput = { ...input, items, idempotencyKey: planIdempotencyKey };
+    const willAttemptWrite = this.config.writeEnabled && input.confirmed !== false
+      && (!this.config.requireFoodConfirmation || input.confirmed === true);
+    if (input.dryRun === true || !willAttemptWrite) {
+      return runFoodLogPlan(this, { ...normalizedInput, dryRun: true });
+    }
+    const accepted = this.startBackgroundBrowserJob(
+      "log_food_plan",
+      backgroundBrowserJobKey("log_food_plan", { idempotencyKey: planIdempotencyKey }),
+      { planIdempotencyKey, count: items.length, input: safeInput(normalizedInput) },
+      (job) => runFoodLogPlan(this, normalizedInput, {
+        settleAcceptedOperations: true,
+        onProgress: (progress) => { job.progress = progress; job.updatedAt = Date.now(); },
+      }),
+      {
+        callerIdempotencyKey: planIdempotencyKey,
+        semanticPayload: normalizedItems.map((item) => canonicalFoodLogPayload(item.normalized)),
+        expectedExistingMatchCount: items.every((item) => item.expectedExistingMatchCount !== undefined)
+          ? items.reduce((sum, item) => sum + (item.expectedExistingMatchCount ?? 0), 0) : undefined,
+      },
+    );
+    return this.waitForAcceptedBackgroundJob("log_food_plan", accepted, input.waitForCompletionSeconds ?? 20);
   }
 
   async logFoods(input: FoodLogBatchInput & { confirmed?: boolean }) {
@@ -3862,7 +3917,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     feature: string,
     key: string,
     input: unknown,
-    runner: () => Promise<ProviderResult>,
+    runner: (job: BackgroundBrowserJob) => Promise<ProviderResult>,
     safety?: { callerIdempotencyKey?: string; semanticPayload?: unknown; expectedExistingMatchCount?: number },
   ): ProviderResult {
     pruneBackgroundBrowserJobs();
@@ -3883,6 +3938,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     const conflictingSemanticOperation = Array.from(this.persistedOperations.values())
       .filter((operation) =>
         operation.feature === feature
+        && (feature !== "log_food_plan" || operation.key !== key)
         && operation.semanticKey === semanticKey
         && ["running", "indeterminate", "completed", "failed"].includes(operation.status)
         && !persistedOperationEffectIsResolved(operation),
@@ -4041,7 +4097,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     this.persistedOperations.set(id, job);
 
     void Promise.resolve()
-      .then(runner)
+      .then(() => runner(job))
       .then((result) => {
         job.status = result.status === "error" ? "failed" : "completed";
         job.result = result;
@@ -4080,6 +4136,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       retryable: false,
       nextAction: "poll",
       input: job.input,
+      progress: job.progress,
       browserOpened: false,
       writeAttempted: false,
       writeScheduled: true,
@@ -5202,6 +5259,7 @@ function summarizeBackgroundBrowserJob(job: BackgroundBrowserJob, now = Date.now
     finishedAgoMs: job.status === "running" ? undefined : now - job.updatedAt,
     result: job.result ? summarizeProviderResultForBackground(job.result) : undefined,
     error: job.error,
+    progress: job.progress,
   };
 }
 

@@ -265,6 +265,15 @@ export interface FoodLogBatchInput {
   waitForCompletionSeconds?: number;
 }
 
+export interface FoodLogPlanInput {
+  items: Array<FoodLogInput & { date: string; meal: string }>;
+  dryRun?: boolean;
+  confirmed?: boolean;
+  idempotencyKey?: string;
+  stopOnFirstFailure?: boolean;
+  waitForCompletionSeconds?: number;
+}
+
 export interface DiaryFoodDeleteInput {
   date?: string;
   meal?: string;
@@ -536,7 +545,7 @@ export interface CronometerProvider {
   readonly mode: BackendMode;
   capabilities(): Promise<ProviderResult<Capability[]>>;
   runtimeStatus(): Promise<ProviderResult>;
-  getOperation(operationId: string): Promise<ProviderResult>;
+  getOperation(operationId: string, waitForCompletionSeconds?: number): Promise<ProviderResult>;
   refreshSession(): Promise<ProviderResult>;
   stabilityCheck(input: StabilityCheckInput): Promise<ProviderResult>;
   readFeaturePage(feature: string, hash: string, input: unknown): Promise<ProviderResult>;
@@ -549,6 +558,7 @@ export interface CronometerProvider {
   resolveRecipeIngredients(input: ResolveRecipeIngredientsInput): Promise<ProviderResult>;
   logFood(input: FoodLogInput): Promise<ProviderResult>;
   logFoods(input: FoodLogBatchInput): Promise<ProviderResult>;
+  logFoodPlan(input: FoodLogPlanInput): Promise<ProviderResult>;
   deleteDiaryFoodEntry(input: DiaryFoodDeleteInput): Promise<ProviderResult>;
   logExercise(input: ExerciseLogInput): Promise<ProviderResult>;
   logBiometric(input: BiometricLogInput): Promise<ProviderResult>;
