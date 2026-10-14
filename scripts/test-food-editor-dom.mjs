@@ -7,6 +7,7 @@ import {
   __collectFoodSearchResultsForTests,
   __exerciseFoodEditorSafetyForTests,
   __fillFoodAmountForTests,
+  __fillRecipeBasicsForTests,
   __fillRecipeCookedWeightForTests,
   __readFoodEditorIdentityForTests,
   __searchCurrentFoodDialogForTests,
@@ -97,6 +98,61 @@ try {
   const escapedSearchDialog = await __closeFoodDialogForTests(page);
   assert.deepEqual(escapedSearchDialog, { closed: true, strategy: "escape" });
   assert.equal(await page.locator("[role='dialog']").count(), 0, "completed search must leave a reusable page modal-free");
+
+  // A hidden old popup must not hide the new ingredient dialog. Its input can
+  // arrive after the old 2.5-second deadline, and the recipe title is already
+  // present before any real search results arrive.
+  await page.setContent(`
+    <style>input,button,table,tr,td{display:block;width:260px;min-height:24px}</style>
+    <h1>Chocolate Banana Bread</h1>
+    <div role="dialog"><div>Add Ingredients</div><button id="late-search">SEARCH</button>
+      <div id="late-input"></div><div class="results-container"><table class="crono-table"><tbody id="late-results"></tbody></table></div>
+    </div>
+    <div class="pretty-dialog" style="display:none"><input placeholder="Search all foods"><button>SEARCH</button></div>
+    <script>
+      window.ingredientSearchModel='';window.ingredientSearchSubmissions=0;
+      setTimeout(()=>{
+        const input=document.createElement('input');input.placeholder='Search all foods';
+        let typed=false; input.onkeydown=()=>typed=true;
+        input.oninput=()=>{if(typed)window.ingredientSearchModel=input.value};
+        document.querySelector('#late-input').append(input);
+      },3200);
+      document.querySelector('#late-search').onclick=()=>{
+        window.ingredientSearchSubmissions++;
+        setTimeout(()=>{
+          document.querySelector('#late-results').innerHTML=window.ingredientSearchModel==='Banana'
+            ? '<tr><td>Banana</td><td class="source">NCCDB</td></tr>' : '<tr><td>No foods found</td></tr>';
+        },650);
+      };
+    </script>
+  `);
+  const lateIngredients = await __searchCurrentFoodDialogForTests(page,"Banana",20);
+  assert.deepEqual(lateIngredients.map(({name,source})=>({name,source})),[{name:"Banana",source:"NCCDB"}]);
+  assert.equal(await page.evaluate(()=>window.ingredientSearchSubmissions),1);
+
+  // The ingredient control depends on the widget model, not the visible DOM
+  // value. Real typing and blur must commit all recipe fields before adding.
+  await page.setContent(`
+    <style>input,button{display:block;width:260px;height:28px}</style>
+    <input class="text-box" id="recipe-name"><input class="text-box" id="recipe-serving"><input class="number-box" id="recipe-count">
+    <button id="recipe-add" disabled>ADD INGREDIENTS</button>
+    <script>
+      window.recipeModel={};
+      for(const input of document.querySelectorAll('input')){
+        let typed=false;input.onkeydown=()=>typed=true;
+        input.onblur=()=>{
+          if(typed)window.recipeModel[input.id]=input.value;
+          document.querySelector('#recipe-add').disabled=Object.keys(window.recipeModel).length!==3;
+        };
+      }
+    </script>
+  `);
+  const typedBasics=await __fillRecipeBasicsForTests(page,{name:"Chocolate Banana Bread",servingName:"g",servings:807,ingredients:[]});
+  assert.equal(typedBasics.nameFilled,true);
+  assert.equal(typedBasics.servingNameFilled,true);
+  assert.equal(typedBasics.servingsFilled,true);
+  assert.equal(await page.locator('#recipe-add').isEnabled(),true);
+  assert.deepEqual(await page.evaluate(()=>window.recipeModel),{"recipe-name":"Chocolate Banana Bread","recipe-serving":"g","recipe-count":"807"});
 
   await page.setContent(`
     <div role="dialog"><div>Add Food to Diary</div>

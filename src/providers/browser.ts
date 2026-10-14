@@ -1207,9 +1207,10 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     }
 
     if (!selection.result) {
+      const missingFood = selection.missingRequestedFood === true;
       return this.result(
         "log_food",
-        "not_written_ambiguous",
+        missingFood ? "not_written_not_found" : "not_written_ambiguous",
         {
           ...preflightData,
           input: safeInput(input),
@@ -1219,7 +1220,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           browserOpened: true,
           writeAttempted: false,
           queryUsed,
-          retry: retryGuidanceForFoodLog("not_written_ambiguous"),
+          retry: missingFood ? selection.nextStep : retryGuidanceForFoodLog("not_written_ambiguous"),
           nextStep: selection.nextStep,
         },
         selection.warning,
@@ -4325,6 +4326,13 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       // deadline. If it fails, retire a reusable local session instead of
       // extending the operation with another navigation.
       if (session.closeContext === false) {
+        if (feature === "create_recipe" && result.status !== "ok" && !this.config.remoteWsEndpoint && this.config.reuseLocalBrowser) {
+          // An unsaved recipe survives Escape and can intercept the next hash
+          // navigation. Retire that page after capturing the failure, retaining
+          // the authenticated storage state for the next serialized operation.
+          await this.closeCachedLocalSession();
+          return result;
+        }
         const neutralFoodUi = await closeFoodDialog(
           session.page,
           Math.min(this.config.navigationTimeoutMs, 10000),
@@ -6784,7 +6792,7 @@ function isDangerousClickText(value: string) {
 }
 
 function activeDialog(page: Page) {
-  return page.locator(".pretty-dialog, [role='dialog'], .gwt-DialogBox, .popupContent").last();
+  return page.locator(".pretty-dialog:visible, [role='dialog']:visible, .gwt-DialogBox:visible, .popupContent:visible").last();
 }
 
 async function foodEditorDiagnostics(page: Page) {
@@ -7024,7 +7032,7 @@ async function foodDialogFilterClickBox(page: Page, label: string) {
 
 async function searchCurrentFoodDialog(page: Page, query: string, limit: number) {
   await waitForFoodDialogReady(page, 8000);
-  const searchBox = await foodSearchBox(page);
+  const searchBox = await waitForFoodSearchInput(page, 8000);
   if (!searchBox) {
     throw new Error("Food search input was not found after opening the Cronometer food dialog.");
   }
@@ -9931,32 +9939,35 @@ function recipeBasicsVerified(
 }
 
 async function fillRecipeEditorInput(page: Page, index: number, value: string) {
-  const filled = await page.evaluate(({ index, value }) => {
+  const inputs = page.locator("input.text-box:visible, input.number-box:visible");
+  const inputIndex = await inputs.evaluateAll((elements, index) => {
     const isVisible = (element: Element) => {
       const rect = element.getBoundingClientRect();
       const style = window.getComputedStyle(element);
       return rect.width >= 40 && rect.height >= 18 && style.display !== "none" && style.visibility !== "hidden";
     };
-    const inputs = Array.from(document.querySelectorAll("input.text-box, input.number-box"))
-      .filter((element): element is HTMLInputElement => element instanceof HTMLInputElement)
-      .filter((element) => isVisible(element))
-      .filter((element) => !String(element.className ?? "").includes("search-field"))
-      .filter((element) => !element.closest(".popupContent,.gwt-DialogBox,[role='dialog']"))
-      .map((element) => ({ element, rect: element.getBoundingClientRect() }))
+    const candidates = elements.map((element, domIndex) => ({ element, domIndex, rect: element.getBoundingClientRect() }))
+      .filter(({ element }) => element instanceof HTMLInputElement && isVisible(element))
+      .filter(({ element }) => !String(element.className ?? "").includes("search-field"))
+      .filter(({ element }) => !element.closest(".pretty-dialog,.popupContent,.gwt-DialogBox,[role='dialog']"))
       .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x)
-      .map((candidate) => candidate.element);
-    const input = inputs[index];
-    if (!input) return false;
-    input.focus();
-    input.value = value;
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-    input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "Enter" }));
-    input.blur();
-    return input.value === value;
-  }, { index, value }).catch(() => false);
-  await page.waitForTimeout(250);
-  return filled;
+      .map(({ domIndex }) => domIndex);
+    return candidates[index] ?? -1;
+  }, index).catch(() => -1);
+  if (inputIndex < 0) return false;
+  const input = inputs.nth(inputIndex);
+  // GWT must receive real keys and blur before enabling the ingredient editor.
+  // Assigning the DOM value only proved the text, not the widget's model value.
+  await input.click();
+  await input.press("Control+A");
+  await input.pressSequentially(value, { delay: 10 });
+  await input.press("Tab");
+  await page.waitForTimeout(150);
+  return await input.inputValue().catch(() => "") === value;
+}
+
+export async function __fillRecipeBasicsForTests(page: Page, input: RecipeInput) {
+  return fillRecipeBasics(page, input);
 }
 
 async function fillRecipeCookedWeight(page: Page, cookedWeight: number, unit?: string) {
@@ -10075,26 +10086,21 @@ async function addRecipeIngredient(page: Page, ingredient: RecipeInput["ingredie
   if (!clickedAdd) return { status: "add_button_not_found", warning: "ADD INGREDIENTS button was not found." };
 
   options.trace?.("ingredient_search_input_wait_start");
-  const search = await waitForFoodSearchInput(page, 2500);
+  const search = await waitForFoodSearchInput(page, Math.min(8000, Math.max(1000, (options.deadline ?? Date.now() + 8000) - Date.now() - 10000)));
   options.trace?.("ingredient_search_input_wait_done", { found: Boolean(search) });
   if (!search) {
-    return { status: "search_input_not_found", warning: "Ingredient search input was not found." };
+    return { status: "search_input_not_found", warning: "Ingredient search input was not found.", editorDebug: await recipeIngredientEditorDebug(page) };
   }
 
   const searchText = ingredient.selectedName ?? ingredient.query;
-  await search.fill(searchText);
   options.trace?.("ingredient_search_submit_start");
-  const searched = await clickDialogButton(page, /^SEARCH$/i);
-  if (!searched) await clickByText(page, /^SEARCH$/i);
-  options.trace?.("ingredient_search_submit_done", { searched });
-  options.trace?.("ingredient_search_result_wait_start");
-  await waitForIngredientSearchResult(page, searchText, Math.min(8000, Math.max(1200, (options.deadline ?? Date.now() + 8000) - Date.now() - 2500)));
-  options.trace?.("ingredient_search_result_wait_done");
+  const searchResults = await searchCurrentFoodDialog(page, searchText, 20);
+  options.trace?.("ingredient_search_submit_done", { candidateCount: searchResults.length });
 
   options.trace?.("ingredient_collect_results_start");
   const candidates = rankFoodResults(
     ingredient.query,
-    await collectFoodSearchResults(page, 12),
+    searchResults,
     ingredient.selectedName,
     ingredient.selectedSource,
   );
@@ -10567,15 +10573,6 @@ async function waitForFoodSearchInput(page: Page, timeoutMs: number) {
   return undefined;
 }
 
-async function waitForIngredientSearchResult(page: Page, name: string, timeoutMs: number) {
-  const expected = name.toLowerCase();
-  return waitForVisibleText(
-    page,
-    (text) => text.toLowerCase().includes(expected) || /\b(no results|no foods found|did not match)\b/i.test(text),
-    Math.max(500, timeoutMs),
-  );
-}
-
 function parseDailySummary(rawText: string) {
   const extract = (name: string, unit: string) => {
     const regex = new RegExp(`${escapeRegExp(name)}\\s+([+\\-]?[0-9,.]+)(?:\\s*\\([^)]*\\))?\\s*/\\s*([+\\-]?[0-9,.]+)\\s*${escapeRegExp(unit)}`, "i");
@@ -10815,6 +10812,7 @@ export function chooseFoodLogResult(input: FoodLogInput, results: SearchResult[]
       status: "needs_manual_step" as const,
       policy,
       candidates,
+      missingRequestedFood: true,
       warning: "No Cronometer food result was found.",
       nextStep: "Try a more specific food query or create a custom food first.",
     };
@@ -10846,6 +10844,23 @@ export function chooseFoodLogResult(input: FoodLogInput, results: SearchResult[]
     };
   }
 
+  const requestedTokens = foodIdentityTokens(input.query);
+  const hasPlausibleIdentity = requestedTokens.length > 0 && ranked.some((candidate) => {
+    const candidateTokens = new Set(foodIdentityTokens(candidate.name));
+    return requestedTokens.filter((token) => candidateTokens.has(token)).length / requestedTokens.length >= 0.8;
+  });
+  if (!hasPlausibleIdentity) {
+    return {
+      status: "needs_manual_step" as const,
+      policy,
+      candidates,
+      confidence,
+      missingRequestedFood: true,
+      warning: "The requested food identity was not found. Cronometer returned unrelated or different-product matches, so no food was written.",
+      nextStep: "Use the user's product label or research the exact product's nutrition, then create_and_log_custom_food. Do not substitute a different brand or product from these search results.",
+    };
+  }
+
   return {
     status: "needs_manual_step" as const,
     policy,
@@ -10854,6 +10869,14 @@ export function chooseFoodLogResult(input: FoodLogInput, results: SearchResult[]
     warning: "Cronometer returned multiple plausible food matches, so cronogpt refused to log one automatically.",
     nextStep: "Call log_food with selectedName and selectedSource from search_foods to pin the exact candidate. Unsafe best-effort writes are not exposed to ChatGPT.",
   };
+}
+
+function foodIdentityTokens(value: string) {
+  return normalizeFoodName(value)
+    .replace(/\b\d+(?:\.\d+)?\s*(?:g|grams?|ml|kg|oz)\b/g, " ")
+    .replace(/[^\p{L}\p{N}%]+/gu, " ")
+    .split(/\s+/)
+    .filter((token) => token && !/^(the|a|an|and|of|with|no|added|g|gram|grams|ml|kg|oz)$/.test(token));
 }
 
 function plainMilkKey(value: string) {

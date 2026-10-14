@@ -670,4 +670,21 @@ assert.equal(rankedMilk[0].source, "CRDB");
 
 assert.match(retryGuidanceForFoodLog("possibly_written_verify_failed"), /read-only diary check/i);
 
+// These are unrelated matches returned in the live full-history attempt.
+for (const [query,names] of [
+  ["Elite Pesek Zman Classic 45 g",["Elite Kif Kaf Classic 45 g","Elite, Low Fat Cocoa Powder"]],
+  ["Lagani Moroccan whole wheat cookies no added sugar",["Allin Cookie crunch","Angel whole wheat bread","Chocolate chip cookies"]],
+  ["Semenzato Carezze di Pane Senza Crosta",["Artebianca, Pan Piuma, Il Pane Senza Crosta","Coop, Pane Integrale, Senza Crosta"]],
+]) {
+  const missing=chooseFoodLogResult({query},names.map(name=>({name,source:"CRDB",raw:name+" CRDB"})));
+  assert.equal(missing.result,undefined);
+  assert.equal(missing.missingRequestedFood,true,query+" must trigger the exact-product custom-food path");
+}
+const actualAmbiguity=chooseFoodLogResult({query:"protein bar"},[
+  {name:"Quest, Protein Bar, Chocolate",source:"CRDB",raw:"Quest, Protein Bar, Chocolate CRDB"},
+  {name:"Barebells, Protein Bar, Vanilla",source:"CRDB",raw:"Barebells, Protein Bar, Vanilla CRDB"},
+]);
+assert.equal(actualAmbiguity.result,undefined);
+assert.notEqual(actualAmbiguity.missingRequestedFood,true,"multiple actual protein bars remain a choice, not a missing food");
+
 console.log("food logic checks passed");
