@@ -36,7 +36,7 @@ import {
 } from "./oauth.js";
 
 export const MCP_PATH = "/mcp";
-export const MCP_SERVER_VERSION = "0.1.22";
+export const MCP_SERVER_VERSION = "0.1.23";
 export const WIDGET_URI = `ui://widget/cronometer-dashboard-v${MCP_SERVER_VERSION}.html`;
 
 const widgetHtml = readFileSync(new URL("../public/cronometer-widget.html", import.meta.url), "utf8")
@@ -200,6 +200,7 @@ const MCP_SERVER_INSTRUCTIONS = [
   "For a clear single-food request, call log_food directly once with the user's date, meal, query, amount, and unit. Do not call search_foods, list_food_entries, or a dry-run first: CronoGPT owns the fresh diary baseline, unique high-confidence food selection, idempotency, write, reload, and persisted verification. Use search_foods only after log_food reports ambiguity or not-found.",
   "Choose exactly one diary-write shape: log_food for one food; log_foods for multiple foods that all share one date and one meal; log_food_plan only when the request spans dates or meal sections. Never split one intent across overlapping write tools.",
   "Use create_and_log_custom_food as the preferred single-step workflow when a packaged food is missing from Cronometer and the user wants it logged.",
+  "After not_written_not_found, use ChatGPT web search or the user's package label to obtain that exact product's nutrition, then call create_and_log_custom_food with the same date, meal and amount. Include nutritionSource; do not invent missing nutrients or substitute a different product. Ask for a label only when reliable product facts cannot be found.",
   "Use ensure_private_recipe for every private-recipe write. Unconfirmed calls preview without opening Cronometer; confirmed calls compare full recipe contents and safely repair an incomplete same-named recipe when possible.",
   "For custom foods, use Cronometer's detailed #/custom-foods editor: pass the package serving size, every nutrient available on the label, and the UPC/EAN/GTIN barcode whenever it is visible. The barcode links the private custom food to future barcode searches/scans.",
   "Do not call duplicate-list tools before create_custom_food or create_and_log_custom_food; those tools resolve exact same-name foods themselves and default to updating one exact match.",
@@ -944,7 +945,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   register(
     "create_and_log_custom_food",
     "Create and log detailed barcode-linked custom food",
-    "Use this as the preferred one-call workflow when a packaged food is missing from Cronometer and the user wants to log it now. Supply the package serving size, every available label nutrient, the UPC/EAN/GTIN barcode whenever visible, and the user's exact diary meal. The tool validates the detailed editor, handles same-name foods internally, verifies the saved barcode and nutrients, then pins and logs that exact private custom food. Do not call list_custom_foods first. Use dryRun=true when facts are uncertain; confirmed=true is required for writes.",
+    "Use this as the preferred one-call workflow after a requested packaged food is not found. ChatGPT can obtain the exact product's nutrition from the user's label or authoritative web sources; pass nutritionSource, serving size, every available label nutrient, barcode when known, and the original date, meal and amount. Do not invent missing nutrients. The tool validates the detailed editor, handles same-name foods internally, verifies the saved barcode and nutrients, then pins and logs that exact private custom food. Do not call list_custom_foods first. Use dryRun=true when facts are uncertain; confirmed=true is required for writes.",
     {
       name: z.string().min(1).describe("Exact custom food name to create/update and then log."),
       servingSize: z.string().min(1).optional().describe("Primary nutrition-label serving size. When portions is supplied and this is omitted, CronoGPT uses the preferred stable base serving of 1 g; without portions, an explicit servingSize remains required."),

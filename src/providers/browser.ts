@@ -1833,8 +1833,9 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     let lastQuery = normalized.searchQueries[0] ?? normalized.query;
     for (const query of normalized.searchQueries) {
       lastQuery = query;
-      const outcome = await this.searchFoodUi(page, query, 5, normalized.date, {
+      const outcome = await this.searchFoodUi(page, query, 15, normalized.date, {
         searchScope: original.searchScope,
+        selectedName: original.selectedName,
         selectedSource: original.selectedSource,
         provenDateStatus,
       });
@@ -2117,14 +2118,20 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     const normalizedInput = preview.barcode.normalized
       ? { ...input, barcode: preview.barcode.normalized }
       : input;
+    const labelServing = parseServingSize(customFoodServingPreview(normalizedInput).servingSize);
+    const requestedServingUnit = normalizeServingUnit(normalizedInput.unit ?? "serving");
+    const useLabelServing = !normalizedInput.portion && requestedServingUnit === "serving"
+      && labelServing && labelServing.unit !== "serving";
     let logInput: FoodLogInput = {
       date: normalizedInput.date,
       meal: normalizedInput.meal,
       query: normalizedInput.name,
       selectedName: normalizedInput.name,
       selectedSource: "Custom Food",
-      amount: normalizedInput.portion ? undefined : normalizedInput.amount ?? 1,
-      unit: normalizedInput.portion ? undefined : normalizedInput.unit,
+      amount: normalizedInput.portion ? undefined : useLabelServing
+        ? (normalizedInput.amount ?? 1) * labelServing.amount
+        : normalizedInput.amount ?? 1,
+      unit: normalizedInput.portion ? undefined : useLabelServing ? labelServing.unit : normalizedInput.unit,
       portion: normalizedInput.portion,
       timestamp: normalizedInput.timestamp,
       matchPolicy: "selected_only",
@@ -3291,6 +3298,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     date?: string,
     options: {
       searchScope?: FoodLogInput["searchScope"];
+      selectedName?: string;
       selectedSource?: string;
       provenDateStatus?: DiaryDateStatus;
     } = {},
@@ -3315,7 +3323,11 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         fallbackResults = results;
       }
 
-      if (hasExactFoodResult(query, results)) {
+      if (hasExactFoodResult(query, results) || chooseFoodLogResult({
+        query,
+        selectedName: options.selectedName,
+        selectedSource: options.selectedSource,
+      }, results).result) {
         return { results, dateStatus };
       }
     }
@@ -3574,6 +3586,13 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     // interrupted reused-context operation before navigating the app shell.
     await closeFoodDialog(page, Math.min(this.config.navigationTimeoutMs, 10000)).catch(() => undefined);
     const targetUrl = `${CRONOMETER_ORIGIN}/${hash}`;
+    // Reuse the already authenticated app document for reads and searches.
+    // Writes still establish a fresh document in openDiaryForWrite and reload
+    // after Save before reporting persisted success.
+    if (page.url() === targetUrl && await this.isLoggedIn(page)) {
+      await this.ensureConfiguredAccount(page, hash);
+      return;
+    }
     await gotoAllowingAbort(page, targetUrl, this.config.navigationTimeoutMs);
     await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
     await page.waitForTimeout(1200);
@@ -5424,6 +5443,8 @@ function summarizeBatchFoodLogResult(index: number, normalized: NormalizedFoodLo
     queryUsed: stringValue(data.queryUsed),
     writeAttempted: data.writeAttempted === true,
     verification: data.verification,
+    selection: result.status === "not_written_ambiguous" ? data.selection : undefined,
+    nextStep: stringValue(data.nextStep),
     retry: data.retry,
   };
 }
@@ -9870,17 +9891,22 @@ async function fillRecipeCookedWeight(page: Page, cookedWeight: number, unit?: s
   return filled;
 }
 
-function chooseRecipeIngredientCandidate(ingredient: RecipeInput["ingredients"][number], candidates: SearchResult[]) {
+export function chooseRecipeIngredientCandidate(ingredient: RecipeInput["ingredients"][number], candidates: SearchResult[]) {
   if (candidates.length === 0) return undefined;
 
   const selectedName = ingredient.selectedName?.trim();
   const selectedSource = ingredient.selectedSource?.trim();
   if (selectedName) {
-    return candidates.find((candidate) =>
+    const matches = candidates.filter((candidate) =>
       normalizeFoodName(candidate.name) === normalizeFoodName(selectedName) &&
       (!selectedSource || normalizeSource(candidate.source) === normalizeSource(selectedSource))
     );
+    return matches.length === 1 ? matches[0] : undefined;
   }
+
+  const canonical = chooseCanonicalFoodResult(ingredient.query, rankFoodResults(ingredient.query, candidates), normalizeSource(selectedSource));
+  if (canonical) return canonical;
+  if (plainMilkKey(ingredient.query)) return undefined;
 
   const exactQueryMatches = candidates.filter((candidate) => normalizeFoodName(candidate.name) === normalizeFoodName(ingredient.query));
   if (exactQueryMatches.length === 1) return exactQueryMatches[0];
@@ -9888,7 +9914,10 @@ function chooseRecipeIngredientCandidate(ingredient: RecipeInput["ingredients"][
   if (officialExactMatches.length > 0) return rankFoodResults(ingredient.query, officialExactMatches)[0];
 
   const confident = confidentRecipeIngredientCandidate(ingredient.query, candidates);
-  if (confident) return confident;
+  if (confident && candidates.filter((candidate) =>
+    normalizeFoodName(candidate.name) === normalizeFoodName(confident.name)
+    && normalizeSource(candidate.source) === normalizeSource(confident.source)
+  ).length === 1) return confident;
 
   return undefined;
 }
@@ -10658,6 +10687,17 @@ export function chooseFoodLogResult(input: FoodLogInput, results: SearchResult[]
     };
   }
 
+  const canonical = chooseCanonicalFoodResult(input.query, ranked, selectedSource);
+  if (canonical) {
+    return {
+      status: "ok" as const,
+      policy,
+      result: canonical,
+      candidates,
+      confidence: { ...foodLogConfidence(input.query, canonical), highConfidence: true, canonicalMatch: true },
+    };
+  }
+
   const top = ranked[0];
   if (!top) {
     return {
@@ -10703,6 +10743,45 @@ export function chooseFoodLogResult(input: FoodLogInput, results: SearchResult[]
     warning: "Cronometer returned multiple plausible food matches, so cronogpt refused to log one automatically.",
     nextStep: "Call log_food with selectedName and selectedSource from search_foods to pin the exact candidate. Unsafe best-effort writes are not exposed to ChatGPT.",
   };
+}
+
+function plainMilkKey(value: string) {
+  const name = normalizeFoodName(value).replace(/\s*%/g, "%");
+  const plain = name.replace(/\blow\s*fat\b|\bfat\b|\bfluid\b/g, " ").replace(/\s+/g, " ").trim();
+  const parts = plain.split(" ").sort(compareStringsOrdinal);
+  // Preserve the exact percentage. Enriched, lactose-free, ultra-filtered,
+  // DHA and other variants retain extra words and cannot match plain milk.
+  return parts.length === 2 && parts.includes("milk") && parts.some((part) => /^\d+(?:\.\d+)?%$/.test(part))
+    ? parts.join(" ")
+    : undefined;
+}
+
+function chooseCanonicalFoodResult(query: string, ranked: SearchResult[], selectedSource: string) {
+  const key = normalizeFoodName(query);
+  const milk = plainMilkKey(query);
+  let matches = ranked.filter((result) => {
+    if (selectedSource && normalizeSource(result.source) !== selectedSource) return false;
+    if (normalizeFoodName(result.name) === key) return true;
+    if (foodNameWordKey(result.name) === foodNameWordKey(query)) return true;
+    if (!/^(crdb|nccdb|usda|cnf)$/.test(normalizeSource(result.source))) return false;
+    if (milk && plainMilkKey(result.name) === milk) return true;
+    // A sole brand prefix is allowed, but extra ingredients/flavours are not.
+    const segments = result.name.split(",");
+    return segments.length === 2 && normalizeFoodName(segments[1]) === key;
+  });
+  const wholeNameMatches = matches.filter((result) => foodNameWordKey(result.name) === foodNameWordKey(query));
+  if (wholeNameMatches.length) matches = wholeNameMatches;
+  if (!matches.length) return undefined;
+  const identities = new Set(matches.map((result) => milk
+    ? plainMilkKey(result.name)
+    : normalizeFoodName(result.name)));
+  if (identities.size !== 1) return undefined;
+  // Never choose between visually indistinguishable rows. An equivalent food
+  // in another official source can be used only when its own row is unique.
+  return matches.find((result) => ranked.filter((candidate) =>
+    normalizeFoodName(candidate.name) === normalizeFoodName(result.name)
+    && normalizeSource(candidate.source) === normalizeSource(result.source)
+  ).length === 1);
 }
 
 export function foodLogConfidence(query: string, top: SearchResult, next?: SearchResult) {

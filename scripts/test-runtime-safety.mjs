@@ -898,6 +898,26 @@ try {
   assert.equal(invalidCustomFood.data.browserOpened, false);
   assert.match(invalidCustomFood.warning, /Unknown nutrient key/);
 
+  // A label-based serving must flow into a selectable physical diary amount.
+  // The real 45 g bar was created successfully but failed when logging the
+  // caller's "1 serving", because Cronometer only offered the label's unit.
+  for (const [servingSize, amount, unit, expectedAmount, expectedUnit] of [
+    ["45 g", 1, "serving", 45, "g"],
+    ["45 g", 2, "servings", 90, "g"],
+    ["250 ml", undefined, undefined, 250, "ml"],
+    ["100 g", 45, "g", 45, "g"],
+  ]) {
+    const preview = await provider.createAndLogCustomFood({
+      name: "Label-serving regression food", servingSize,
+      nutrients: { calories: 200 }, meal: "Snacks", date: "2026-10-14",
+      amount, unit, dryRun: true,
+    });
+    assert.equal(preview.status, "dry_run");
+    assert.equal(preview.data.logFood.data.normalized.amount, expectedAmount);
+    assert.equal(preview.data.logFood.data.normalized.unit, expectedUnit);
+    assert.equal(preview.data.logFood.data.browserOpened, false);
+  }
+
   const pausedBatchWrite = await provider.logFoods({
     meal: "Lunch",
     items: [{ query: "banana", amount: 1, unit: "g" }],

@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import {
   chooseFoodLogResult,
+  chooseRecipeIngredientCandidate,
   customFoodCreatePreview,
   customFoodNutrientEntries,
   customFoodUpdatePreview,
@@ -425,6 +426,41 @@ const duplicatePinnedResult = chooseFoodLogResult({
   { name: "Banana", source: "NCCDB", raw: "Banana NCCDB row 2" },
 ]);
 assert.equal(duplicatePinnedResult.status, "needs_manual_step");
+
+// Real October diary request: duplicate branded database rows must not hide
+// the unique equivalent cereal, and plain milk must not select a variant.
+const cerealResults = [
+  { name: "Post, Cocoa Pebbles", source: "CRDB", raw: "first duplicate" },
+  { name: "Post, Cocoa Pebbles", source: "CRDB", raw: "second duplicate" },
+  { name: "Post, Cocoa Pebbles Cereal, With Real Cocoa", source: "CRDB", raw: "variant" },
+  { name: "Post, Cocoa Pebbles with Marshmallow", source: "CRDB", raw: "marshmallow" },
+  { name: "Post, Fruity Pebbles, Cocoa Pebbles", source: "CRDB", raw: "mixed" },
+  { name: "Post, Cocoa Pebbles", source: "NCCDB", raw: "unique equivalent" },
+];
+const cerealSelection = chooseFoodLogResult({ query: "Cocoa Pebbles" }, cerealResults);
+assert.equal(cerealSelection.result?.name, "Post, Cocoa Pebbles");
+assert.equal(cerealSelection.result?.source, "NCCDB");
+assert.equal(chooseFoodLogResult({ query: "Cocoa Pebbles" }, cerealResults.slice(0, 5)).status, "needs_manual_step");
+assert.equal(chooseFoodLogResult({ query: "Cocoa Pebbles" }, [
+  ...cerealResults,
+  { name: "Other Brand, Cocoa Pebbles", source: "NCCDB", raw: "different brand" },
+]).status, "needs_manual_step");
+const milkResults = [
+  { name: "Milk, 1% fat (lowfat), ultra-filtered", source: "NCCDB", raw: "ultrafiltered" },
+  { name: "Milk, 1% Fat, with DHA", source: "NCCDB", raw: "DHA" },
+  { name: "Milk, 1 % Fat, Lowfat", source: "NCCDB", raw: "plain" },
+  { name: "Milk, 1 1/2% Fat", source: "NCCDB", raw: "different fat" },
+  { name: "Milk, 1/2% Fat", source: "NCCDB", raw: "different fat again" },
+];
+for (const query of ["Milk 1%", "1% fat milk", "Milk, 1% Fat"]) {
+  assert.equal(chooseFoodLogResult({ query }, milkResults).result?.name, "Milk, 1 % Fat, Lowfat");
+  assert.equal(chooseFoodLogResult({ query }, [...milkResults].reverse()).result?.name, "Milk, 1 % Fat, Lowfat");
+}
+assert.equal(chooseFoodLogResult({ query: "Milk 1%", selectedSource: "USDA" }, milkResults).status, "needs_manual_step");
+assert.equal(chooseFoodLogResult({ query: "Milk 1%" }, milkResults.filter((row) => row.raw !== "plain")).status, "needs_manual_step");
+assert.equal(chooseRecipeIngredientCandidate({ query: "Cocoa Pebbles" }, cerealResults)?.source, "NCCDB");
+assert.equal(chooseRecipeIngredientCandidate({ query: "Milk 1%" }, milkResults)?.name, "Milk, 1 % Fat, Lowfat");
+assert.equal(chooseRecipeIngredientCandidate({ query: "Milk 1%" }, milkResults.filter((row) => row.raw !== "plain")), undefined);
 
 const bestEffort = chooseFoodLogResult({ query: "Banana", matchPolicy: "best_effort" }, [
   { name: "Banana cream", source: "Custom Recipe", raw: "Banana cream Custom Recipe" },
