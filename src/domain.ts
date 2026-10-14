@@ -372,6 +372,11 @@ export interface RecipeDeleteInput extends CustomRecipeSelectorInput {
 export interface RecipeUpdateInput extends CustomRecipeSelectorInput {
   newName?: string;
   ingredientsToAdd?: RecipeIngredientInput[];
+  ingredientsToReplace?: Array<{
+    currentName: string;
+    currentSource?: string;
+    ingredient: RecipeIngredientInput;
+  }>;
   servings?: number;
   servingName?: string;
   cookedWeight?: number;

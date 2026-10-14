@@ -11,6 +11,8 @@ import {
   __fillRecipeIngredientFieldsForTests,
   __fillRecipeCookedWeightForTests,
   __readFoodEditorIdentityForTests,
+  __removeRecipeIngredientForTests,
+  __recipeEditIngredientsVerifiedForTests,
   __searchCurrentFoodDialogForTests,
   chooseFoodLogResult,
 } from "../dist/providers/browser.js";
@@ -18,6 +20,27 @@ import {
 const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true });
 try {
   const page = await browser.newPage();
+  await page.setContent(`
+    <table><tr><td><table>
+      <tr id="butter"><td><div>Butter, Salted</div></td><td>NCCDB</td><td>16.15</td><td>g</td><td><img alt="Delete" title="Delete" width="16" height="16"></td></tr>
+      <tr id="banana"><td><div>Banana, raw</div></td><td>CNF</td><td>385.7</td><td>g</td><td><img alt="Delete" title="Delete" width="16" height="16"></td></tr>
+    </table></td></tr></table>
+    <script>document.querySelectorAll('img').forEach(img=>img.onclick=()=>img.closest('tr').remove())</script>
+  `);
+  assert.equal((await __removeRecipeIngredientForTests(page, "Butter, Salted", "NCCDB")).removed, true);
+  assert.equal(await page.locator('#banana').count(), 1, "removing the butter must preserve other ingredients and ignore ancestor table rows");
+  await page.setContent(`<table><tr><td>Butter, Salted</td><td>NCCDB</td><td><img alt="Delete" width="16" height="16"></td></tr><tr><td>Butter, Salted</td><td>NCCDB</td><td><img alt="Delete" width="16" height="16"></td></tr></table>`);
+  assert.equal((await __removeRecipeIngredientForTests(page, "Butter, Salted", "NCCDB")).removed, false, "ambiguous ingredient rows must not be deleted");
+  assert.equal(await page.getByRole('img', { name: 'Delete', exact: true }).count(), 2);
+  const originalIngredients = { name: "Recipe", ingredientsStatus: "parsed", ingredients: [
+    { name: "Banana, raw", database: "CNF", amount: 385.7, unit: "g" },
+    { name: "Butter, Salted", database: "NCCDB", amount: 16.15, unit: "g" },
+  ] };
+  const swappedIngredients = { ...originalIngredients, ingredients: [originalIngredients.ingredients[0], { name: "Butter, Unsalted", database: "NCCDB", amount: 16.15, unit: "g" }] };
+  const additionProof = [{ status: "ok", selectedCandidate: { name: "Butter, Unsalted", source: "NCCDB" }, ingredient: { query: "unsalted butter", amount: 16.15, unit: "g" } }];
+  assert.equal(__recipeEditIngredientsVerifiedForTests(originalIngredients, swappedIngredients, additionProof, [1]), true);
+  assert.equal(__recipeEditIngredientsVerifiedForTests(originalIngredients, { ...swappedIngredients, ingredients: [...swappedIngredients.ingredients, originalIngredients.ingredients[1]] }, additionProof, [1]), false, "a swap must not leave both butter entries");
+  assert.equal(__recipeEditIngredientsVerifiedForTests(originalIngredients, { ...swappedIngredients, ingredients: [{ ...swappedIngredients.ingredients[0], amount: 400 }, swappedIngredients.ingredients[1]] }, additionProof, [1]), false, "editing butter must not silently change a retained ingredient");
   await page.setContent(`
     <style>.dialog{display:block;position:absolute;width:300px;height:200px;top:10px;left:10px}.menu{position:absolute;top:55px;left:10px}.hidden{display:none}.unrelated{display:none}button{display:block;width:100px;height:25px}</style>
     <div class="dialog" role="dialog"><div>Add Food to Diary</div><input><input><button class="meal dropdown-toggle">Breakfast</button><button class="unit">g</button><button class="commit">ADD TO DIARY</button></div>

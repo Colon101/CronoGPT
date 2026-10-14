@@ -240,6 +240,7 @@ const ACCOUNT_VERIFICATION_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_FOOD_WRITE_WAIT_SECONDS = 75;
 const DEFAULT_BATCH_WRITE_WAIT_SECONDS = 120;
 const DEFAULT_CUSTOM_WRITE_WAIT_SECONDS = 180;
+const DEFAULT_RECIPE_WRITE_WAIT_SECONDS = 20;
 // Version the evidence rules independently from the journal's serialization
 // format. Completed food writes from before this verifier trusted Cronometer's
 // optimistic editor DOM and must never be replayed as durable successes.
@@ -2875,10 +2876,30 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   async updateCustomRecipe(input: RecipeUpdateInput & { confirmed?: boolean }) {
+    if (!input.name?.trim()) {
+      return this.result("update_custom_recipe", "needs_manual_step", {
+        browserOpened: false,
+        writeAttempted: false,
+      }, "Pass the exact current recipe name, with recipeId when needed, so the editor can open one target without scanning the recipe library.");
+    }
+    if (shouldRunConfirmedWrite(input, this.config.writeEnabled)) {
+      const accepted = this.startBackgroundBrowserJob(
+        "update_custom_recipe",
+        backgroundBrowserJobKey("update_custom_recipe", safeInput(input)),
+        safeInput(input),
+        () => this.runUpdateCustomRecipe(input),
+      );
+      return this.waitForAcceptedBackgroundJob("update_custom_recipe", accepted, DEFAULT_RECIPE_WRITE_WAIT_SECONDS);
+    }
+    return this.runUpdateCustomRecipe(input);
+  }
+
+  private async runUpdateCustomRecipe(input: RecipeUpdateInput & { confirmed?: boolean }) {
     const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
     const hasChanges = Boolean(
       input.newName !== undefined
       || (input.ingredientsToAdd?.length ?? 0) > 0
+      || (input.ingredientsToReplace?.length ?? 0) > 0
       || input.servings !== undefined
       || input.servingName !== undefined
       || input.cookedWeight !== undefined
@@ -2889,6 +2910,10 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       ...(input.newName !== undefined && !input.newName.trim() ? ["newName must not be blank."] : []),
       ...(input.cookedWeightUnit !== undefined && input.cookedWeight === undefined ? ["cookedWeightUnit requires cookedWeight."] : []),
       ...(input.ingredientsToAdd ?? []).flatMap((ingredient, index) => ingredient.query?.trim() ? [] : [`Ingredient ${index + 1} query must not be blank.`]),
+      ...(input.ingredientsToReplace ?? []).flatMap((replacement, index) =>
+        replacement.currentName?.trim() && replacement.ingredient.query?.trim()
+          && Number(replacement.ingredient.amount) > 0 && replacement.ingredient.unit?.trim()
+          ? [] : [`Replacement ${index + 1} requires an exact current name and a replacement query, amount and unit.`]),
     ];
     if (validationIssues.length > 0) {
       return this.result("update_custom_recipe", "needs_manual_step", {
@@ -2912,6 +2937,18 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       }
 
       const before = resolved.targets[0];
+      const replacementIndices = new Set<number>();
+      for (const replacement of input.ingredientsToReplace ?? []) {
+        const matches = (before.ingredients ?? []).flatMap((ingredient, index) =>
+          normalizeFoodName(ingredient.name) === normalizeFoodName(replacement.currentName)
+            && recipeIngredientSourceMatches(ingredient.database, replacement.currentSource) ? [index] : []);
+        if (before.ingredientsStatus !== "parsed" || matches.length !== 1 || replacementIndices.has(matches[0])) {
+          return this.result("update_custom_recipe", "needs_manual_step", {
+            before, replacement, browserOpened: true, writeAttempted: false,
+          }, "Every ingredient replacement requires one distinct exact existing ingredient. No recipe edit was attempted.");
+        }
+        replacementIndices.add(matches[0]);
+      }
       const basicsInput: RecipeInput = {
         name: input.newName ?? before.name,
         ingredients: input.ingredientsToAdd ?? [],
@@ -2928,6 +2965,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         cookedWeight: input.cookedWeight,
         cookedWeightUnit: input.cookedWeightUnit,
         ingredientsToAdd: input.ingredientsToAdd,
+        ingredientsToReplace: input.ingredientsToReplace,
       };
       if (!confirmedWrite) {
         return this.result("update_custom_recipe", "dry_run", {
@@ -2945,16 +2983,27 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       }
       const basics = await fillRecipeBasics(page, basicsInput);
       const addedIngredients = [];
-      for (const ingredient of input.ingredientsToAdd ?? []) {
+      const removedIngredients = [];
+      for (const replacement of input.ingredientsToReplace ?? []) {
+        const removed = await removeRecipeIngredient(page, replacement.currentName, replacement.currentSource);
+        removedIngredients.push({ replacement, ...removed });
+        if (!removed.removed) break;
+      }
+      const allRemoved = removedIngredients.length === (input.ingredientsToReplace?.length ?? 0)
+        && removedIngredients.every((item) => item.removed);
+      const ingredientsToAdd = [...(input.ingredientsToAdd ?? []), ...(input.ingredientsToReplace ?? []).map((item) => item.ingredient)];
+      for (const ingredient of allRemoved ? ingredientsToAdd : []) {
         const added = await addRecipeIngredient(page, ingredient);
         addedIngredients.push({ ingredient, ...added });
         if (added.status !== "ok") break;
       }
-      const allAdded = addedIngredients.length === (input.ingredientsToAdd?.length ?? 0)
+      const allAdded = allRemoved && addedIngredients.length === ingredientsToAdd.length
         && addedIngredients.every((item) => item.status === "ok");
       const refilledBasics = allAdded ? await fillRecipeBasics(page, basicsInput) : undefined;
       const basicsVerified = recipeBasicsVerified(refilledBasics ?? basics, basicsInput);
-      if (!allAdded || !basicsVerified) {
+      const draftDetail = allAdded ? await extractCustomRecipeDetailWithRetry(page, 3, 200) : undefined;
+      const draftIngredientsVerified = recipeEditIngredientsVerified(before, draftDetail, addedIngredients, replacementIndices);
+      if (!allAdded || !basicsVerified || !draftIngredientsVerified) {
         return this.result("update_custom_recipe", "needs_manual_step", {
           updated: false,
           action: "not_saved",
@@ -2964,6 +3013,8 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           refilledBasics,
           basicsVerified,
           addedIngredients,
+          removedIngredients,
+          draftIngredientsVerified,
           browserOpened: true,
           writeAttempted: false,
         }, "The recipe changes did not all read back exactly, so Save was not clicked and no partial update was intentionally persisted.");
@@ -2986,10 +3037,13 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         }, "All requested recipe fields were filled, but Save was not available. Nothing was intentionally saved.");
       }
       await page.waitForTimeout(1000);
-      const finalDetail = await extractCustomRecipeDetailWithRetry(page, 4, 350);
+      await page.reload();
+      await this.openApp(page, "#custom-recipes");
+      const reopened = await resolveCustomRecipeTargets(page, { name: basicsInput.name, recipeId: before.recipeId }, { maxDetails: 1, timeoutMs: this.config.navigationTimeoutMs });
+      const finalDetail = reopened.targets.length === 1 ? reopened.targets[0] : undefined;
       const nameVerified = normalizeCustomFoodName(finalDetail?.name ?? "") === normalizeCustomFoodName(basicsInput.name);
       const servingsVerified = recipeServingsVerified(finalDetail, basicsInput);
-      const ingredientsVerified = recipeIngredientsVerified(finalDetail, addedIngredients);
+      const ingredientsVerified = recipeEditIngredientsVerified(before, finalDetail, addedIngredients, replacementIndices);
       const verified = nameVerified && servingsVerified && ingredientsVerified;
       return this.result("update_custom_recipe", verified ? "ok" : "possibly_written_verify_failed", {
         updated: verified,
@@ -3000,6 +3054,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         refilledBasics,
         basicsVerified,
         addedIngredients,
+        removedIngredients,
         saveClicked,
         nameVerified,
         servingsVerified,
@@ -3010,6 +3065,25 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   async deleteCustomRecipe(input: RecipeDeleteInput & { confirmed?: boolean }) {
+    if (!input.name?.trim()) {
+      return this.result("delete_custom_recipe", "needs_manual_step", {
+        browserOpened: false,
+        writeAttempted: false,
+      }, "Pass the exact current recipe name and matching confirmName, with recipeId when needed, so only the intended recipe is inspected.");
+    }
+    if (shouldRunConfirmedWrite(input, this.config.writeEnabled)) {
+      const accepted = this.startBackgroundBrowserJob(
+        "delete_custom_recipe",
+        backgroundBrowserJobKey("delete_custom_recipe", safeInput(input)),
+        safeInput(input),
+        () => this.runDeleteCustomRecipe(input),
+      );
+      return this.waitForAcceptedBackgroundJob("delete_custom_recipe", accepted, DEFAULT_RECIPE_WRITE_WAIT_SECONDS);
+    }
+    return this.runDeleteCustomRecipe(input);
+  }
+
+  private async runDeleteCustomRecipe(input: RecipeDeleteInput & { confirmed?: boolean }) {
     const confirmedWrite = shouldRunConfirmedWrite(input, this.config.writeEnabled);
     const ifUsed = input.ifUsed ?? "retire";
     return this.withPage("delete_custom_recipe", async (page) => {
@@ -4326,7 +4400,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       // deadline. If it fails, retire a reusable local session instead of
       // extending the operation with another navigation.
       if (session.closeContext === false) {
-        if (feature === "create_recipe" && result.status !== "ok" && !this.config.remoteWsEndpoint && this.config.reuseLocalBrowser) {
+        if (/^(create_recipe|update_custom_recipe)$/.test(feature) && result.status !== "ok" && !this.config.remoteWsEndpoint && this.config.reuseLocalBrowser) {
           // An unsaved recipe survives Escape and can intercept the next hash
           // navigation. Retire that page after capturing the failure, retaining
           // the authenticated storage state for the next serialized operation.
@@ -4431,7 +4505,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private featureQueueWaitTimeoutMs(feature: string) {
-    if (/^(log_food|log_foods|delete_diary_food_entry|create_custom_food|create_and_log_custom_food|update_custom_food|delete_custom_food|retire_custom_food)$/.test(feature)) {
+    if (/^(log_food|log_foods|delete_diary_food_entry|create_custom_food|create_and_log_custom_food|update_custom_food|delete_custom_food|retire_custom_food|update_custom_recipe|delete_custom_recipe)$/.test(feature)) {
       return Math.max(10000, Math.min(this.config.operationTimeoutMs, 180000));
     }
     if (/^(refresh_cronometer_session|cronometer_stability_check|search_foods|read_cronometer_page|list_custom_foods|find_duplicate_custom_foods|list_custom_meals|list_custom_recipes|list_private_recipe_names)$/.test(feature)) return 5000;
@@ -9111,6 +9185,7 @@ async function customRecipeDetailsForNames(page: Page, names: string[], maxDetai
       textHasFoodName(text, name) && /\b(BACK TO RECIPES? LIST|Recipe #|Ingredients|ADD TO DIARY)\b/i.test(text),
       6000,
     ).then(() => true).catch(() => false);
+    if (opened) await expandRecipeAdvancedInfo(page);
     const detail = opened ? await extractCustomRecipeDetailWithRetry(page, 3, 350) : undefined;
     details.push({
       ...(detail ?? { name, ingredientsStatus: "extraction_failed" as const }),
@@ -9607,6 +9682,61 @@ function recipeIngredientsVerified(
       && recipeIngredientSourceMatches(candidate.database, item.source)
       && recipeIngredientAmountMatches(candidate.amount, candidate.unit, item.amount, item.unit, candidate.weight));
   });
+}
+
+function recipeEditIngredientsVerified(
+  before: CustomRecipeDetail,
+  after: CustomRecipeDetail | undefined,
+  added: Array<{ status?: string; selectedCandidate?: SearchResult; [key: string]: unknown }>,
+  replacedIndices: Set<number>,
+) {
+  if (before.ingredientsStatus !== "parsed" || after?.ingredientsStatus !== "parsed") return false;
+  const expected = (before.ingredients ?? []).filter((_, index) => !replacedIndices.has(index));
+  for (const item of added) {
+    const ingredient = item.ingredient as RecipeInput["ingredients"][number] | undefined;
+    if (item.status !== "ok" || !item.selectedCandidate?.name || !ingredient) return false;
+    expected.push({ name: item.selectedCandidate.name, database: item.selectedCandidate.source, amount: ingredient.amount, unit: ingredient.unit });
+  }
+  const unmatched = [...(after.ingredients ?? [])];
+  if (expected.length !== unmatched.length) return false;
+  for (const ingredient of expected) {
+    const index = unmatched.findIndex((candidate) =>
+      normalizeFoodName(candidate.name) === normalizeFoodName(ingredient.name)
+        && recipeIngredientSourceMatches(candidate.database, ingredient.database)
+        && recipeIngredientAmountMatches(candidate.amount, candidate.unit, ingredient.amount, ingredient.unit, candidate.weight));
+    if (index < 0) return false;
+    unmatched.splice(index, 1);
+  }
+  return unmatched.length === 0;
+}
+
+async function removeRecipeIngredient(page: Page, name: string, source?: string) {
+  let row = page.locator("tr:not(:has(tr))").filter({ has: page.getByText(name, { exact: true }) });
+  if (source) row = row.filter({ has: page.getByText(source === "Custom Food" ? "Custom" : source, { exact: true }) });
+  if (await row.count() !== 1) return { removed: false, reason: "ingredient_row_not_unique" };
+  const control = row.getByRole("img", { name: "Delete", exact: true });
+  if (await control.count() !== 1) return { removed: false, reason: "ingredient_delete_control_not_unique" };
+  await control.click({ timeout: 5000 });
+  for (let attempt = 0; attempt < 5; attempt++) {
+    if (await row.count() === 0) return { removed: true };
+    await page.waitForTimeout(150);
+  }
+  return { removed: false, reason: "ingredient_removal_not_verified" };
+}
+
+async function expandRecipeAdvancedInfo(page: Page) {
+  const advanced = page.getByRole("button", { name: /^Advanced Info/i });
+  if (await advanced.count() === 1 && await advanced.isVisible() && await advanced.getAttribute("aria-expanded") !== "true") {
+    await advanced.click({ timeout: 5000 });
+  }
+}
+
+export async function __removeRecipeIngredientForTests(page: Page, name: string, source?: string) {
+  return removeRecipeIngredient(page, name, source);
+}
+
+export function __recipeEditIngredientsVerifiedForTests(before: CustomRecipeDetail, after: CustomRecipeDetail, added: Parameters<typeof recipeEditIngredientsVerified>[2], replaced: number[]) {
+  return recipeEditIngredientsVerified(before, after, added, new Set(replaced));
 }
 
 function recipeIngredientSourceMatches(actual?: string, expected?: string) {

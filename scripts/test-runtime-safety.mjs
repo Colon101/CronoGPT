@@ -1108,6 +1108,44 @@ try {
   });
   assert.equal(hostedProvider.featureQueueWaitTimeoutMs("log_food"), 180000);
   assert.equal(hostedProvider.featureQueueWaitTimeoutMs("log_foods"), 180000);
+  assert.equal(hostedProvider.featureQueueWaitTimeoutMs("update_custom_recipe"), 180000);
+  assert.equal(hostedProvider.featureQueueWaitTimeoutMs("delete_custom_recipe"), 180000);
+  for (const method of ["updateCustomRecipe", "deleteCustomRecipe"]) {
+    const refused = await hostedProvider[method]({ recipeId: "123", confirmed: true });
+    assert.equal(refused.status, "needs_manual_step");
+    assert.equal(refused.data.browserOpened, false, "an ID-only recipe mutation must refuse before scanning the library");
+    assert.equal(refused.data.writeAttempted, false);
+  }
+  const recipeJobProvider = new BrowserCronometerProvider({
+    ...provider.config,
+    operationJournalFile: join(tempDir, "recipe-edit-jobs.json"),
+  });
+  // Keep the real admission, deduplication and durable completion machinery.
+  // Only the slow browser edit and the initial response wait are stubbed.
+  let finishRecipeEdit;
+  let recipeEditRuns = 0;
+  recipeJobProvider.runUpdateCustomRecipe = async () => {
+    recipeEditRuns++;
+    return new Promise((resolve) => { finishRecipeEdit = resolve; });
+  };
+  recipeJobProvider.waitForAcceptedBackgroundJob = async (_feature, accepted, seconds) => {
+    assert.equal(seconds, 20, "recipe edits must return before the ChatGPT request timeout");
+    return accepted;
+  };
+  const editInput = { name: "Existing recipe", recipeId: "123", newName: "New recipe name", confirmed: true };
+  const pendingEdit = await recipeJobProvider.updateCustomRecipe(editInput);
+  assert.equal(pendingEdit.status, "accepted");
+  const duplicateEdit = await recipeJobProvider.updateCustomRecipe(editInput);
+  assert.equal(duplicateEdit.data.operationId, pendingEdit.data.operationId);
+  assert.equal(recipeEditRuns, 1, "a pending recipe edit must not be submitted twice");
+  finishRecipeEdit({ provider: "browser", mode: "browser", feature: "update_custom_recipe", status: "ok", data: { updated: true } });
+  await new Promise((resolve) => setImmediate(resolve));
+  const finishedEdit = await recipeJobProvider.getOperation(pendingEdit.data.operationId);
+  assert.equal(finishedEdit.status, "ok");
+  assert.equal(finishedEdit.data.updated, true);
+  const resumedRecipeJobs = new BrowserCronometerProvider(recipeJobProvider.config);
+  const durableEdit = await resumedRecipeJobs.getOperation(pendingEdit.data.operationId);
+  assert.equal(durableEdit.status, "ok", "recipe completion must survive a provider restart");
   assert.equal(hostedProvider.featureQueueWaitTimeoutMs("create_and_log_custom_food"), 180000);
   assert.equal(hostedProvider.featureQueueWaitTimeoutMs("delete_diary_food_entry"), 180000);
 

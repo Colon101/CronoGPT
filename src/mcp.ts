@@ -37,7 +37,7 @@ import {
 } from "./oauth.js";
 
 export const MCP_PATH = "/mcp";
-export const MCP_SERVER_VERSION = "0.1.29";
+export const MCP_SERVER_VERSION = "0.1.30";
 export const WIDGET_URI = `ui://widget/cronometer-dashboard-v${MCP_SERVER_VERSION}.html`;
 
 const widgetHtml = readFileSync(new URL("../public/cronometer-widget.html", import.meta.url), "utf8")
@@ -1360,10 +1360,10 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   register(
     "delete_custom_recipe",
     "Delete custom recipe",
-    "Deletes one existing Cronometer custom recipe by exact recipeId or unique exact name. Requires confirmed=true and confirmName matching the selected recipe name. If Cronometer reports existing diary uses, the default behavior is to click Cronometer's native Retire action and preserve history; force deletion requires explicit user approval.",
+    "Deletes one existing Cronometer custom recipe by its exact current name; include recipeId to disambiguate duplicates. Always pass name, even when recipeId is known, to avoid scanning the library. Requires confirmed=true and matching confirmName. Poll get_cronometer_operation if accepted. Existing diary uses default to Cronometer's native Retire action; force deletion requires explicit user approval.",
     {
       recipeId: z.string().optional(),
-      name: z.string().optional(),
+      name: z.string().min(1).describe("Exact current recipe name. Required even when recipeId is provided."),
       confirmName: z.string().optional(),
       ifUsed: z.enum(["stop", "retire", "force"]).optional().describe("Defaults to retire. When Cronometer reports existing diary uses, retire clicks Cronometer's native Retire action and preserves history; force requires explicit user approval."),
       dryRun: z.boolean().optional(),
@@ -1376,10 +1376,10 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   register(
     "update_custom_recipe",
     "Update custom recipe",
-    "Updates one existing Cronometer custom recipe by exact recipeId or unique exact name. Can edit basics/cooked weight and add resolved ingredients without creating a duplicate.",
+    "Updates one existing Cronometer custom recipe by its exact current name; include recipeId to disambiguate duplicates. Always pass name, even when recipeId is known, to avoid scanning the library. Edits name, servings or cooked weight, adds ingredients, or replaces exact named ingredients in place without creating a duplicate recipe. For a swap, use ingredientsToReplace rather than adding a second ingredient. Omitted fields and other ingredients are preserved. Poll get_cronometer_operation if accepted; do not resubmit a pending edit.",
     {
       recipeId: z.string().optional(),
-      name: z.string().optional().describe("Current exact custom recipe name. If multiple recipes match, recipeId is required."),
+      name: z.string().min(1).describe("Current exact custom recipe name, required even when recipeId is provided. If multiple recipes match, recipeId is required."),
       newName: z.string().optional(),
       ingredientsToAdd: z.array(
         z.object({
@@ -1390,6 +1390,17 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
           unit: z.string().optional(),
         }),
       ).min(1).optional(),
+      ingredientsToReplace: z.array(z.object({
+        currentName: z.string().min(1).describe("Exact existing ingredient name to replace."),
+        currentSource: z.string().optional().describe("Current database source, to disambiguate names."),
+        ingredient: z.object({
+          query: z.string().min(1),
+          selectedName: z.string().optional(),
+          selectedSource: z.string().optional(),
+          amount: z.number().positive(),
+          unit: z.string().min(1),
+        }),
+      })).min(1).optional().describe("Replace each unique exact current ingredient with the resolved replacement; all other ingredients remain unchanged."),
       servings: z.number().positive().optional(),
       servingName: z.string().optional(),
       cookedWeight: z.number().positive().optional(),
