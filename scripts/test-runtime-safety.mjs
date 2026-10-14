@@ -1146,6 +1146,68 @@ try {
   const resumedRecipeJobs = new BrowserCronometerProvider(recipeJobProvider.config);
   const durableEdit = await resumedRecipeJobs.getOperation(pendingEdit.data.operationId);
   assert.equal(durableEdit.status, "ok", "recipe completion must survive a provider restart");
+  const savedFoodLoopProvider = new BrowserCronometerProvider({ ...provider.config, operationJournalFile: join(tempDir, "saved-food-reset-loop.json") });
+  const libraryCalls = [];
+  savedFoodLoopProvider.waitForAcceptedBackgroundJob = async (_feature, accepted) => accepted;
+  savedFoodLoopProvider.runCreateCustomFood = async () => {
+    libraryCalls.push("create");
+    return { provider: "browser", mode: "browser", feature: "create_custom_food", status: "ok", data: { created: true } };
+  };
+  savedFoodLoopProvider.runDeleteCustomFood = async () => {
+    libraryCalls.push("delete");
+    return { provider: "browser", mode: "browser", feature: "delete_custom_food", status: "ok", data: { deleted: true } };
+  };
+  const savedFoodInput = { name: "Reset cycle fixture", servingSize: "100 g", nutrients: { calories: 100 }, confirmed: true };
+  const savedDeleteInput = { name: savedFoodInput.name, confirmName: savedFoodInput.name, confirmed: true };
+  const cycle = [];
+  for (const [method, input] of [["createCustomFood", savedFoodInput], ["deleteCustomFood", savedDeleteInput], ["createCustomFood", savedFoodInput], ["deleteCustomFood", savedDeleteInput]]) {
+    const operation = await savedFoodLoopProvider[method](input);
+    assert.equal(operation.status, "accepted", "a new library intent must verify current state, not return a past success receipt");
+    cycle.push(operation.data.operationId);
+    await new Promise((resolve)=>setImmediate(resolve));
+    assert.equal((await savedFoodLoopProvider.getOperation(operation.data.operationId)).status,"ok");
+  }
+  assert.equal(new Set(cycle).size,4);
+  assert.deepEqual(libraryCalls,["create","delete","create","delete"],"delete/recreate/delete must execute each exact-name transaction");
+  assert.equal((await savedFoodLoopProvider.getOperation(cycle[0])).status,"ok","old operation receipts remain available for audit");
+  const savedFoodRestart = new BrowserCronometerProvider(savedFoodLoopProvider.config);
+  let restartedCreates=0;
+  savedFoodRestart.waitForAcceptedBackgroundJob=async(_feature,accepted)=>accepted;
+  savedFoodRestart.runCreateCustomFood=async()=>{restartedCreates++;return {provider:"browser",mode:"browser",feature:"create_custom_food",status:"ok",data:{created:true}}};
+  assert.equal((await savedFoodRestart.createCustomFood(savedFoodInput)).status,"accepted");
+  await new Promise((resolve)=>setImmediate(resolve));
+  assert.equal(restartedCreates,1,"a durable success from before deletion must not prevent recreating the food");
+  const legacySavedDeleteJournal=join(tempDir,"legacy-saved-delete-menu.json");
+  writeFileSync(legacySavedDeleteJournal,JSON.stringify({version:2,operations:[{
+    id:"bg_legacy_saved_delete_menu",key:"legacy-menu-key",feature:"delete_custom_food",status:"completed",startedAt:1,updatedAt:2,
+    result:{provider:"browser",mode:"browser",feature:"delete_custom_food",status:"needs_manual_step",warning:"Opened the actions menu but could not find a delete action.",data:{target:{name:"Test Food"}}},
+  }]}));
+  const recoveredSavedDelete=new BrowserCronometerProvider({...provider.config,operationJournalFile:legacySavedDeleteJournal});
+  const noActionDelete=await recoveredSavedDelete.getOperation("bg_legacy_saved_delete_menu");
+  assert.equal(noActionDelete.data.writeAttempted,false,"the historical menu-not-found branch proves no delete control was clicked");
+  assert.equal(noActionDelete.data.deleteClicked,false);
+  const combinedResetProvider=new BrowserCronometerProvider({...provider.config,operationJournalFile:join(tempDir,"combined-reset-intents.json")});
+  combinedResetProvider.waitForAcceptedBackgroundJob=async(_feature,accepted)=>accepted;
+  let finishCombinedBeforeReset;
+  const combinedIntentKeys=[];
+  combinedResetProvider.runCreateAndLogCustomFood=async(_input,logInput)=>{
+    combinedIntentKeys.push(logInput.idempotencyKey);
+    if(logInput.idempotencyKey==="combined-before-reset")return new Promise(resolve=>finishCombinedBeforeReset=resolve);
+    return {provider:"browser",mode:"browser",feature:"create_and_log_custom_food",status:"written",data:{logged:true}};
+  };
+  const combinedInput={name:"Combined reset fixture",servingSize:"100 g",nutrients:{calories:100},date:"2026-10-14",meal:"Breakfast",amount:45,unit:"g",confirmed:true};
+  const firstCombined=await combinedResetProvider.createAndLogCustomFood({...combinedInput,idempotencyKey:"combined-before-reset"});
+  assert.equal(firstCombined.status,"accepted");
+  const bypassCombined=await combinedResetProvider.createAndLogCustomFood({...combinedInput,idempotencyKey:"combined-after-reset"});
+  assert.equal(bypassCombined.status,"possibly_written_verify_failed","a fresh key must not bypass a pending identical combined write");
+  assert.equal(combinedIntentKeys.length,1);
+  finishCombinedBeforeReset({provider:"browser",mode:"browser",feature:"create_and_log_custom_food",status:"written",data:{logged:true}});
+  await new Promise(resolve=>setImmediate(resolve));
+  const nextCombined=await combinedResetProvider.createAndLogCustomFood({...combinedInput,idempotencyKey:"combined-after-reset"});
+  assert.equal(nextCombined.status,"accepted");
+  assert.notEqual(nextCombined.data.operationId,firstCombined.data.operationId,"a new user intent after reset must not reuse the old logging receipt");
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(combinedIntentKeys,["combined-before-reset","combined-after-reset"]);
   assert.equal(hostedProvider.featureQueueWaitTimeoutMs("create_and_log_custom_food"), 180000);
   assert.equal(hostedProvider.featureQueueWaitTimeoutMs("delete_diary_food_entry"), 180000);
 

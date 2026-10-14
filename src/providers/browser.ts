@@ -2194,6 +2194,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     const useLabelServing = !normalizedInput.portion && requestedServingUnit === "serving"
       && labelServing && labelServing.unit !== "serving";
     let logInput: FoodLogInput = {
+      idempotencyKey: normalizedInput.idempotencyKey,
       date: normalizedInput.date,
       meal: normalizedInput.meal,
       query: normalizedInput.name,
@@ -2266,6 +2267,18 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       backgroundKey,
       safeInput(normalizedInput),
       () => this.runCreateAndLogCustomFood(normalizedInput, logInput, customFoodInput),
+      {
+        callerIdempotencyKey: normalizedInput.idempotencyKey,
+        semanticPayload: {
+          name: customFoodInput.name,
+          servingSize: customFoodInput.servingSize,
+          portions: customFoodInput.portions,
+          nutrients: customFoodInput.nutrients,
+          barcode: customFoodInput.barcode,
+          duplicatePolicy: customFoodInput.duplicatePolicy,
+          ...canonicalFoodLogPayload(normalizedLog),
+        },
+      },
     );
     return this.waitForAcceptedBackgroundJob(
       "create_and_log_custom_food",
@@ -2550,6 +2563,8 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         return this.result("delete_custom_food", "needs_manual_step", {
           input: safeInput(input),
           target,
+          writeAttempted: false,
+          deleteClicked: false,
           visibleText: compactText(await this.visibleText(page), 12000),
         }, "Opened the actions menu but could not find a delete action.");
       }
@@ -2577,6 +2592,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       }
 
       await page.waitForTimeout(1200);
+      await dismissSavedItemSuccessNotice(page);
       const deletion = await waitForCustomFoodGone(page, target, this.config.navigationTimeoutMs);
       return this.result("delete_custom_food", deletion.gone ? "ok" : "possibly_written_verify_failed", {
         deleted: deletion.gone,
@@ -3165,6 +3181,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       }
 
       await page.waitForTimeout(1200);
+      await dismissSavedItemSuccessNotice(page);
       await this.openApp(page, "#custom-recipes");
       const listText = await waitForCustomItemListText(page, "Custom Recipes", this.config.navigationTimeoutMs);
       const stillListed = textHasFoodName(listText, target.name);
@@ -3729,6 +3746,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
   }
 
   private async openApp(page: Page, hash = "") {
+    await dismissSavedItemSuccessNotice(page);
     // Defend against modal state left by an older server version or an
     // interrupted reused-context operation before navigating the app shell.
     await closeFoodDialog(page, Math.min(this.config.navigationTimeoutMs, 10000)).catch(() => undefined);
@@ -4044,7 +4062,16 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       .filter((operation) => operation.key === key)
       .sort(comparePersistedOperationsNewestFirst)[0];
     const persistedExistingDidNotWrite = persistedOperationDefinitelyDidNotWrite(persistedExisting);
-    if (persistedExisting && !persistedExistingDidNotWrite && persistedExisting.canonicalPayload && persistedExisting.canonicalPayload !== canonicalPayload) {
+    const inputObject = input && typeof input === "object" ? input as Record<string, unknown> : {};
+    const revalidateLibraryWrite = /^(create_custom_food|update_custom_food|delete_custom_food|retire_custom_food)$/.test(feature)
+      && !(feature === "create_custom_food" && inputObject.duplicatePolicy === "create_new");
+    const revalidatePersisted = revalidateLibraryWrite && Boolean(persistedExisting && persistedOperationIsVerifiedSuccess(persistedExisting));
+    const revalidateExisting = revalidateLibraryWrite && Boolean(existing && persistedOperationIsVerifiedSuccess(existing));
+    // A food can be deleted and recreated between two identical library
+    // requests. Revalidate through the exact-name upsert/delete flow rather
+    // than returning an old success as evidence about the current library.
+    // Pending and indeterminate operations keep their no-replay protections.
+    if (!revalidatePersisted && persistedExisting && !persistedExistingDidNotWrite && persistedExisting.canonicalPayload && persistedExisting.canonicalPayload !== canonicalPayload) {
       return this.result(feature, "needs_manual_step", {
         operationId: persistedExisting.id,
         idempotencyKey: safety?.callerIdempotencyKey,
@@ -4096,7 +4123,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         nextAction: "use_new_idempotency_key",
       }, "A verified earlier delete has the same legacy derived key. CronoGPT will not replay that old success as current diary evidence. Inspect the diary and use a new idempotencyKey for a new user-approved delete intent.");
     }
-    if (!existing && !persistedExistingDidNotWrite && persistedExisting?.status === "completed" && persistedExisting.result && persistedExisting.result.status !== "busy") {
+    if (!revalidatePersisted && !existing && !persistedExistingDidNotWrite && persistedExisting?.status === "completed" && persistedExisting.result && persistedExisting.result.status !== "busy") {
       return this.result(feature, persistedExisting.result.status, {
         ...resultDataObject(persistedExisting.result),
         operationId: persistedExisting.id,
@@ -4123,7 +4150,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       }, "A verified earlier delete has the same legacy derived key. CronoGPT will not replay that old success as current diary evidence. Inspect the diary and use a new idempotencyKey for a new user-approved delete intent.");
     }
     const existingDidNotWrite = existing?.status === "completed" && providerResultDefinitelyDidNotWrite(existing.result);
-    if (existing?.status === "completed" && !existingDidNotWrite && existing.result && existing.result.status !== "busy") {
+    if (!revalidateExisting && existing?.status === "completed" && !existingDidNotWrite && existing.result && existing.result.status !== "busy") {
       return this.result(feature, existing.result.status, {
         ...resultDataObject(existing.result),
         backgroundJob: summarizeBackgroundBrowserJob(existing, Date.now()),
@@ -4761,6 +4788,23 @@ async function clickOptionalSaveConfirmation(page: Page) {
   return clickFirstVisible(dialog.locator(clickableTextSelector()).filter({ hasText: /^(SAVE|CONFIRM|YES|OK)$/i }));
 }
 
+async function dismissSavedItemSuccessNotice(page: Page) {
+  const dialog = page.locator(".pretty-dialog:visible,.gwt-DialogBox:visible,[role='dialog']:visible,.popupContent:visible")
+    .filter({ hasText: /Successfully (?:deleted|retired)\b/i }).last();
+  if (await dialog.count() === 0) return { dismissed: false };
+  const text = (await dialog.innerText()).replace(/\s+/g, " ").trim();
+  if (!/^(?:Message )?Successfully (?:deleted|retired) .+ OK$/i.test(text)) return { dismissed: false };
+  const ok = dialog.getByRole("button", { name: /^OK$/i });
+  if (await ok.count() !== 1) return { dismissed: false };
+  await ok.click({ timeout: 3000 });
+  await dialog.waitFor({ state: "hidden", timeout: 3000 });
+  return { dismissed: true };
+}
+
+export async function __dismissSavedItemSuccessNoticeForTests(page: Page) {
+  return dismissSavedItemSuccessNotice(page);
+}
+
 interface DeleteConfirmationOutcome {
   dialogVisible: boolean;
   dialogText?: string;
@@ -5172,6 +5216,14 @@ function recoverPersistedBrowserOperation(operation: PersistedBackgroundBrowserJ
       status: "indeterminate",
       error: "The process restarted before this operation reached a terminal state.",
     };
+  }
+
+  // Older saved-food deletes marked the page before looking for the menu
+  // action. This exact branch returned only when no delete control was clicked.
+  if (operation.feature === "delete_custom_food" && operation.status === "completed"
+    && operation.result?.status === "needs_manual_step"
+    && operation.result.warning === "Opened the actions menu but could not find a delete action.") {
+    operation = { ...operation, result: { ...operation.result, data: { ...resultDataObject(operation.result), writeAttempted: false, deleteClicked: false } } };
   }
 
   const foodEffectFeatures = new Set([
@@ -9300,9 +9352,8 @@ async function openCustomFoodTarget(page: Page, target: CustomFoodDetail) {
     5000,
   ).then(() => true).catch(() => false);
   if (!openedDetail) return false;
-  if (!target.foodId) return true;
   const detail = await extractCustomFoodDetail(page);
-  if (!detail?.foodId && textHasFoodName(await page.locator("body").innerText({ timeout: 3000 }).catch(() => ""), target.name)) return true;
+  if (!target.foodId) return Boolean(detail?.foodId && normalizeCustomFoodName(detail.name) === normalizeCustomFoodName(target.name));
   return detail?.foodId === target.foodId;
 }
 

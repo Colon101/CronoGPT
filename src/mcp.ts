@@ -37,7 +37,7 @@ import {
 } from "./oauth.js";
 
 export const MCP_PATH = "/mcp";
-export const MCP_SERVER_VERSION = "0.1.30";
+export const MCP_SERVER_VERSION = "0.1.31";
 export const WIDGET_URI = `ui://widget/cronometer-dashboard-v${MCP_SERVER_VERSION}.html`;
 
 const widgetHtml = readFileSync(new URL("../public/cronometer-widget.html", import.meta.url), "utf8")
@@ -959,6 +959,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
       portions: customFoodPortionsSchema.optional(),
       nutrients: nonEmptyNutrientRecordSchema.describe("Required package-label values using custom_food_nutrient_schema keys, aliases, or exact Cronometer labels. Include every available value, not only calories and macros."),
       nutritionSource: z.string().optional().describe("Short citation or URL/title summary of where ChatGPT found the nutrition facts. Stored in the tool result for audit; not written as a secret."),
+      idempotencyKey: z.string().min(1).optional().describe("Use a fresh key for a new diary intent after a user-approved reset; reuse it only for retries of that same intent, never to bypass an unresolved operation."),
       barcode: barcodeInputSchema.optional(),
       duplicatePolicy: z.enum(["fail", "update_existing"]).optional().describe("Defaults to update_existing so an existing same-named custom food is updated rather than duplicated. Use create_custom_food separately only when an intentional duplicate is required."),
       expectedExistingMatchCount: expectedExistingMatchCountSchema.optional(),

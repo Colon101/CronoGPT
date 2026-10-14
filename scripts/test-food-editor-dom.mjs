@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { chromium } from "playwright-core";
 import {
   __closeFoodDialogForTests,
+  __dismissSavedItemSuccessNoticeForTests,
   __clickFoodSearchResultForTests,
   __collectFoodSearchResultsForTests,
   __exerciseFoodEditorSafetyForTests,
@@ -20,6 +21,13 @@ import {
 const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true });
 try {
   const page = await browser.newPage();
+  await page.setContent(`<div class="gwt-DialogBox" role="dialog">Message <div>Successfully deleted Test Food</div><button>OK</button></div><button id="next-food">Next saved food</button><script>document.querySelector('[role=dialog] button').onclick=()=>document.querySelector('[role=dialog]').remove();document.querySelector('#next-food').onclick=()=>window.nextFoodOpened=true</script>`);
+  assert.equal((await __dismissSavedItemSuccessNoticeForTests(page)).dismissed, true);
+  await page.locator('#next-food').click();
+  assert.equal(await page.evaluate(()=>window.nextFoodOpened),true,"a completed delete notice must not block the next food editor");
+  await page.setContent(`<div class="gwt-DialogBox" role="dialog">Message <div>This food is used by existing recipes. Delete or retire it?</div><button>OK</button></div>`);
+  assert.equal((await __dismissSavedItemSuccessNoticeForTests(page)).dismissed, false,"dependency confirmation is not a success notice");
+  assert.equal(await page.getByRole('dialog').count(),1);
   await page.setContent(`
     <table><tr><td><table>
       <tr id="butter"><td><div>Butter, Salted</div></td><td>NCCDB</td><td>16.15</td><td>g</td><td><img alt="Delete" title="Delete" width="16" height="16"></td></tr>

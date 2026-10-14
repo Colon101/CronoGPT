@@ -407,6 +407,7 @@ export interface CustomFoodInput {
 }
 
 export interface CustomFoodAndLogInput extends CustomFoodInput {
+  idempotencyKey?: string;
   date?: string;
   meal: string;
   amount?: number;
