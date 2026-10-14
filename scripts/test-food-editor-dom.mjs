@@ -8,6 +8,7 @@ import {
   __collectFoodSearchResultsForTests,
   __exerciseFoodEditorSafetyForTests,
   __fillFoodAmountForTests,
+  __fillFoodUnitForTests,
   __fillRecipeBasicsForTests,
   __fillRecipeIngredientFieldsForTests,
   __fillRecipeCookedWeightForTests,
@@ -21,6 +22,22 @@ import {
 const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true });
 try {
   const page = await browser.newPage();
+  await page.setContent(`<style>#background-unit{width:8px;height:12px}#diary-unit-editor{width:400px;height:200px}.dropdown-menu{display:none}</style>
+    <table><tr><td id="background-unit">g</td></tr></table>
+    <div id="diary-unit-editor"><button class="dropdown-btn dropdown-toggle" id="diary-unit">full recipe — 807g</button></div>
+    <div class="dropdown-menu"><a class="gwt-Anchor dropdown-item" href="javascript:void(0)">g</a><a class="gwt-Anchor dropdown-item">full recipe — 807g</a></div>
+    <script>(()=>{window.backgroundDiaryUnitClicked=false;
+      const editor=document.querySelector('#diary-unit-editor'),unit=document.querySelector('#diary-unit'),menu=document.querySelector('.dropdown-menu');
+      document.querySelector('#background-unit').onclick=()=>{window.backgroundDiaryUnitClicked=true;editor.style.display='none'};
+      unit.onclick=()=>setTimeout(()=>menu.style.display='block',500);
+      menu.querySelector('a').onclick=()=>{setTimeout(()=>unit.textContent='g',300);menu.style.display='none'};
+    })();</script>`);
+  const diaryRecipeUnit=await __fillFoodUnitForTests(page,'#diary-unit-editor','g');
+  assert.equal(diaryRecipeUnit.filled,true,JSON.stringify(diaryRecipeUnit));
+  assert.equal(await page.locator('#diary-unit').innerText(),'g');
+  assert.equal(await page.evaluate(()=>window.backgroundDiaryUnitClicked),false,'recipe gram selection must ignore background nutrition units and wait for the actual dropdown');
+  await page.setContent(`<table><tr><td>g</td></tr></table><div id="missing-unit-editor"><button class="dropdown-btn dropdown-toggle">full recipe — 807g</button></div><div class="dropdown-menu"><a class="dropdown-item">full recipe — 807g</a></div>`);
+  assert.equal((await __fillFoodUnitForTests(page,'#missing-unit-editor','g')).filled,false,'a full-recipe unit containing a gram annotation is not a gram option');
   await page.setContent(`<div class="gwt-DialogBox" role="dialog">Message <div>Successfully deleted Test Food</div><button>OK</button></div><button id="next-food">Next saved food</button><script>document.querySelector('[role=dialog] button').onclick=()=>document.querySelector('[role=dialog]').remove();document.querySelector('#next-food').onclick=()=>window.nextFoodOpened=true</script>`);
   assert.equal((await __dismissSavedItemSuccessNoticeForTests(page)).dismissed, true);
   await page.locator('#next-food').click();

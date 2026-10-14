@@ -299,3 +299,5 @@ For model-initiated recipe writes, pass a chosen `selectedName` and `selectedSou
 See `docs/cronometer-chatgpt-plan.md` for the feature matrix and shipping checklist.
 
 Saved-food deletion dismisses only verified success notices before continuing to the next item and requires a real food-editor ID. New library upsert/delete intents revalidate the current library instead of replaying completed receipts, so delete/recreate/delete cycles remain usable. Historical operation IDs still return their receipts for audit. For `create_and_log_custom_food` after a user-approved diary reset, pass a fresh `idempotencyKey` for the new intent. Reuse that key only for retries; a new key cannot bypass an unresolved identical write.
+
+Diary unit selection waits for the serving menu and only clicks actual menu options. Background nutrition-unit labels cannot choose a measure; a full-recipe serving annotated with grams is not treated as the gram option. Amount entry runs after the unit change, which may reset Cronometer's default quantity.

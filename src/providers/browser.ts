@@ -7464,8 +7464,9 @@ async function fillFoodUnit(page: Page, editor: ReturnType<Page["locator"]>, uni
     return { filled: true as const, unit: normalizedUnit, strategy: "already-selected" as const, currentUnitText };
   }
   await unitButton.click();
+  await waitForVisibleUnitOptions(page, 1800);
   const clicked = await clickExactFoodLogUnitOption(page, normalizedUnit)
-    || await clickVisibleUnitOption(page, normalizedUnit);
+    || (normalizedUnit.toLowerCase() !== "g" && await clickVisibleUnitOption(page, normalizedUnit));
   if (!clicked) {
     await page.keyboard.press("Escape").catch(() => undefined);
     return {
@@ -7486,6 +7487,10 @@ async function fillFoodUnit(page: Page, editor: ReturnType<Page["locator"]>, uni
     };
   }
   return { filled: true as const, unit: normalizedUnit, strategy: "dropdown-option" as const, currentUnitText: updatedUnitText };
+}
+
+export async function __fillFoodUnitForTests(page: Page, editorSelector: string, unit: string) {
+  return fillFoodUnit(page, page.locator(editorSelector), unit);
 }
 
 async function foodLogUnitDropdownButton(scope: ReturnType<Page["locator"]>) {
@@ -7531,7 +7536,7 @@ async function clickExactFoodLogUnitOption(page: Page, unit: string) {
   const labelPattern = labels.map(escapeRegExp).join("|");
   const exactPattern = new RegExp(`^\\s*(?:1(?:\\.0+)?\\s+)?(?:${labelPattern})\\s*$`, "i");
   const candidates = page
-    .locator(".dropdown-item:visible,[role='option']:visible,.gwt-MenuItem:visible,li:visible,td:visible,button:visible")
+    .locator(".dropdown-item:visible,[role='option']:visible,.gwt-MenuItem:visible,.dropdown-menu li:visible,.dropdown-menu td:visible,.gwt-PopupPanel li:visible,.gwt-PopupPanel td:visible,.select-popup li:visible,.select-popup td:visible")
     .filter({ hasText: exactPattern });
   const count = await candidates.count().catch(() => 0);
   for (let index = 0; index < count; index += 1) {
@@ -7539,7 +7544,7 @@ async function clickExactFoodLogUnitOption(page: Page, unit: string) {
     if (!(await candidate.isVisible().catch(() => false))) continue;
     const text = await candidate.innerText().catch(() => "");
     if (!foodLogUnitTextMatches(text, unit)) continue;
-    await candidate.click().catch(async () => candidate.click({ force: true }));
+    await candidate.click({ timeout: 1500 });
     return true;
   }
   return false;
