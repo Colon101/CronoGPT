@@ -8,6 +8,7 @@ import {
   __exerciseFoodEditorSafetyForTests,
   __fillFoodAmountForTests,
   __fillRecipeBasicsForTests,
+  __fillRecipeIngredientFieldsForTests,
   __fillRecipeCookedWeightForTests,
   __readFoodEditorIdentityForTests,
   __searchCurrentFoodDialogForTests,
@@ -153,6 +154,44 @@ try {
   assert.equal(typedBasics.servingsFilled,true);
   assert.equal(await page.locator('#recipe-add').isEnabled(),true);
   assert.deepEqual(await page.evaluate(()=>window.recipeModel),{"recipe-name":"Chocolate Banana Bread","recipe-serving":"g","recipe-count":"807"});
+
+  // A small background 'g' label used to win over the real menu option and
+  // dismiss the ingredient dialog. Unit selection must keep this editor open.
+  await page.setContent(`
+    <style>
+      #background-g{position:absolute;left:5px;top:5px;width:6px;height:12px;font-size:9px}
+      .pretty-dialog{position:absolute;left:100px;top:80px;width:400px;height:300px}
+      .food-search-name,input,button{display:block;width:240px;min-height:28px}
+      .dropdown-menu{position:absolute;left:100px;top:190px;width:240px}
+      .dropdown-item{display:block;width:220px;height:32px}
+    </style>
+    <div id="background-g">g</div>
+    <div class="pretty-dialog" role="dialog"><div class="food-search-name">Banana, raw</div>
+      <input class="text-box" aria-label="Amount" value="1">
+      <button class="dropdown-btn dropdown-toggle" id="ingredient-unit">250ml mashed — 238g</button>
+      <button id="commit-ingredient">ADD</button>
+    </div>
+    <div class="popupContent dropdown-menu" role="listbox" style="display:none"><div class="dropdown-item" role="option">g</div></div>
+    <script>
+      (()=>{
+      window.backgroundUnitClicked=false;window.ingredientModel={};
+      const editor=document.querySelector('.pretty-dialog'),menu=document.querySelector('.dropdown-menu'),unit=document.querySelector('#ingredient-unit'),amount=editor.querySelector('input');
+      document.querySelector('#background-g').onclick=()=>{window.backgroundUnitClicked=true;editor.style.display='none'};
+      unit.onclick=()=>menu.style.display='block';
+      menu.querySelector('[role=option]').onclick=()=>{unit.textContent='g';window.ingredientModel.unit='g';menu.style.display='none'};
+      let typed=false;amount.onkeydown=()=>typed=true;
+      amount.onblur=()=>{if(typed)window.ingredientModel.amount=Number(amount.value)};
+      document.querySelector('#commit-ingredient').onclick=()=>window.savedIngredient=window.ingredientModel.amount+' '+window.ingredientModel.unit;
+      })();
+    </script>
+  `);
+  const ingredientFields=await __fillRecipeIngredientFieldsForTests(page,385.7,"g","Banana, raw");
+  assert.equal(ingredientFields.unit.filled,true,JSON.stringify(ingredientFields));
+  assert.equal(ingredientFields.amount?.filled,true);
+  assert.equal(await page.locator('.pretty-dialog').isVisible(),true);
+  assert.equal(await page.evaluate(()=>window.backgroundUnitClicked),false);
+  await page.locator('#commit-ingredient').click();
+  assert.equal(await page.evaluate(()=>window.savedIngredient),"385.7 g");
 
   await page.setContent(`
     <div role="dialog"><div>Add Food to Diary</div>

@@ -7456,8 +7456,10 @@ async function fillLikelyAmount(page: Page, amount?: number, selectedName?: stri
   if (/^(radio|checkbox|button|submit)$/i.test(elementType)) {
     return { filled: false, warning: `Refused to fill non-text ingredient amount input: ${elementType}.` };
   }
-  await input.fill(amountText);
-  await input.press("Tab").catch(() => page.keyboard.press("Tab").catch(() => undefined));
+  await input.click();
+  await input.press("Control+A");
+  await input.pressSequentially(amountText, { delay: 10 });
+  await input.press("Tab");
   await page.waitForTimeout(120);
   const actualValue = await input.inputValue().catch(() => "");
   if (!numericInputMatches(actualValue, amount)) {
@@ -7550,7 +7552,6 @@ async function fillLikelyUnit(page: Page, unit?: string) {
     if (selected) return { filled: true, unit: normalizedUnit, strategy: "select-label" };
   }
 
-  const dialog = activeDialog(page);
   const unitButton = await recipeUnitDropdownButton(page);
   if (!unitButton) return { filled: false, unit: normalizedUnit, warning: "No visible unit dropdown was found." };
   const currentUnitText = await unitButton.innerText().catch(() => "");
@@ -7560,10 +7561,7 @@ async function fillLikelyUnit(page: Page, unit?: string) {
 
   await unitButton.click({ timeout: 2500 }).catch(async () => unitButton.click({ timeout: 2500, force: true }));
   await waitForVisibleUnitOptions(page, 1800);
-  const clicked = await clickVisibleUnitOption(page, normalizedUnit)
-    || await clickVisibleOptionByExactText(page, normalizedUnit)
-    || await clickVisibleOptionByExactText(page, unitAliases(normalizedUnit)[0])
-    || await clickVisibleControlByLabel(dialog, new RegExp(`^${escapeRegExp(normalizedUnit)}$`, "i"));
+  const clicked = await clickVisibleUnitOption(page, normalizedUnit);
   if (clicked) {
     const updatedUnitText = await waitForUnitText(page, unitButton, normalizedUnit, 1800);
     if (unitTextAlreadyMatches(updatedUnitText, normalizedUnit)) {
@@ -7575,6 +7573,12 @@ async function fillLikelyUnit(page: Page, unit?: string) {
   await page.keyboard.press("Escape").catch(() => undefined);
   const updatedUnitText = await unitButton.innerText().catch(() => currentUnitText);
   return { filled: false, unit: normalizedUnit, currentUnitText: updatedUnitText, warning: `Could not select unit option: ${normalizedUnit}.` };
+}
+
+export async function __fillRecipeIngredientFieldsForTests(page: Page, amount: number, unit: string, selectedName?: string) {
+  const unitResult = await fillLikelyUnit(page, unit);
+  const amountResult = unitResult.filled ? await fillLikelyAmount(page, amount, selectedName) : undefined;
+  return { unit: unitResult, amount: amountResult };
 }
 
 async function waitForVisibleUnitOptions(page: Page, timeoutMs: number) {
@@ -7593,9 +7597,9 @@ async function waitForVisibleUnitOptions(page: Page, timeoutMs: number) {
 
 async function waitForUnitText(page: Page, unitButton: ReturnType<Page["locator"]>, unit: string, timeoutMs: number) {
   const deadline = Date.now() + timeoutMs;
-  let latest = await unitButton.innerText().catch(() => "");
+  let latest = await unitButton.innerText({ timeout: 300 }).catch(() => "");
   while (Date.now() < deadline) {
-    latest = await unitButton.innerText().catch(() => latest);
+    latest = await unitButton.innerText({ timeout: 300 }).catch(() => latest);
     if (unitTextAlreadyMatches(latest, unit)) return latest;
     await page.waitForTimeout(100);
   }
@@ -7764,7 +7768,8 @@ async function clickVisibleOptionByExactText(page: Page, value?: string) {
 
 async function clickVisibleUnitOption(page: Page, unit: string) {
   const normalizedUnit = unit.replace(/\s+/g, " ").trim().toLowerCase();
-  const box = await page.evaluate((normalizedUnit) => {
+  const options = page.locator("[role='option'],.dropdown-item,.gwt-MenuItem,.dropdown-menu li,.dropdown-menu td,.gwt-PopupPanel li,.gwt-PopupPanel td,.select-popup li,.select-popup td");
+  const index = await options.evaluateAll((elements, normalizedUnit) => {
     const normalize = (text: string | null | undefined) => (text ?? "").replace(/\s+/g, " ").trim();
     const aliases = (value: string) => {
       if (value === "g") return ["gram", "grams"];
@@ -7808,16 +7813,18 @@ async function clickVisibleUnitOption(page: Page, unit: string) {
       const style = window.getComputedStyle(element);
       return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
     };
-    const candidates = Array.from(document.querySelectorAll("[role='option'],.dropdown-item,.dropdown-menu *,.popupContent *,.gwt-PopupPanel *,.select-popup *,li,button,div,td"))
-      .filter(isVisible)
-      .map((element) => {
+    // Unit labels also occur throughout the background nutrition tables.
+    // Only real menu options can change the ingredient's unit.
+    const candidates = elements.map((element, index) => ({ element, index }))
+      .filter(({ element }) => isVisible(element))
+      .map(({ element, index }) => {
         const text = normalize(element.textContent);
         const rect = element.getBoundingClientRect();
         const gramWeight = normalizedUnit === "g" ? gramsPerServingUnit(text) : undefined;
         const exactText = text.toLowerCase() === normalizedUnit;
         const optionLike = element.matches("[role='option'],.dropdown-item,li,button,td")
           || Boolean(element.closest("[role='listbox'],[role='menu'],.dropdown-menu,.select-popup"));
-        return { text, x: rect.x, y: rect.y, width: rect.width, height: rect.height, gramWeight, exactText, optionLike };
+        return { index, text, x: rect.x, y: rect.y, width: rect.width, height: rect.height, gramWeight, exactText, optionLike };
       })
       .filter((candidate) => candidate.text && matches(candidate.text, normalizedUnit) && (normalizedUnit !== "g" || candidate.optionLike || candidate.exactText))
       .sort((a, b) => {
@@ -7831,11 +7838,10 @@ async function clickVisibleUnitOption(page: Page, unit: string) {
         };
         return score(b) - score(a);
       });
-    return candidates[0];
+    return candidates[0]?.index;
   }, normalizedUnit).catch(() => undefined);
-  if (!box) return false;
-  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-  return true;
+  if (index === undefined) return false;
+  return options.nth(index).click({ timeout: 1500 }).then(() => true).catch(() => false);
 }
 
 function unitAliases(unit: string) {
@@ -10142,26 +10148,11 @@ async function addRecipeIngredient(page: Page, ingredient: RecipeInput["ingredie
   }
 
   options.trace?.("ingredient_unit_fill_start");
-  let convertedAmount = await convertGramAmountForCurrentServingUnit(page, ingredient.amount, ingredient.unit, selectedCandidate.name);
-  if (convertedAmount) options.trace?.("ingredient_unit_preconvert_done", {
-    converted: convertedAmount.converted,
-    currentUnitText: convertedAmount.currentUnitText,
-    gramsPerServing: convertedAmount.gramsPerServing,
-  });
-  const unit = convertedAmount?.converted === true
-    ? {
-      filled: true,
-      skipped: false,
-      unit: ingredient.unit?.trim() ?? "",
-      strategy: "converted-current-serving",
-      currentUnitText: convertedAmount.currentUnitText,
-      warning: undefined,
-    }
-    : await fillLikelyUnit(page, ingredient.unit);
+  const unit = await fillLikelyUnit(page, ingredient.unit);
   options.trace?.("ingredient_unit_fill_done", { filled: unit?.filled, skipped: unit?.skipped, strategy: unit?.strategy });
-  convertedAmount = unit?.filled === false
+  const convertedAmount = unit?.filled === false
     ? await convertGramAmountForCurrentServingUnit(page, ingredient.amount, ingredient.unit, selectedCandidate.name)
-    : convertedAmount;
+    : undefined;
   if (convertedAmount) options.trace?.("ingredient_unit_convert_done", { converted: convertedAmount.converted });
   if (unit?.filled === false && convertedAmount?.converted !== true) {
     return { status: "unit_not_found", warning: unit.warning ?? convertedAmount?.warning ?? "Ingredient unit could not be selected or converted safely.", selectedCandidate, unit, convertedAmount };
