@@ -40,8 +40,11 @@ const chatGptActionToolNames = [
   "list_custom_foods",
   "create_custom_food",
   "create_and_log_custom_food",
+  "delete_custom_food",
   "find_private_recipe",
   "ensure_private_recipe",
+  "update_custom_recipe",
+  "delete_custom_recipe",
   "get_cronometer_operation",
 ];
 

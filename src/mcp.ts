@@ -37,7 +37,7 @@ import {
 } from "./oauth.js";
 
 export const MCP_PATH = "/mcp";
-export const MCP_SERVER_VERSION = "0.1.28";
+export const MCP_SERVER_VERSION = "0.1.29";
 export const WIDGET_URI = `ui://widget/cronometer-dashboard-v${MCP_SERVER_VERSION}.html`;
 
 const widgetHtml = readFileSync(new URL("../public/cronometer-widget.html", import.meta.url), "utf8")
@@ -182,8 +182,11 @@ export const STABLE_MODEL_VISIBLE_TOOLS = [
   "list_custom_foods",
   "create_custom_food",
   "create_and_log_custom_food",
+  "delete_custom_food",
   "find_private_recipe",
   "ensure_private_recipe",
+  "update_custom_recipe",
+  "delete_custom_recipe",
   "get_cronometer_operation",
 ] as const;
 const stableModelVisibleTools = new Set<string>(STABLE_MODEL_VISIBLE_TOOLS);
@@ -203,7 +206,8 @@ const MCP_SERVER_INSTRUCTIONS = [
   "When a verified food write returns mealNutrition, use those Cronometer diary meal totals for the reply without additional searches or daily-summary calls. They include existing foods in that meal and are rounded by Cronometer. Do not substitute daily totals or guessed macros for meal totals. list_food_entries also returns these saved meal headers when visible.",
   "Use create_and_log_custom_food as the preferred single-step workflow when a packaged food is missing from Cronometer and the user wants it logged.",
   "After not_written_not_found, use ChatGPT web search or the user's package label to obtain that exact product's nutrition, then call create_and_log_custom_food with the same date, meal and amount. Include nutritionSource; do not invent missing nutrients or substitute a different product. Ask for a label only when reliable product facts cannot be found.",
-  "Use ensure_private_recipe for every private-recipe write. Unconfirmed calls preview without opening Cronometer; confirmed calls compare full recipe contents and safely repair an incomplete same-named recipe when possible.",
+  "Use ensure_private_recipe to create or repair a private recipe. Use update_custom_recipe to rename an existing recipe or change its serving/cooked-weight fields by exact current name or recipeId, preserving omitted fields and existing ingredients. Unconfirmed calls preview; confirmed calls write and verify.",
+  "For user-authorized saved-food or saved-recipe cleanup, use delete_custom_food or delete_custom_recipe, not diary deletion. Pass the exact current name and confirmName; use the ID when names are duplicated. Restrict cleanup to the user's named targets or identified test items, preserve custom foods referenced by a retained recipe, and never infer permission to clear the whole library. Use ifUsed='stop' when dependency preservation is required; force deletion needs explicit user approval.",
   "For custom foods, use Cronometer's detailed #/custom-foods editor: pass the package serving size, every nutrient available on the label, and the UPC/EAN/GTIN barcode whenever it is visible. The barcode links the private custom food to future barcode searches/scans.",
   "Do not call duplicate-list tools before create_custom_food or create_and_log_custom_food; those tools resolve exact same-name foods themselves and default to updating one exact match.",
   "For every diary food write or delete, pass the user's exact meal section explicitly. A product or search category never chooses the meal: if the user says Lunch, pass Lunch even for an energy drink or supplement-like product.",

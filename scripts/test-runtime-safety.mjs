@@ -89,8 +89,11 @@ try {
     "list_custom_foods",
     "create_custom_food",
     "create_and_log_custom_food",
+    "delete_custom_food",
     "find_private_recipe",
     "ensure_private_recipe",
+    "update_custom_recipe",
+    "delete_custom_recipe",
     "get_cronometer_operation",
   ], "the default model surface must stay intentionally small and deterministic");
   assert.equal(STABLE_MODEL_VISIBLE_TOOLS.includes("get_targets"), false, "unstructured target scraping must not be ChatGPT-visible by default");
@@ -201,6 +204,17 @@ try {
   });
   assert.equal(rejectedWrite.structuredContent?.status, "error");
   assert.equal(rejectedWrite.structuredContent?.source, "oauth-scope-enforcement");
+  for (const [name, arguments_] of [
+    ["delete_custom_food", { name: "test food", confirmName: "test food", confirmed: true }],
+    ["delete_custom_recipe", { name: "test recipe", confirmName: "test recipe", confirmed: true }],
+    ["update_custom_recipe", { name: "test recipe", newName: "renamed recipe", confirmed: true }],
+  ]) {
+    const tool = listedTools.tools.find((candidate) => candidate.name === name);
+    assert.deepEqual(tool._meta.securitySchemes, [{ type: "oauth2", scopes: ["cronometer:read", "cronometer:write"] }]);
+    assert.equal(tool.annotations.destructiveHint, name.startsWith("delete_"));
+    const denied = await scopedClient.callTool({ name, arguments: arguments_ });
+    assert.equal(denied.structuredContent?.source, "oauth-scope-enforcement", `${name} must reject read-only tokens before calling the provider`);
+  }
   await scopedClient.close();
   await scopedServer.close();
 
