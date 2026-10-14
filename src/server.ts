@@ -1,10 +1,12 @@
 import { createServer } from "node:http";
-import { handleMcpHttpRequest, MCP_PATH } from "./mcp.js";
+import { handleMcpHttpRequest, MCP_PATH, shutdownMcpRuntime } from "./mcp.js";
 import { validateRuntimeConfiguration } from "./runtime-config.js";
 
 validateRuntimeConfiguration();
 const port = parsePort(process.env.PORT);
 const host = process.env.HOST ?? (process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1");
+const shutdownGraceMs = 210_000;
+let shuttingDown = false;
 
 const server = createServer((req, res) => {
   if (!hasValidRequestUrl(req.url, req.headers.host)) {
@@ -25,6 +27,44 @@ const server = createServer((req, res) => {
 server.listen(port, host, () => {
   console.log(`cronogpt MCP server listening on http://${host}:${port}${MCP_PATH}`);
 });
+
+process.once("SIGTERM", () => beginGracefulShutdown("SIGTERM"));
+process.once("SIGINT", () => beginGracefulShutdown("SIGINT"));
+
+function beginGracefulShutdown(signal: "SIGTERM" | "SIGINT") {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} received; stopping new HTTP connections and allowing in-flight MCP/browser work up to ${shutdownGraceMs} ms to finish.`);
+
+  const forceTimer = setTimeout(() => {
+    console.error(`Graceful shutdown exceeded ${shutdownGraceMs} ms; closing remaining HTTP connections.`);
+    server.closeAllConnections();
+    process.exit(1);
+  }, shutdownGraceMs);
+  forceTimer.unref();
+
+  const shutdownStartedAt = Date.now();
+  server.close(async (error) => {
+    if (error) {
+      console.error("HTTP server shutdown failed:", error);
+      process.exitCode = 1;
+      return;
+    }
+    const remainingMs = Math.max(0, shutdownGraceMs - (Date.now() - shutdownStartedAt));
+    const runtime = await shutdownMcpRuntime(remainingMs).catch((runtimeError) => ({
+      drained: false,
+      error: runtimeError instanceof Error ? runtimeError.message : "Unknown MCP runtime shutdown error",
+    }));
+    clearTimeout(forceTimer);
+    if (runtime && typeof runtime === "object" && "drained" in runtime && runtime.drained === false) {
+      console.error("MCP/browser runtime did not drain cleanly before shutdown:", runtime);
+      process.exitCode = 1;
+      return;
+    }
+    console.log("HTTP and MCP/browser runtime shutdown completed.");
+  });
+  server.closeIdleConnections();
+}
 
 function hasValidRequestUrl(requestUrl: string | undefined, hostHeader: string | undefined) {
   if (!requestUrl) return false;

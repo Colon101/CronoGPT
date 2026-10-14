@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export type BackendMode = "mock" | "terra" | "browser";
 
 export type ProviderStatus =
@@ -112,9 +114,21 @@ export interface CustomFoodTransactionPreview extends CustomFoodServingPreview {
 /** Stable browser-independent preview for create, create-and-log, and update inputs. */
 export function customFoodTransactionPreview(input: {
   name?: string;
+  foodId?: string;
+  newName?: string;
   servingSize?: string;
   portions?: FoodPortionDefinition[];
+  nutrients?: Record<string, number>;
+  barcode?: string;
+  duplicatePolicy?: string;
   expectedExistingMatchCount?: number;
+  date?: string;
+  meal?: string;
+  amount?: number;
+  unit?: string;
+  portion?: WholePackagePortion;
+  timestamp?: string;
+  nutritionSource?: string;
   requireServingSize?: boolean;
 }): CustomFoodTransactionPreview {
   const serving = customFoodServingPreview(input);
@@ -124,9 +138,25 @@ export function customFoodTransactionPreview(input: {
     : [];
   const transactionDigest = stableTransactionDigest({
     name: normalizeTransactionText(input.name),
+    foodId: normalizeTransactionText(input.foodId),
+    newName: normalizeTransactionText(input.newName),
     servingSize: serving.servingSize ?? null,
     portions: serving.portions.map((portion) => ({ name: normalizeTransactionText(portion.name), weightGrams: portion.weightGrams })),
+    nutrients: normalizeTransactionRecord(input.nutrients),
+    barcode: normalizeTransactionText(input.barcode),
+    duplicatePolicy: normalizeTransactionText(input.duplicatePolicy),
     expectedExistingMatchCount: input.expectedExistingMatchCount ?? null,
+    diary: {
+      date: normalizeTransactionText(input.date),
+      meal: normalizeTransactionText(input.meal),
+      amount: input.amount ?? null,
+      unit: normalizeTransactionText(input.unit),
+      portion: input.portion
+        ? { kind: input.portion.kind, name: normalizeTransactionText(input.portion.portion.name), weightGrams: input.portion.portion.weightGrams, count: input.portion.count ?? 1 }
+        : null,
+      timestamp: normalizeTransactionText(input.timestamp),
+    },
+    nutritionSource: normalizeTransactionText(input.nutritionSource),
   });
   return {
     ...serving,
@@ -159,13 +189,38 @@ function normalizeTransactionText(value: unknown) {
   return String(value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
 }
 
-function stableTransactionDigest(value: unknown) {
-  let hash = 2166136261;
-  for (const character of JSON.stringify(value)) {
-    hash ^= character.charCodeAt(0);
-    hash = Math.imul(hash, 16777619);
+function normalizeTransactionRecord(value: Record<string, number> | undefined) {
+  // Keep normalized-key collisions instead of silently letting insertion order
+  // decide which value survives Object.fromEntries(). The canonical tuple list
+  // is ordered by Unicode code point and then by a stable numeric spelling.
+  return Object.entries(value ?? {})
+    .map(([key, item]) => [normalizeTransactionText(key), item] as const)
+    .sort(([leftKey, leftValue], [rightKey, rightValue]) => {
+      return compareCodePoints(leftKey, rightKey)
+        || compareCodePoints(transactionNumberSortKey(leftValue), transactionNumberSortKey(rightValue));
+    });
+}
+
+function compareCodePoints(left: string, right: string) {
+  const leftPoints = Array.from(left, (character) => character.codePointAt(0) ?? 0);
+  const rightPoints = Array.from(right, (character) => character.codePointAt(0) ?? 0);
+  const length = Math.min(leftPoints.length, rightPoints.length);
+  for (let index = 0; index < length; index += 1) {
+    if (leftPoints[index] !== rightPoints[index]) return leftPoints[index] - rightPoints[index];
   }
-  return `txn-${(hash >>> 0).toString(16).padStart(8, "0")}`;
+  return leftPoints.length - rightPoints.length;
+}
+
+function transactionNumberSortKey(value: number) {
+  if (Number.isNaN(value)) return "nan";
+  if (value === Number.POSITIVE_INFINITY) return "+infinity";
+  if (value === Number.NEGATIVE_INFINITY) return "-infinity";
+  if (Object.is(value, -0)) return "0";
+  return String(value);
+}
+
+function stableTransactionDigest(value: unknown) {
+  return `txn-${createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0, 32)}`;
 }
 
 export interface WholePackagePortion {
@@ -218,6 +273,10 @@ export interface DiaryFoodDeleteInput {
   unit?: string;
   deleteCount?: number;
   confirmName?: string;
+  /** Fresh exact-match count precondition used to authorize an intentional repeat safely. */
+  expectedExistingMatchCount?: number;
+  /** Caller-scoped retry key. Reuse only for retries of the same deletion intent. */
+  idempotencyKey?: string;
   dryRun?: boolean;
   confirmed?: boolean;
   waitForCompletionSeconds?: number;

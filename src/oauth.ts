@@ -75,8 +75,9 @@ export function authorizeMcpRequest(req: IncomingMessage) {
   }
 
   const authorization = req.headers.authorization ?? "";
-  const [scheme, credential] = authorization.split(/\s+/, 2);
-  if (scheme?.toLowerCase() !== "bearer" || !credential) {
+  const bearer = /^Bearer[ \t]+([^\s]+)$/i.exec(authorization);
+  const credential = bearer?.[1];
+  if (!credential) {
     return { ok: false, scopes: [], reason: "Missing bearer token." };
   }
 
@@ -84,10 +85,11 @@ export function authorizeMcpRequest(req: IncomingMessage) {
     return { ok: true, scopes: [...SCOPES], reason: undefined };
   }
 
-  const payload = verifySignedPayload(credential, "access");
-  if (!payload) {
+  const verified = verifySignedPayload(credential, "access");
+  if (!verified) {
     return { ok: false, scopes: [], reason: "Invalid bearer token." };
   }
+  const payload = verified.payload;
 
   const validAudiences = new Set([resourceIdentifier(req), publicOrigin(req)]);
   if (!payload.aud || !validAudiences.has(payload.aud)) {
@@ -313,12 +315,13 @@ function handleTokenRequest(req: IncomingMessage, res: ServerResponse, params: R
     return;
   }
 
-  const code = verifySignedPayload(params.code, "code");
-  if (!code) {
+  const verifiedCode = verifySignedPayload(params.code, "code");
+  if (!verifiedCode) {
     logOAuth(req, "token_error", { grant_type: params.grant_type, reason: "invalid_code" });
     oauthError(res, 400, "invalid_grant", "Authorization code is invalid or expired.");
     return;
   }
+  const code = verifiedCode.payload;
 
   if (code.redirect_uri !== params.redirect_uri || code.client_id !== params.client_id) {
     logOAuth(req, "token_error", {
@@ -347,7 +350,7 @@ function handleTokenRequest(req: IncomingMessage, res: ServerResponse, params: R
     oauthError(res, 400, "invalid_grant", "PKCE verifier does not match the authorization code.");
     return;
   }
-  if (!consumeAuthorizationCode(params.code, code.exp)) {
+  if (!consumeAuthorizationCode(verifiedCode.canonicalToken, code.exp)) {
     logOAuth(req, "token_error", { grant_type: params.grant_type, reason: "authorization_code_reused" });
     oauthError(res, 400, "invalid_grant", "Authorization code has already been used.");
     return;
@@ -368,12 +371,13 @@ function handleRefreshToken(req: IncomingMessage, res: ServerResponse, params: R
     return;
   }
 
-  const refresh = verifySignedPayload(params.refresh_token, "refresh");
-  if (!refresh) {
+  const verifiedRefresh = verifySignedPayload(params.refresh_token, "refresh");
+  if (!verifiedRefresh) {
     logOAuth(req, "token_error", { grant_type: params.grant_type, reason: "invalid_refresh_token" });
     oauthError(res, 400, "invalid_grant", "Refresh token is invalid or expired.");
     return;
   }
+  const refresh = verifiedRefresh.payload;
   if (refresh.client_id !== params.client_id || !refresh.aud || !isAllowedResource(refresh.aud, req)) {
     logOAuth(req, "token_error", { grant_type: params.grant_type, reason: "refresh_request_mismatch" });
     oauthError(res, 400, "invalid_grant", "Refresh token does not match this client or MCP resource.");
@@ -488,19 +492,30 @@ function signPayload(payload: SignedPayload) {
 }
 
 function verifySignedPayload(token: string, expectedType: SignedPayload["typ"]) {
-  const [body, signature] = token.split(".", 2);
-  if (!body || !signature || !safeEqual(hmac(body), signature)) return undefined;
+  const segments = token.split(".");
+  if (segments.length !== 2) return undefined;
+  const [body, signature] = segments;
+  const decodedBody = decodeCanonicalBase64Url(body);
+  if (!decodedBody || !decodeCanonicalBase64Url(signature) || !safeEqual(hmac(body), signature)) {
+    return undefined;
+  }
 
   let payload: SignedPayload;
   try {
-    payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as SignedPayload;
+    payload = JSON.parse(decodedBody.toString("utf8")) as SignedPayload;
   } catch {
     return undefined;
   }
 
   const now = Math.floor(Date.now() / 1000);
   if (payload.typ !== expectedType || !payload.exp || payload.exp < now) return undefined;
-  return payload;
+  return { payload, canonicalToken: `${body}.${signature}` };
+}
+
+function decodeCanonicalBase64Url(segment: string | undefined) {
+  if (!segment || !/^[A-Za-z0-9_-]+$/.test(segment)) return undefined;
+  const decoded = Buffer.from(segment, "base64url");
+  return base64Url(decoded) === segment ? decoded : undefined;
 }
 
 function hmac(value: string) {
@@ -552,7 +567,7 @@ function isAllowedResource(resource: string, req: IncomingMessage) {
   return resource === resourceIdentifier(req) || resource === publicOrigin(req);
 }
 
-function consumeAuthorizationCode(code: string, expiresAt: number) {
+function consumeAuthorizationCode(canonicalCode: string, expiresAt: number) {
   const now = Math.floor(Date.now() / 1000);
   const persisted = readPersistedAuthorizationCodes();
   if (persisted === null) return false;
@@ -563,7 +578,7 @@ function consumeAuthorizationCode(code: string, expiresAt: number) {
   for (const [digest, expiry] of consumedAuthorizationCodes) {
     if (expiry < now) consumedAuthorizationCodes.delete(digest);
   }
-  const digest = createHash("sha256").update(code).digest("base64url");
+  const digest = createHash("sha256").update(canonicalCode).digest("base64url");
   if (consumedAuthorizationCodes.has(digest)) return false;
   consumedAuthorizationCodes.set(digest, expiresAt);
   return writePersistedAuthorizationCodes();

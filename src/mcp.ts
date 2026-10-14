@@ -1,7 +1,6 @@
 import "dotenv/config";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import {
   registerAppResource,
   registerAppTool,
@@ -11,10 +10,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { createProviderFromEnv } from "./providers/index.js";
-import { toMcpToolResponse } from "./tool-response.js";
+import {
+  MCP_NEXT_ACTION_VALUES,
+  MCP_OPERATION_STATE_VALUES,
+  toMcpToolResponse,
+} from "./tool-response.js";
 import { CUSTOM_FOOD_NUTRIENT_SCHEMA, customFoodNutrientSchemaSummary } from "./nutrients.js";
 import { validateBarcode } from "./barcode.js";
-import { FOOD_LOG_MEALS, isValidFoodLogDate, parseFoodLogTimestamp } from "./food-log-transaction.js";
+import { FOOD_LOG_MEALS, isValidFoodLogDate, normalizeFoodLogDate, normalizeFoodLogUnit, parseFoodLogTimestamp } from "./food-log-transaction.js";
 import { customFoodTransactionPreview } from "./domain.js";
 import type {
   CronometerProvider,
@@ -32,10 +35,40 @@ import {
   rejectUnauthorized,
 } from "./oauth.js";
 
-const widgetHtml = readFileSync(join(process.cwd(), "public/cronometer-widget.html"), "utf8");
-const widgetUri = "ui://widget/cronometer-dashboard.html";
+export const MCP_PATH = "/mcp";
+export const MCP_SERVER_VERSION = "0.1.22";
+export const WIDGET_URI = `ui://widget/cronometer-dashboard-v${MCP_SERVER_VERSION}.html`;
+
+const widgetHtml = readFileSync(new URL("../public/cronometer-widget.html", import.meta.url), "utf8")
+  .replaceAll("__CRONOGPT_VERSION__", MCP_SERVER_VERSION);
+const widgetDomain = process.env.CRONOGPT_WIDGET_DOMAIN?.trim() || undefined;
+const widgetUiMetadata = {
+  csp: {
+    connectDomains: [] as string[],
+    resourceDomains: [] as string[],
+  },
+  prefersBorder: true,
+  ...(widgetDomain ? { domain: widgetDomain } : {}),
+};
+const widgetResourceMetadata = {
+  ui: widgetUiMetadata,
+  "openai/widgetDescription": "A compact, read-only Cronometer dashboard for nutrition, foods, biometrics, exercises, and notes.",
+  "openai/widgetPrefersBorder": true,
+  "openai/widgetCSP": {
+    connect_domains: [] as string[],
+    resource_domains: [] as string[],
+  },
+  ...(widgetDomain ? { "openai/widgetDomain": widgetDomain } : {}),
+};
 
 const defaultProvider = createProviderFromEnv();
+
+export async function shutdownMcpRuntime(timeoutMs: number) {
+  const provider = defaultProvider as CronometerProvider & {
+    shutdown?: (timeoutMs?: number) => Promise<unknown>;
+  };
+  return provider.shutdown?.(timeoutMs);
+}
 
 const dateValueInputSchema = z.string()
   .refine((value) => {
@@ -73,9 +106,9 @@ const commonOutputSchema = {
     "needs_manual_step",
     "error",
   ]),
-  state: z.enum(["pending", "running", "succeeded", "failed", "indeterminate"]).optional(),
+  state: z.enum(MCP_OPERATION_STATE_VALUES).optional(),
   retryable: z.boolean().optional(),
-  nextAction: z.enum(["none", "poll", "inspect_diary", "retry_with_same_key", "manual_resolution"]).optional(),
+  nextAction: z.enum(MCP_NEXT_ACTION_VALUES).optional(),
   operationId: z.string().optional(),
   warning: z.string().optional(),
   source: z.string().optional(),
@@ -123,18 +156,17 @@ const customFoodPortionsSchema = z.array(foodPortionDefinitionSchema)
   })
   .describe("Optional additional exact portion name-to-gram mappings, such as piece=10 g, serving=30 g, or bag=130 g. When present without servingSize, CronoGPT uses a stable base servingSize of 1 g.");
 const expectedExistingMatchCountSchema = z.number().int().nonnegative()
-  .describe("Optional exact match count from an immediately preceding read-only lookup. The write refuses a changed count instead of overwriting a concurrent change.");
+  .describe("Advanced optional concurrency/recovery guard. Omit for an ordinary new write because CronoGPT establishes its own fresh baseline. Supply only from a fresh exact read when intentionally repeating an indistinguishable row or resolving prior indeterminate state; a mismatch refuses the write.");
 const wholePackagePortionSchema = z.object({
   kind: z.literal("whole_package"),
   portion: foodPortionDefinitionSchema.describe("The package portion as its exact name-to-weight mapping."),
   count: z.number().finite().positive().optional().describe("Number of whole packages consumed. Defaults to 1."),
 }).describe("Use when the user consumed a whole package. CronoGPT logs count × portion.weightGrams, so multiple portions on the same food remain unambiguous.");
 
-export const MCP_PATH = "/mcp";
-export const MCP_SERVER_VERSION = "0.1.18";
 const readToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read"] }];
 const writeToolSecuritySchemes = [{ type: "oauth2" as const, scopes: ["cronometer:read", "cronometer:write"] }];
 export const STABLE_MODEL_VISIBLE_TOOLS = [
+  "render_cronometer_dashboard",
   "get_daily_summary",
   "list_food_entries",
   "list_biometrics",
@@ -143,42 +175,39 @@ export const STABLE_MODEL_VISIBLE_TOOLS = [
   "log_food",
   "log_foods",
   "log_food_plan",
-  "delete_diary_food_entry",
   "delete_diary_food_entries",
   "search_foods",
   "custom_food_nutrient_schema",
   "list_custom_foods",
-  "find_duplicate_custom_foods",
   "create_custom_food",
   "create_and_log_custom_food",
-  "update_custom_food",
-  "delete_custom_food",
-  "retire_custom_food",
-  "list_private_recipe_names",
   "find_private_recipe",
-  "list_custom_recipes",
-  "resolve_recipe_ingredients",
   "ensure_private_recipe",
-  "create_recipe",
-  "update_custom_recipe",
-  "delete_custom_recipe",
-  "retire_custom_recipe",
-  "cronometer_runtime_status",
   "get_cronometer_operation",
-  "cronometer_stability_check",
-  "refresh_cronometer_session",
 ] as const;
 const stableModelVisibleTools = new Set<string>(STABLE_MODEL_VISIBLE_TOOLS);
+export const APP_CALLABLE_READ_TOOLS = [
+  "cronometer_capabilities",
+  "get_daily_summary",
+  "list_food_entries",
+  "list_biometrics",
+  "list_exercises",
+  "list_notes",
+] as const;
+const appCallableReadTools = new Set<string>(APP_CALLABLE_READ_TOOLS);
 
 const MCP_SERVER_INSTRUCTIONS = [
+  "For a clear single-food request, call log_food directly once with the user's date, meal, query, amount, and unit. Do not call search_foods, list_food_entries, or a dry-run first: CronoGPT owns the fresh diary baseline, unique high-confidence food selection, idempotency, write, reload, and persisted verification. Use search_foods only after log_food reports ambiguity or not-found.",
+  "Choose exactly one diary-write shape: log_food for one food; log_foods for multiple foods that all share one date and one meal; log_food_plan only when the request spans dates or meal sections. Never split one intent across overlapping write tools.",
   "Use create_and_log_custom_food as the preferred single-step workflow when a packaged food is missing from Cronometer and the user wants it logged.",
-  "Use ensure_private_recipe as the preferred private recipe workflow. Unconfirmed calls preview without opening Cronometer; confirmed calls compare full recipe contents and safely repair an incomplete same-named recipe when possible. Use create_recipe directly only after find_private_recipe has confirmed that the exact recipe name is absent. Use delete_custom_recipe only with an exact recipe ID and confirmation name for user-approved cleanup or rollback; it retires instead of deleting when Cronometer reports existing uses unless the user explicitly requests force.",
+  "Use ensure_private_recipe for every private-recipe write. Unconfirmed calls preview without opening Cronometer; confirmed calls compare full recipe contents and safely repair an incomplete same-named recipe when possible.",
   "For custom foods, use Cronometer's detailed #/custom-foods editor: pass the package serving size, every nutrient available on the label, and the UPC/EAN/GTIN barcode whenever it is visible. The barcode links the private custom food to future barcode searches/scans.",
   "Do not call duplicate-list tools before create_custom_food or create_and_log_custom_food; those tools resolve exact same-name foods themselves and default to updating one exact match.",
   "For every diary food write or delete, pass the user's exact meal section explicitly. A product or search category never chooses the meal: if the user says Lunch, pass Lunch even for an energy drink or supplement-like product.",
   "For a whole bag, can, bottle, or package, pass portion={kind:'whole_package',portion:{name,weightGrams},count}. A custom food can have multiple named portions; use the exact name-to-weight mapping for the consumed package and never guess its weight. Do not also pass amount/unit.",
   "Submit one multi-food user intent once through log_foods. For a confirmed background write, accepted means the write is in progress, not failed: never resubmit it; poll get_cronometer_operation with the returned operation ID.",
   "Use log_food_plan for one bounded intent that spans multiple dates or meal sections, and delete_diary_food_entries for a bounded exact multi-day cleanup. These tools stop before later groups after an unresolved or ambiguous result; inspect their per-group or per-item results instead of blindly retrying the whole plan.",
+  "Use render_cronometer_dashboard only when the user explicitly asks to see the interactive dashboard. Do not open it as a prerequisite for another tool.",
   "Treat possibly_written_verify_failed as an ambiguous write: inspect the custom-food list or diary before retrying so a duplicate is not created.",
   "Treat ok=false or completed=false as not completed, even when the tool call itself returned normally. accepted means a background job is still pending, not that the requested write succeeded.",
 ].join("\n");
@@ -193,25 +222,18 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   registerAppResource(
     server,
     "cronometer-dashboard",
-    widgetUri,
+    WIDGET_URI,
     {
-      _meta: {
-        ui: {
-          csp: {
-            connectDomains: [],
-            resourceDomains: [],
-          },
-          domain: process.env.APP_PUBLIC_ORIGIN ?? "http://localhost:8787",
-        },
-        "openai/widgetDescription": "Cronometer tool status and result dashboard.",
-      },
+      description: "Versioned Cronometer dashboard UI used only by render_cronometer_dashboard.",
+      _meta: widgetResourceMetadata,
     },
     async () => ({
       contents: [
         {
-          uri: widgetUri,
+          uri: WIDGET_URI,
           mimeType: RESOURCE_MIME_TYPE,
           text: widgetHtml,
+          _meta: widgetResourceMetadata,
         },
       ],
     }),
@@ -225,22 +247,41 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
     annotations: Record<string, boolean>,
     handler: (args: Record<string, unknown>) => Promise<any>,
   ) => {
-    const securitySchemes = annotations.readOnlyHint === true && annotations.destructiveHint !== true
+    const readOnlyHint = annotations.readOnlyHint === true;
+    const completeAnnotations = {
+      readOnlyHint,
+      destructiveHint: annotations.destructiveHint === true,
+      idempotentHint: typeof annotations.idempotentHint === "boolean" ? annotations.idempotentHint : readOnlyHint,
+      openWorldHint: annotations.openWorldHint === true,
+    };
+    const securitySchemes = completeAnnotations.readOnlyHint && !completeAnnotations.destructiveHint
       ? readToolSecuritySchemes
       : writeToolSecuritySchemes;
     const modelVisible = process.env.CRONOGPT_FULL_TOOL_SURFACE === "true" || stableModelVisibleTools.has(name);
+    const appVisible = appCallableReadTools.has(name);
+    if (!modelVisible && !appVisible) {
+      return;
+    }
+    if (appVisible && (!completeAnnotations.readOnlyHint || completeAnnotations.destructiveHint)) {
+      throw new Error(`App-callable tool ${name} must be a non-destructive read-only tool.`);
+    }
+    const visibility = [
+      ...(modelVisible ? ["model" as const] : []),
+      ...(appVisible ? ["app" as const] : []),
+    ];
     const baseToolConfig = {
       title,
       description,
       inputSchema,
       outputSchema: commonOutputSchema,
       securitySchemes,
-      annotations,
+      annotations: completeAnnotations,
       _meta: {
         securitySchemes,
-        ui: { visibility: ["model"] },
+        ui: { visibility },
         "openai/toolInvocation/invoking": "Running Cronometer tool...",
         "openai/toolInvocation/invoked": "Cronometer tool complete.",
+        ...(appVisible ? { "openai/widgetAccessible": true } : {}),
       },
     };
 
@@ -257,7 +298,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
       }
       return handler((args ?? {}) as Record<string, unknown>);
     };
-    if (modelVisible) {
+    if (!appVisible) {
       server.registerTool(name, baseToolConfig, toolHandler);
       return;
     }
@@ -267,12 +308,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
       name,
       {
         ...baseToolConfig,
-        _meta: {
-          ...baseToolConfig._meta,
-          ui: { resourceUri: widgetUri, visibility: ["app"] },
-          "openai/outputTemplate": widgetUri,
-          "openai/widgetAccessible": true,
-        },
+        _meta: baseToolConfig._meta,
       } as Parameters<typeof registerAppTool>[2],
       toolHandler,
     );
@@ -420,6 +456,44 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
     account: "#account",
   };
 
+  registerAppTool(
+    server,
+    "render_cronometer_dashboard",
+    {
+      title: "Open Cronometer dashboard",
+      description: "Use this only when the user explicitly asks to open, show, or inspect the interactive Cronometer dashboard. Do not call it for an ordinary read or write request; call the narrow data or action tool directly instead.",
+      inputSchema: emptyInputSchema,
+      outputSchema: commonOutputSchema,
+      securitySchemes: readToolSecuritySchemes,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+      _meta: {
+        securitySchemes: readToolSecuritySchemes,
+        ui: { resourceUri: WIDGET_URI, visibility: ["model"] },
+        "openai/outputTemplate": WIDGET_URI,
+        "openai/widgetAccessible": true,
+        "openai/toolInvocation/invoking": "Opening Cronometer dashboard...",
+        "openai/toolInvocation/invoked": "Cronometer dashboard ready.",
+      },
+    } as Parameters<typeof registerAppTool>[2],
+    async () => toMcpToolResponse({
+      provider: provider.name,
+      mode: provider.mode,
+      feature: "render_cronometer_dashboard",
+      status: "ok",
+      source: "mcp-app-launcher",
+      data: {
+        dashboard: "cronometer",
+        resourceUri: WIDGET_URI,
+        appCallableTools: APP_CALLABLE_READ_TOOLS,
+      },
+    }),
+  );
+
   register(
     "cronometer_capabilities",
     "Show Cronometer capabilities",
@@ -441,7 +515,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   register(
     "get_cronometer_operation",
     "Get Cronometer operation",
-    "Polls one accepted Cronometer background operation by its returned operation ID. Use this instead of resubmitting a write.",
+    "Use this when a prior write returned accepted and supplied an operationId. It polls exactly that background operation; never resubmit the original write while this operation is pending or indeterminate.",
     { operationId: z.string().min(1) },
     { readOnlyHint: true, openWorldHint: false },
     async (args) => toMcpToolResponse(await provider.getOperation(String(args.operationId))),
@@ -450,7 +524,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   register(
     "custom_food_nutrient_schema",
     "Show custom food nutrient schema",
-    "Returns the canonical nutrient keys, Cronometer display labels, units, and aliases accepted by create_custom_food. Use this before writing detailed custom foods.",
+    "Use this when nutrition facts must be mapped into create_custom_food or create_and_log_custom_food fields. It returns canonical nutrient keys, Cronometer labels, units, and accepted aliases; do not use it to search for an existing food.",
     emptyInputSchema,
     { readOnlyHint: true, openWorldHint: false },
     async () => toMcpToolResponse({
@@ -565,7 +639,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   register(
     "get_daily_summary",
     "Get daily nutrition summary",
-    "Reads a Cronometer daily nutrition summary for a date or date range.",
+    "Use this when the user wants daily totals, targets, or nutrition summary values for one date or range. Do not use it to verify exact diary rows; use list_food_entries for names, meals, amounts, and units.",
     dateRangeInputSchema,
     { readOnlyHint: true, openWorldHint: false },
     async (args) => toMcpToolResponse(await provider.getDailySummary(args)),
@@ -574,7 +648,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   register(
     "list_food_entries",
     "List food entries",
-    "Lists Cronometer food and recipe diary entries for a date or date range.",
+    "Use this when the user asks to inspect exact Cronometer food/recipe rows, or after an ambiguous write/delete result must be checked before retrying. Do not call it as routine preflight for a clear log_food request; log_food establishes its own fresh exact-date baseline. It returns entries for one date or range; use get_daily_summary for aggregate nutrition totals.",
     dateRangeInputSchema,
     { readOnlyHint: true, openWorldHint: false },
     async (args) => toMcpToolResponse(await provider.listFoodEntries(args)),
@@ -583,7 +657,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   register(
     "list_biometrics",
     "List biometrics",
-    "Lists Cronometer biometric entries for a date or date range.",
+    "Use this when the user asks for recorded Cronometer biometric entries such as weight for one date or range. Do not use it for food, exercise, or nutrition totals.",
     dateRangeInputSchema,
     { readOnlyHint: true, openWorldHint: false },
     async (args) => toMcpToolResponse(await provider.listBiometrics(args)),
@@ -592,7 +666,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   register(
     "list_exercises",
     "List exercises",
-    "Lists Cronometer exercise entries for a date or date range.",
+    "Use this when the user asks for recorded Cronometer exercise entries for one date or range. Do not use it for food, biometrics, or nutrition totals.",
     dateRangeInputSchema,
     { readOnlyHint: true, openWorldHint: false },
     async (args) => toMcpToolResponse(await provider.listExercises(args)),
@@ -601,7 +675,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   register(
     "list_notes",
     "List notes",
-    "Lists Cronometer diary notes for a date or date range.",
+    "Use this when the user asks for Cronometer diary notes for one date or range. Do not use it for foods, biometrics, exercises, or nutrition totals.",
     dateRangeInputSchema,
     { readOnlyHint: true, openWorldHint: false },
     async (args) => toMcpToolResponse(await provider.listNotes(args)),
@@ -610,7 +684,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   register(
     "search_foods",
     "Search foods",
-    "Searches the bounded Cronometer food database and the authenticated user's private Cronometer foods for visible food matches. Use searchScope=custom for private custom foods/recipes, all for official database lookups, or auto by default. It does not browse arbitrary websites or access files.",
+    "Use this after log_food reports ambiguity/not-found, or when the user explicitly wants to choose a database source. Do not pre-call it for a clear ordinary food log: log_food performs its own bounded search and unique high-confidence selection. It searches only Cronometer's database and the authenticated user's private foods; it does not browse the web. Do not call it when the user already supplied selectedName and selectedSource.",
     {
       query: z.string().min(1),
       limit: z.number().int().positive().max(25).optional(),
@@ -636,7 +710,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
         z.object({
           query: z.string().min(1),
           selectedName: z.string().optional(),
-          selectedSource: z.string().optional().describe("Optional Cronometer result source from resolve_recipe_ingredients, such as CRDB, NCCDB, USDA, Custom Food, or Brand."),
+          selectedSource: z.string().optional().describe("Optional exact Cronometer result source from search_foods, such as CRDB, NCCDB, USDA, Custom Food, or Brand."),
           amount: z.number().positive().optional(),
           unit: z.string().optional(),
         }),
@@ -660,23 +734,23 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   register(
     "log_food",
     "Log food",
-    "Adds one food to an explicit Cronometer meal. The server verifies the diary date plus the requested meal, optional time, amount, and unit before Save, then verifies the exact structured diary row afterward. Confirmed real writes are idempotent background jobs. accepted is not success: poll cronometer_runtime_status before any retry. Use selectedName/selectedSource from search_foods for exact choices, especially private custom foods.",
+    "Use this directly for one food on one Cronometer date and meal. For a clear request, make this the only initial tool call: pass the user's query, date, meal, amount, and unit; do not preflight with search_foods, list_food_entries, or dryRun. CronoGPT itself proves the date, establishes the current exact-row count, selects one unique high-confidence result, rechecks the editor, writes once, reloads, and verifies the persisted row delta. Only after an ambiguity/not-found response should search_foods pin selectedName and selectedSource. Use log_foods for multiple foods sharing a date/meal or log_food_plan across dates/meals. A timestamped write remains indeterminate because persisted rows do not expose time. If accepted, poll get_cronometer_operation and never resubmit as polling.",
     {
       date: diaryDateInputSchema.optional(),
       meal: diaryMealInputSchema,
       query: z.string().min(1),
-      selectedName: z.string().optional(),
-      selectedSource: z.string().optional().describe("Optional Cronometer result source from search_foods, such as CRDB, NCCDB, USDA, Custom Food, Custom Recipe, or Brand."),
+      selectedName: z.string().optional().describe("Leave unset for a clear ordinary request. Set only to pin an exact result after search_foods was needed for ambiguity."),
+      selectedSource: z.string().optional().describe("Leave unset for a clear ordinary request. Set with selectedName only after search_foods, using its exact source such as CRDB, NCCDB, USDA, Custom Food, Custom Recipe, or Brand."),
       amount: z.number().positive().optional(),
       unit: z.string().min(1).optional(),
       portion: wholePackagePortionSchema.optional(),
       timestamp: foodTimestampInputSchema.optional(),
       matchPolicy: z.enum(["high_confidence", "selected_only"]).optional().describe("Defaults to high_confidence. Use selected_only with selectedName and selectedSource to pin an exact search result. Unsafe best-effort writes are intentionally not model-visible."),
       searchScope: z.enum(["auto", "all", "custom", "favorites"]).optional().describe("Optional food-search tab preference. Use custom for private custom foods/recipes, all for official database lookups, or auto by default."),
-      expectedExistingMatchCount: expectedExistingMatchCountSchema.optional(),
-      dryRun: z.boolean().optional(),
-      confirmed: z.boolean().optional(),
-      idempotencyKey: z.string().optional().describe("Optional caller-supplied idempotency key. If omitted, cronogpt derives one from date, meal, food, amount, and unit."),
+      expectedExistingMatchCount: expectedExistingMatchCountSchema.optional().describe("Optional concurrency guard for a deliberate repeat or recovery after an ambiguous prior operation. Do not perform a routine list_food_entries preflight just to populate it."),
+      dryRun: z.boolean().optional().describe("Omit for a normal user-requested write. Set true only when the user explicitly asked for a preview with no browser write."),
+      confirmed: z.boolean().optional().describe("Set true when the user explicitly requested the diary change. A separate preview call is not required."),
+      idempotencyKey: z.string().optional().describe("Omit normally so CronoGPT derives a stable key from date, meal, food, amount, and unit. Never invent a new key to bypass an indeterminate operation."),
       waitForCompletionSeconds: z.number().int().min(0).max(600).optional().describe("Defaults to a short server-chosen wait window. Use 0 to return immediately after accepting the background job."),
     },
     { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -686,7 +760,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   register(
     "log_foods",
     "Log multiple foods",
-    "Adds multiple distinct foods to one explicit Cronometer diary meal as one idempotent batch. Date and meal are batch-level so items cannot drift into different sections. Semantically duplicate items are rejected before the browser opens instead of being silently collapsed. The server logs sequentially, verifies every row, and reports per-item status.",
+    "Call this directly when two or more distinct foods all belong to one Cronometer date and meal; do not preflight with search_foods, list_food_entries, or dryRun for clear items. CronoGPT owns each baseline, bounded search, write, and persisted verification. Do not use it for a single food (use log_food) or items with different dates/meals (use log_food_plan). Semantic duplicates are rejected and every saved row is reported separately.",
     {
       date: diaryDateInputSchema.optional(),
       meal: diaryMealInputSchema,
@@ -704,8 +778,8 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
         idempotencyKey: z.string().optional().describe("Optional per-item idempotency key. If omitted, cronogpt derives one from date, meal, food, amount, and unit."),
       })).min(1).max(50),
       expectedExistingMatchCount: z.array(expectedExistingMatchCountSchema).optional().describe("Optional expected exact-row counts in items order from a prior lookup. Each supplied value must match its corresponding item's current count before write."),
-      dryRun: z.boolean().optional(),
-      confirmed: z.boolean().optional(),
+      dryRun: z.boolean().optional().describe("Omit for a normal user-requested batch write. Set true only when the user explicitly asked for a no-write preview."),
+      confirmed: z.boolean().optional().describe("Set true when the user explicitly requested the batch change; no separate preview call is required."),
       idempotencyKey: z.string().optional().describe("Optional caller-supplied batch idempotency key. If omitted, cronogpt derives one from all normalized item keys."),
       stopOnFirstFailure: z.boolean().optional().describe("Set true to stop attempting later items after the first unresolved result. Already verified earlier writes cannot be rolled back."),
       waitForCompletionSeconds: z.number().int().min(0).max(600).optional().describe("Defaults to a server-chosen wait window for batch writes. Use 0 to return immediately after accepting the background job."),
@@ -717,7 +791,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   register(
     "log_food_plan",
     "Log a multi-day food plan",
-    "Adds a bounded set of foods across multiple explicit Cronometer dates and meal sections. The server groups items by date and meal, submits each group through the verified idempotent log_foods transaction, and stops before later groups after any accepted, ambiguous, or failed result. Use this for one user intent that cannot fit in a single meal batch.",
+    "Call this directly when one bounded user intent spans more than one Cronometer date or meal section; do not preflight clear items with search_foods, list_food_entries, or dryRun. Do not use it when every item shares one date/meal (use log_foods), or for one food (use log_food). CronoGPT groups items deterministically and stops before later groups after any accepted, ambiguous, or failed result.",
     {
       items: z.array(z.object({
         date: diaryDateInputSchema,
@@ -734,8 +808,8 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
         expectedExistingMatchCount: expectedExistingMatchCountSchema.optional(),
         idempotencyKey: z.string().optional(),
       })).min(1).max(100),
-      dryRun: z.boolean().optional(),
-      confirmed: z.boolean().optional(),
+      dryRun: z.boolean().optional().describe("Omit for a normal user-requested plan write. Set true only when the user explicitly asked for a no-write preview."),
+      confirmed: z.boolean().optional().describe("Set true when the user explicitly requested the plan; no separate preview call is required."),
       idempotencyKey: z.string().optional().describe("Optional plan-level idempotency key. CronoGPT derives deterministic group and item keys from it."),
       stopOnFirstFailure: z.boolean().optional().describe("Defaults to true across date/meal groups. Later groups are never started after an accepted, ambiguous, or failed result."),
       waitForCompletionSeconds: z.number().int().min(0).max(600).optional(),
@@ -747,7 +821,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   register(
     "delete_diary_food_entry",
     "Delete diary food entry",
-    "Deletes a bounded number of matching food entries from one explicit Cronometer diary meal. By default it preserves the conservative unique-match behavior. For indistinguishable duplicate rows, first preview the match count, then pass an explicit deleteCount with confirmation; the server deletes one at a time and verifies the count drops by exactly one after each action.",
+    "Deletes a bounded number of matching food entries from one explicit Cronometer diary meal. By default it preserves the conservative unique-match behavior. For indistinguishable duplicate rows, first preview the match count, then pass an explicit deleteCount with confirmation; the server deletes one at a time and verifies the count drops by exactly one after each action. Reuse an idempotencyKey only to retry the same intent; use a new key for a later user-approved deletion of a re-added identical row.",
     {
       date: diaryDateInputSchema.optional(),
       meal: diaryMealInputSchema,
@@ -756,6 +830,8 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
       unit: z.string().min(1).optional().describe("Optional unit used to narrow the matching diary row."),
       deleteCount: z.number().int().positive().optional().describe("Exact number of indistinguishable matching rows to delete. Omit for the conservative unique-match default; there is intentionally no delete-all mode."),
       confirmName: z.string().optional().describe("Must exactly match name when executing the delete."),
+      expectedExistingMatchCount: z.number().int().nonnegative().optional().describe("Optional fresh exact-match-count precondition. Use it when safely superseding an unresolved same-target operation; CronoGPT rechecks it before sending Delete."),
+      idempotencyKey: z.string().min(1).optional().describe("Retry key for this deletion intent. Reuse only for retries or polling of the same intent; use a new key for a later user-approved deletion, never to bypass an indeterminate operation without a fresh expectedExistingMatchCount."),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
       waitForCompletionSeconds: z.number().int().min(0).max(600).optional().describe("Defaults to a server-chosen wait window for confirmed deletes. Use 0 to return immediately after accepting the background job."),
@@ -767,7 +843,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   register(
     "delete_diary_food_entries",
     "Delete exact diary food entries across days",
-    "Deletes a bounded explicit list of diary rows across multiple dates and meal sections. Every item requires its exact visible name and matching confirmation name. The server invokes the conservative verified single-entry delete sequentially and stops before later items after any accepted, ambiguous, or failed result; there is no delete-all mode.",
+    "Use this for any user-approved diary-food deletion, including one exact row or a bounded list across dates and meals. Every item requires an explicit date, meal, exact visible name, and identical confirmName. Deletes run sequentially and stop before later items after any accepted, ambiguous, or failed result; overlapping targets are rejected and must be combined with deleteCount. Supply a fresh plan idempotencyKey for each confirmed new plan, then reuse it only for retries of that same plan.",
     {
       items: z.array(z.object({
         date: diaryDateInputSchema,
@@ -777,7 +853,10 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
         unit: z.string().min(1).optional(),
         deleteCount: z.number().int().positive().optional(),
         confirmName: z.string().min(1).describe("Must exactly match this item's name."),
+        expectedExistingMatchCount: z.number().int().nonnegative().optional(),
+        idempotencyKey: z.string().min(1).optional().describe("Optional item retry key. When omitted under an explicit top-level plan key, CronoGPT derives a stable plan-and-index child key; without a top-level key, it uses the conservative target-derived replay guard."),
       })).min(1).max(100),
+      idempotencyKey: z.string().min(1).optional().describe("Supply a fresh plan key for every confirmed new delete plan, then reuse it only for retries of that same plan. Use a new key for a later plan that targets re-added identical rows."),
       dryRun: z.boolean().optional(),
       confirmed: z.boolean().optional(),
       stopOnFirstFailure: z.boolean().optional().describe("Defaults to true. Later deletes are not attempted after an unresolved result."),
@@ -898,7 +977,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   register(
     "list_custom_foods",
     "List custom foods",
-    "Lists Cronometer Foods > Custom Foods with structured names and optional detail extraction including foodId, serving size, energy, macros, and nutrient rows.",
+    "Use this when the user asks to inspect existing private custom foods or when a prior ambiguous custom-food result requires manual resolution. It can return structured names and optional details including foodId, serving size, energy, macros, and nutrients; do not call it routinely before create_custom_food because that tool resolves exact same-name foods itself.",
     {
       query: z.string().optional(),
       includeDetails: z.boolean().optional(),
@@ -1027,7 +1106,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   register(
     "find_private_recipe",
     "Find private recipe",
-    "Reads one authenticated user's private Cronometer custom recipe by exact or near-exact name filter and returns a sanitized summary for verification.",
+    "Use this when one private Cronometer recipe must be checked by exact name or when an ambiguous recipe write needs verification. It returns a sanitized summary; use ensure_private_recipe, not this read tool, when the user wants the recipe created or repaired.",
     {
       name: z.string().min(1).describe("Exact private custom recipe name to verify."),
     },
@@ -1061,14 +1140,14 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   register(
     "create_recipe",
     "Create recipe",
-    "Creates and verifies a new private custom Cronometer recipe in the authenticated user's account after user confirmation. Use this direct creator only after find_private_recipe has confirmed that the exact name is absent; otherwise prefer ensure_private_recipe to avoid duplicates. This does not publish, send, share, or write outside that private Cronometer account. For straightforward ingredients, pass query, amount, and unit directly; the browser provider auto-selects high-confidence official Cronometer matches. Use selectedName and selectedSource only when the user or resolve_recipe_ingredients picked a specific match. Ambiguous low-confidence searches are returned without writing.",
+    "Creates and verifies a new private custom Cronometer recipe in the authenticated user's account after user confirmation. Use this direct creator only after find_private_recipe has confirmed that the exact name is absent; otherwise prefer ensure_private_recipe to avoid duplicates. This does not publish, send, share, or write outside that private Cronometer account. For straightforward ingredients, pass query, amount, and unit directly; the browser provider auto-selects high-confidence official Cronometer matches. Use selectedName and selectedSource only when the user or search_foods picked a specific match. Ambiguous low-confidence searches are returned without writing.",
     {
       name: z.string().min(1),
       ingredients: z.array(
         z.object({
           query: z.string().min(1),
           selectedName: z.string().optional(),
-          selectedSource: z.string().optional().describe("Optional Cronometer result source from resolve_recipe_ingredients, such as CRDB, NCCDB, USDA, Custom Food, or Brand."),
+          selectedSource: z.string().optional().describe("Optional exact Cronometer result source from search_foods, such as CRDB, NCCDB, USDA, Custom Food, or Brand."),
           amount: z.number().positive().optional(),
           unit: z.string().optional(),
         }),
@@ -1094,7 +1173,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
         z.object({
           query: z.string().min(1),
           selectedName: z.string().optional(),
-          selectedSource: z.string().optional().describe("Optional Cronometer result source from resolve_recipe_ingredients, such as CRDB, NCCDB, USDA, Custom Food, or Brand."),
+          selectedSource: z.string().optional().describe("Optional exact Cronometer result source from search_foods, such as CRDB, NCCDB, USDA, Custom Food, or Brand."),
           amount: z.number().positive().optional(),
           unit: z.string().optional(),
         }),
@@ -1298,7 +1377,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
         z.object({
           query: z.string().min(1),
           selectedName: z.string().optional(),
-          selectedSource: z.string().optional().describe("Optional Cronometer result source from resolve_recipe_ingredients, such as CRDB, NCCDB, USDA, Custom Food, or Brand."),
+          selectedSource: z.string().optional().describe("Optional exact Cronometer result source from search_foods, such as CRDB, NCCDB, USDA, Custom Food, or Brand."),
           amount: z.number().positive().optional(),
           unit: z.string().optional(),
         }),
@@ -1709,6 +1788,47 @@ async function runFoodLogPlan(provider: CronometerProvider, args: Record<string,
 
 async function runDiaryDeletePlan(provider: CronometerProvider, args: Record<string, unknown>): Promise<ProviderResult> {
   const items = (args.items ?? []) as Array<DiaryFoodDeleteInput & { date: string; meal: string; confirmName: string }>;
+  const callerPlanIdempotencyKey = typeof args.idempotencyKey === "string" && args.idempotencyKey.trim()
+    ? args.idempotencyKey.trim()
+    : undefined;
+  const planIdempotencyKey = callerPlanIdempotencyKey ?? deterministicPlanKey("diary-delete", items);
+  // A deterministic digest is useful for reporting, but it is not evidence of
+  // a new user intent. Only an explicit plan/item key becomes a child caller
+  // key; otherwise the provider's legacy target key safely blocks stale replay.
+  const itemIdempotencyKeys = items.map((item, index) =>
+    item.idempotencyKey?.trim() || (callerPlanIdempotencyKey ? `${callerPlanIdempotencyKey}:item:${index}` : undefined));
+  const explicitItemKeys = itemIdempotencyKeys.filter((key): key is string => Boolean(key));
+  const duplicateKeyGroups = Array.from(new Set(explicitItemKeys))
+    .map((key) => ({ key, indices: itemIdempotencyKeys.map((candidate, index) => candidate === key ? index : -1).filter((index) => index >= 0) }))
+    .filter((group) => group.indices.length > 1);
+  const overlappingTargets: Array<{ indices: [number, number] }> = [];
+  for (let left = 0; left < items.length; left += 1) {
+    for (let right = left + 1; right < items.length; right += 1) {
+      if (diaryDeleteTargetsOverlap(items[left], items[right])) overlappingTargets.push({ indices: [left, right] });
+    }
+  }
+  if (duplicateKeyGroups.length > 0 || overlappingTargets.length > 0) {
+    return {
+      provider: provider.name,
+      mode: provider.mode,
+      feature: "delete_diary_food_entries",
+      status: "needs_manual_step",
+      source: "mcp-multi-day-orchestrator",
+      warning: duplicateKeyGroups.length > 0
+        ? "The diary-delete plan reuses an item idempotency key. Every item key must be unique within one plan. No delete was attempted."
+        : "The diary-delete plan contains overlapping exact targets. Combine each overlap into one item with an explicit deleteCount. No delete was attempted.",
+      data: {
+        planIdempotencyKey,
+        count: items.length,
+        attemptedCount: 0,
+        completed: false,
+        stoppedEarly: false,
+        duplicateKeyGroups,
+        overlappingTargets,
+        writeAttempted: false,
+      },
+    };
+  }
   const results: Array<Record<string, unknown>> = [];
   let stoppedEarly = false;
 
@@ -1717,6 +1837,7 @@ async function runDiaryDeletePlan(provider: CronometerProvider, args: Record<str
       ...item,
       dryRun: args.dryRun === undefined && args.confirmed === true ? false : args.dryRun as boolean | undefined,
       confirmed: args.confirmed as boolean | undefined,
+      idempotencyKey: itemIdempotencyKeys[index],
       waitForCompletionSeconds: args.waitForCompletionSeconds as number | undefined,
     });
     const data = resultData(result);
@@ -1752,6 +1873,7 @@ async function runDiaryDeletePlan(provider: CronometerProvider, args: Record<str
       ? undefined
       : "The exact diary cleanup did not fully complete. Inspect per-item statuses before continuing; ambiguous deletes must be checked with list_food_entries.",
     data: {
+      planIdempotencyKey,
       count: items.length,
       attemptedCount: results.length,
       completed,
@@ -1774,6 +1896,20 @@ function groupFoodPlanItems(items: MultiDayFoodPlanItem[]) {
     groups.set(key, group);
   });
   return Array.from(groups.values());
+}
+
+function diaryDeleteTargetsOverlap(left: DiaryFoodDeleteInput, right: DiaryFoodDeleteInput) {
+  const normalize = (value: string | undefined) => (value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+  const amountOverlaps = left.amount === undefined || right.amount === undefined || left.amount === right.amount;
+  const leftUnit = normalize(normalizeFoodLogUnit(left.unit));
+  const rightUnit = normalize(normalizeFoodLogUnit(right.unit));
+  const unitOverlaps = !leftUnit || !rightUnit || leftUnit === rightUnit;
+  const timeZone = process.env.CRONOMETER_TIME_ZONE?.trim() || "Asia/Jerusalem";
+  return normalize(normalizeFoodLogDate(left.date, timeZone)) === normalize(normalizeFoodLogDate(right.date, timeZone))
+    && normalize(left.meal) === normalize(right.meal)
+    && normalize(left.name) === normalize(right.name)
+    && amountOverlaps
+    && unitOverlaps;
 }
 
 function deterministicPlanKey(kind: string, value: unknown) {
@@ -1842,8 +1978,8 @@ export async function handleMcpHttpRequest(req: IncomingMessage, res: ServerResp
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "POST, GET, DELETE, OPTIONS",
-      "Access-Control-Allow-Headers": "authorization, content-type, mcp-session-id",
-      "Access-Control-Expose-Headers": "Mcp-Session-Id",
+      "Access-Control-Allow-Headers": "authorization, content-type, mcp-session-id, mcp-protocol-version, last-event-id",
+      "Access-Control-Expose-Headers": "Mcp-Session-Id, Mcp-Protocol-Version, WWW-Authenticate",
     });
     res.end();
     return;
@@ -1872,8 +2008,8 @@ export async function handleMcpHttpRequest(req: IncomingMessage, res: ServerResp
   const MCP_METHODS = new Set(["POST", "GET", "DELETE"]);
   if (url.pathname === MCP_PATH && req.method && MCP_METHODS.has(req.method)) {
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Headers", "authorization, content-type, mcp-session-id");
-    res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+    res.setHeader("Access-Control-Allow-Headers", "authorization, content-type, mcp-session-id, mcp-protocol-version, last-event-id");
+    res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id, Mcp-Protocol-Version, WWW-Authenticate");
 
     const auth = authorizeMcpRequest(req);
     if (!auth.ok) {

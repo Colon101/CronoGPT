@@ -394,14 +394,14 @@ export function verifyFoodLogInDiaryEntries(entries: DiaryFoodEntry[], normalize
 }
 
 export function retryGuidanceForFoodLog(status: string) {
-  if (status === "busy") return "The browser queue did not free up in time. Check cronometer_runtime_status, then retry once after the active job finishes.";
+  if (status === "busy") return "The browser queue did not free up in time. Wait for the active job to finish, then retry once with the same idempotency key.";
   if (status === "not_written_login_paused") return "Do not retry until the login cooldown expires or storage state is refreshed.";
   if (status === "not_written_ambiguous") return "Call search_foods and retry with selectedName and selectedSource.";
   if (status === "not_written_not_found") return "Try a more specific food query or create a custom food first.";
   if (status === "possibly_written_verify_failed") return "Run a read-only diary check before any retry to avoid a duplicate.";
   if (status === "already_exists") return "No retry needed; an equivalent diary entry is already present.";
   if (status === "written") return "No retry needed; the write was verified.";
-  return "Retry only after checking runtime status.";
+  return "Before retrying, call list_food_entries for the exact date and inspect the matching row count.";
 }
 
 export function foodLogBrowserPreflightData(normalized: NormalizedFoodLog) {
@@ -500,14 +500,14 @@ function foodEntryAmountMatches(entry: DiaryFoodEntry, requestedAmount: number, 
   if (entry.amount === undefined) return false;
   if (numbersMatch(entry.amount, requestedAmount)) return true;
   const multiplier = requestedUnit ? measurePerDiaryUnit(entry.unit, requestedUnit) : undefined;
-  return multiplier !== undefined && numbersMatch(entry.amount * multiplier, requestedAmount);
+  return multiplier !== undefined && convertedServingMeasureMatches(entry.amount, multiplier, requestedAmount);
 }
 
 function foodEntryUnitMatches(entry: DiaryFoodEntry, requestedAmount: number | undefined, requestedUnit: string) {
   if (foodLogUnitsMatch(entry.unit, requestedUnit)) return true;
   if (requestedAmount === undefined || entry.amount === undefined) return false;
   const multiplier = measurePerDiaryUnit(entry.unit, requestedUnit);
-  return multiplier !== undefined && numbersMatch(entry.amount * multiplier, requestedAmount);
+  return multiplier !== undefined && convertedServingMeasureMatches(entry.amount, multiplier, requestedAmount);
 }
 
 function measurePerDiaryUnit(actualUnit: string | undefined, requestedUnit: string) {
@@ -534,6 +534,18 @@ function normalizeDiaryUnitDisplay(value: string) {
 
 function numbersMatch(actual: number, expected: number) {
   return Math.abs(actual - expected) <= Math.max(0.000001, Math.abs(expected) * 0.000001);
+}
+
+function convertedServingMeasureMatches(servingCount: number, multiplier: number, expected: number) {
+  // Cronometer displays/stores serving counts to four decimals. The largest
+  // conversion error caused by that rounding is half of one 0.0001 serving,
+  // scaled by the selected serving's measure. For example, 0.8615 × 65 g
+  // may legitimately read back as 55.9975 g for a requested 56 g. A fixed
+  // gram floor would be unsafe for sub-gram requests.
+  const actual = servingCount * multiplier;
+  const quantizationTolerance = Math.abs(multiplier) * 0.00005;
+  const arithmeticTolerance = Number.EPSILON * Math.max(1, Math.abs(actual), Math.abs(expected)) * 8;
+  return Math.abs(actual - expected) <= quantizationTolerance + arithmeticTolerance;
 }
 
 function diaryMealSectionText(text: string, meal: string) {

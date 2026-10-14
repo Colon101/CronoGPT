@@ -102,7 +102,7 @@ jobs:
           CRONOMETER_STORAGE_STATE_BASE64: ${{ secrets.CRONOMETER_STORAGE_STATE_BASE64 }}
         run: npm run oracle:deploy
 
-      - name: Load smoke-test token from Oracle
+      - name: Load smoke-test credentials from Oracle
         run: |
           set -euo pipefail
           token="$(
@@ -113,8 +113,23 @@ jobs:
             echo "Remote CRONOGPT_API_TOKEN is missing after deploy." >&2
             exit 1
           fi
+          link_secret="$(
+            ssh -i "$ORACLE_SSH_KEY" -o BatchMode=yes "$ORACLE_USER@$ORACLE_HOST" \
+              "awk -F= '\$1 == \"CRONOGPT_LINK_SECRET\" { sub(/^[^=]*=/, \"\"); print; exit }' /opt/cronogpt/secrets/cronogpt.env"
+          )"
+          if [[ -z "$link_secret" ]]; then
+            echo "Remote CRONOGPT_LINK_SECRET is missing after deploy." >&2
+            exit 1
+          fi
           echo "::add-mask::$token"
+          echo "::add-mask::$link_secret"
           echo "CRONOGPT_API_TOKEN=$token" >> "$GITHUB_ENV"
+          echo "CRONOGPT_LINK_SECRET=$link_secret" >> "$GITHUB_ENV"
+
+      - name: Smoke test production OAuth
+        env:
+          CRONOGPT_SMOKE_URL: https://cronogpt.129-159-156-186.sslip.io/mcp
+        run: npm run smoke:oauth:production
 
       - name: Smoke test production
         env:

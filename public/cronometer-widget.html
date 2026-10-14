@@ -3,12 +3,32 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>cronogpt</title>
+    <title>Cronometer dashboard</title>
     <style>
       :root {
-        color: #16201b;
-        background: #f7f7f4;
-        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color-scheme: light dark;
+        --surface: #ffffff;
+        --surface-muted: #f5f7f4;
+        --page: #f7f7f4;
+        --text: #16201b;
+        --text-muted: #536057;
+        --border: #d6ddd7;
+        --accent: #2f6b4d;
+        --danger: #9a3412;
+        background: var(--page);
+        color: var(--text);
+        font-family: var(--font-sans, Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
+      }
+
+      :root[data-theme="dark"] {
+        --surface: #18201b;
+        --surface-muted: #111713;
+        --page: #101512;
+        --text: #edf4ef;
+        --text-muted: #a8b5ac;
+        --border: #354239;
+        --accent: #8ed3aa;
+        --danger: #fdba74;
       }
 
       * {
@@ -42,9 +62,13 @@
       }
 
       .status {
+        color: var(--text-muted);
         font-size: 12px;
-        color: #4b5b52;
         white-space: nowrap;
+      }
+
+      .status[data-state="error"] {
+        color: var(--danger);
       }
 
       .toolbar {
@@ -54,145 +78,323 @@
       }
 
       button {
-        min-height: 34px;
-        border: 1px solid #b9c9bd;
-        border-radius: 7px;
-        background: #ffffff;
-        color: #16201b;
-        padding: 0 11px;
+        min-height: 36px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--surface);
+        color: var(--text);
+        padding: 0 12px;
         font: inherit;
         font-size: 13px;
         cursor: pointer;
       }
 
+      button:hover:not(:disabled),
+      button:focus-visible {
+        border-color: var(--accent);
+        outline: none;
+      }
+
       button:disabled {
         cursor: wait;
-        opacity: 0.65;
+        opacity: 0.6;
       }
 
       .panel {
-        border: 1px solid #d6ddd7;
-        border-radius: 8px;
-        background: #ffffff;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: var(--surface);
         overflow: hidden;
       }
 
       .panel h2 {
         margin: 0;
         padding: 10px 12px;
-        border-bottom: 1px solid #e5e9e5;
+        border-bottom: 1px solid var(--border);
         font-size: 14px;
+      }
+
+      .result {
+        display: grid;
+        gap: 8px;
+        min-height: 92px;
+        padding: 12px;
+      }
+
+      .result-title {
+        margin: 0;
+        font-size: 15px;
+        font-weight: 650;
+      }
+
+      .result-message {
+        margin: 0;
+        color: var(--text-muted);
+        font-size: 13px;
+        line-height: 1.45;
+      }
+
+      .facts {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin: 0;
+      }
+
+      .fact {
+        border-radius: 999px;
+        background: var(--surface-muted);
+        padding: 4px 8px;
+        color: var(--text-muted);
+        font-size: 11px;
+      }
+
+      details {
+        border-top: 1px solid var(--border);
+      }
+
+      summary {
+        padding: 10px 12px;
+        color: var(--text-muted);
+        font-size: 12px;
+        cursor: pointer;
       }
 
       pre {
         margin: 0;
-        min-height: 180px;
-        max-height: 360px;
+        max-height: 280px;
         overflow: auto;
         padding: 12px;
-        color: #213127;
-        background: #fbfcfa;
-        font-size: 12px;
+        color: var(--text);
+        background: var(--surface-muted);
+        font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+        font-size: 11px;
         line-height: 1.45;
+        white-space: pre-wrap;
+        word-break: break-word;
       }
     </style>
   </head>
   <body>
     <main>
       <header>
-        <h1>cronogpt</h1>
-        <div id="status" class="status">Connecting</div>
+        <h1>Cronometer</h1>
+        <div id="status" class="status" role="status" aria-live="polite">Connecting…</div>
       </header>
 
-      <div class="toolbar">
+      <nav class="toolbar" aria-label="Cronometer dashboard views">
         <button type="button" data-tool="cronometer_capabilities">Capabilities</button>
         <button type="button" data-tool="get_daily_summary">Today</button>
         <button type="button" data-tool="list_food_entries">Foods</button>
         <button type="button" data-tool="list_biometrics">Biometrics</button>
         <button type="button" data-tool="list_exercises">Exercises</button>
-      </div>
+        <button type="button" data-tool="list_notes">Notes</button>
+      </nav>
 
-      <section class="panel">
-        <h2>Result</h2>
-        <pre id="output">{}</pre>
+      <section class="panel" aria-labelledby="result-heading">
+        <h2 id="result-heading">Result</h2>
+        <div id="summary" class="result" role="status" aria-live="polite">
+          <p id="result-title" class="result-title">Dashboard readying</p>
+          <p id="result-message" class="result-message">Choose a view after the connection is ready.</p>
+          <div id="facts" class="facts" aria-label="Result details"></div>
+        </div>
+        <details>
+          <summary>Structured details</summary>
+          <pre id="output">{}</pre>
+        </details>
       </section>
     </main>
 
     <script type="module">
       const statusEl = document.querySelector("#status");
+      const resultTitleEl = document.querySelector("#result-title");
+      const resultMessageEl = document.querySelector("#result-message");
+      const factsEl = document.querySelector("#facts");
       const outputEl = document.querySelector("#output");
       const buttons = [...document.querySelectorAll("button[data-tool]")];
-      const today = new Date().toISOString().slice(0, 10);
-      let rpcId = 0;
+      const allowedTools = new Set(buttons.map((button) => button.dataset.tool));
+      const toolArguments = {
+        cronometer_capabilities: () => ({}),
+        get_daily_summary: () => ({ date: "today" }),
+        list_food_entries: () => ({ date: "today" }),
+        list_biometrics: () => ({ date: "today" }),
+        list_exercises: () => ({ date: "today" }),
+        list_notes: () => ({ date: "today" }),
+      };
       const pendingRequests = new Map();
+      let rpcId = 0;
+      let initialized = false;
+      let sizeFrame = 0;
 
-      const show = (value) => {
-        outputEl.textContent = JSON.stringify(value, null, 2);
+      const asMessage = (error) => {
+        if (typeof error === "string") return error;
+        if (error && typeof error.message === "string") return error.message;
+        try {
+          return JSON.stringify(error);
+        } catch {
+          return "Unknown error";
+        }
+      };
+
+      const setConnectionStatus = (text, state = "ready") => {
+        statusEl.textContent = text;
+        statusEl.dataset.state = state;
+      };
+
+      const formatFeature = (value) => String(value ?? "Cronometer").replaceAll("_", " ");
+
+      const showResult = (value) => {
+        const result = value && typeof value === "object" ? value : { value };
+        const data = result.data && typeof result.data === "object" ? result.data : {};
+        const status = typeof result.status === "string" ? result.status : undefined;
+        const warning = typeof result.warning === "string" ? result.warning : undefined;
+        const count = typeof data.count === "number" ? data.count : undefined;
+
+        resultTitleEl.textContent = status
+          ? `${formatFeature(result.feature)} · ${formatFeature(status)}`
+          : formatFeature(result.feature ?? "Result");
+        resultMessageEl.textContent = warning
+          ?? (count !== undefined ? `${count} ${count === 1 ? "item" : "items"} returned.` : "The latest structured result is available below.");
+        factsEl.replaceChildren();
+
+        for (const [label, factValue] of [
+          ["Provider", result.provider],
+          ["State", result.state],
+          ["Date", data.date ?? data.resolvedDate],
+          ["Source", result.source],
+        ]) {
+          if (typeof factValue !== "string" && typeof factValue !== "number") continue;
+          const fact = document.createElement("span");
+          fact.className = "fact";
+          fact.textContent = `${label}: ${factValue}`;
+          factsEl.append(fact);
+        }
+
+        outputEl.textContent = JSON.stringify(result, null, 2);
+        scheduleSizeNotification();
       };
 
       const rpcNotify = (method, params) => {
         window.parent.postMessage({ jsonrpc: "2.0", method, params }, "*");
       };
 
-      const rpcRequest = (method, params) =>
+      const rpcRequest = (method, params, timeoutMs = 120000) =>
         new Promise((resolve, reject) => {
           const id = ++rpcId;
-          pendingRequests.set(id, { resolve, reject });
+          const timer = window.setTimeout(() => {
+            pendingRequests.delete(id);
+            reject(new Error(`${method} timed out after ${Math.round(timeoutMs / 1000)} seconds`));
+          }, timeoutMs);
+          pendingRequests.set(id, { resolve, reject, timer });
           window.parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
         });
 
-      window.addEventListener(
-        "message",
-        (event) => {
-          if (event.source !== window.parent) return;
-          const message = event.data;
-          if (!message || message.jsonrpc !== "2.0") return;
-
-          if (typeof message.id === "number") {
-            const pending = pendingRequests.get(message.id);
-            if (!pending) return;
-            pendingRequests.delete(message.id);
-            if (message.error) pending.reject(message.error);
-            else pending.resolve(message.result);
-            return;
+      const applyHostContext = (context = {}) => {
+        if (context.theme === "light" || context.theme === "dark") {
+          document.documentElement.dataset.theme = context.theme;
+        }
+        const variables = context.styles?.variables;
+        if (variables && typeof variables === "object") {
+          for (const [name, value] of Object.entries(variables)) {
+            if (name.startsWith("--") && typeof value === "string") {
+              document.documentElement.style.setProperty(name, value);
+            }
           }
+        }
+        scheduleSizeNotification();
+      };
 
-          if (message.method === "ui/notifications/tool-result") {
-            show(message.params?.structuredContent ?? message.params);
-          }
-        },
-        { passive: true },
-      );
-
-      const bridgeReady = (async () => {
-        await rpcRequest("ui/initialize", {
-          appInfo: { name: "cronogpt-widget", version: "0.1.0" },
-          appCapabilities: {},
-          protocolVersion: "2026-01-26",
+      const scheduleSizeNotification = () => {
+        if (!initialized || sizeFrame) return;
+        sizeFrame = requestAnimationFrame(() => {
+          sizeFrame = 0;
+          rpcNotify("ui/notifications/size-changed", {
+            width: Math.ceil(document.documentElement.getBoundingClientRect().width),
+            height: Math.ceil(document.documentElement.getBoundingClientRect().height),
+          });
         });
-        rpcNotify("ui/notifications/initialized", {});
-        statusEl.textContent = "Ready";
-      })();
+      };
+
+      window.addEventListener("message", (event) => {
+        if (event.source !== window.parent) return;
+        const message = event.data;
+        if (!message || message.jsonrpc !== "2.0") return;
+
+        if (typeof message.id === "number") {
+          const pending = pendingRequests.get(message.id);
+          if (!pending) return;
+          window.clearTimeout(pending.timer);
+          pendingRequests.delete(message.id);
+          if (message.error) pending.reject(message.error);
+          else pending.resolve(message.result);
+          return;
+        }
+
+        if (message.method === "ui/notifications/tool-result") {
+          showResult(message.params?.structuredContent ?? message.params);
+        } else if (message.method === "ui/notifications/host-context-changed") {
+          applyHostContext(message.params);
+        }
+      }, { passive: true });
+
+      async function initializeBridge() {
+        try {
+          const response = await rpcRequest("ui/initialize", {
+            appInfo: { name: "cronogpt-widget", version: "__CRONOGPT_VERSION__" },
+            appCapabilities: {},
+            protocolVersion: "2026-01-26",
+          }, 15000);
+          applyHostContext(response?.hostContext);
+          rpcNotify("ui/notifications/initialized", {});
+          initialized = true;
+          setConnectionStatus("Ready");
+          resultTitleEl.textContent = "Dashboard ready";
+          resultMessageEl.textContent = "Choose a read-only view. “Today” is resolved by the server timezone.";
+          scheduleSizeNotification();
+        } catch (error) {
+          setConnectionStatus("Connection failed", "error");
+          showResult({ feature: "dashboard", status: "error", warning: asMessage(error) });
+          buttons.forEach((button) => (button.disabled = true));
+          throw error;
+        }
+      }
+
+      const bridgeReady = initializeBridge();
+      void bridgeReady.catch(() => {});
 
       async function callTool(name) {
-        await bridgeReady;
-        const args = name === "cronometer_capabilities" ? {} : { date: today };
+        if (!allowedTools.has(name) || typeof toolArguments[name] !== "function") {
+          showResult({ feature: "dashboard", status: "error", warning: "This dashboard does not allow that tool." });
+          return;
+        }
+
         buttons.forEach((button) => (button.disabled = true));
-        statusEl.textContent = "Working";
+        setConnectionStatus("Working…");
         try {
-          const result = await rpcRequest("tools/call", { name, arguments: args });
-          show(result?.structuredContent ?? result);
+          await bridgeReady;
+          const result = await rpcRequest("tools/call", { name, arguments: toolArguments[name]() });
+          showResult(result?.structuredContent ?? result);
+          setConnectionStatus("Ready");
         } catch (error) {
-          show({ ok: false, error });
+          showResult({ feature: name, status: "error", warning: asMessage(error) });
+          setConnectionStatus("Request failed", "error");
         } finally {
-          buttons.forEach((button) => (button.disabled = false));
-          statusEl.textContent = "Ready";
+          if (initialized) buttons.forEach((button) => (button.disabled = false));
         }
       }
 
       buttons.forEach((button) => {
-        button.addEventListener("click", () => callTool(button.dataset.tool));
+        button.addEventListener("click", () => void callTool(button.dataset.tool));
       });
+
+      new ResizeObserver(scheduleSizeNotification).observe(document.documentElement);
+      window.addEventListener("beforeunload", () => {
+        for (const { reject, timer } of pendingRequests.values()) {
+          window.clearTimeout(timer);
+          reject(new Error("Dashboard closed"));
+        }
+        pendingRequests.clear();
+      }, { once: true });
     </script>
   </body>
 </html>

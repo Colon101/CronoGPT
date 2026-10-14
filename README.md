@@ -20,7 +20,7 @@ ChatGPT connects to an Apps SDK app by calling an HTTPS MCP endpoint, usually `/
 
 - `GET /` health check
 - `POST|GET|DELETE /mcp` MCP endpoint
-- Apps SDK widget resource at `ui://widget/cronometer-dashboard.html`
+- Versioned Apps SDK widget resource at `ui://widget/cronometer-dashboard-v<app-version>.html`
 - Tool framework for diary reads, logging actions, targets, reports, fasting, recipes, and capability discovery
 
 ## Local setup
@@ -106,7 +106,7 @@ The Oracle Docker image includes local Chromium through the Playwright base imag
 
 Food logs write directly when `CRONOMETER_ENABLE_WRITES=true` unless the tool call sets `dryRun=true`. Set `CRONOMETER_REQUIRE_FOOD_CONFIRMATION=true` to restore the older second-step confirmation behavior. Other write tools require `confirmed=true` and will write as long as `dryRun` is not `true`. Dry-run write previews return without opening Cronometer, so recipe/custom-food validation does not burn browser login attempts. Set `CRONOMETER_ENABLE_WRITES=false` for read-only dry-run mode.
 
-Browser-backed tools are serialized inside the hosted process to reduce Chromium contention. Confirmed `log_food` writes are accepted as background jobs and deduped by idempotency key, so slow Cronometer UI work can finish after the caller returns. `CRONOMETER_OPERATION_TIMEOUT_MS` bounds individual browser attempts, and `CRONOMETER_BROWSER_RETRY_COUNT` retries transient pre-write automation failures without retrying login/CAPTCHA/credential failures. Once a commit control has been reached, any browser exception becomes `possibly_written_verify_failed`; it is never retried automatically.
+Browser-backed tools are serialized inside the hosted process to reduce Chromium contention. Confirmed `log_food` writes are accepted as background jobs and deduped by idempotency key, so slow Cronometer UI work can finish after the caller returns. `CRONOMETER_OPERATION_TIMEOUT_MS` is one shared deadline across queue wait, session setup, retries, the UI transaction, and persisted verification; `CRONOMETER_BROWSER_RETRY_COUNT` retries only transient pre-write automation failures within that same deadline. Login/CAPTCHA/credential failures are not retried. Once a commit control has been reached, any browser exception becomes `possibly_written_verify_failed`; it is never retried automatically.
 
 For multi-ingredient meals, use `log_foods` instead of several separate `log_food` calls. It accepts an `items` array, derives one batch idempotency key, logs the foods sequentially in one browser job, verifies each item by proving the exact matching-row count increased by one, and returns a per-item status table. By default it waits briefly for the batch to finish; if Cronometer is slow, call `get_cronometer_operation` with the returned operation ID. An `accepted` result means the write is in progress, not failed—never submit the same batch again as a polling mechanism.
 
@@ -114,7 +114,7 @@ For one bounded intent spanning several dates or meal sections, use `log_food_pl
 
 When the user consumes a whole bag, can, bottle, or other package, pass `portion: { kind: "whole_package", portion: { name, weightGrams }, count }`. A food can have multiple portions, each represented by its own name-to-weight mapping (for example `piece: 10 g`, `serving: 30 g`, and `bag: 130 g`); use the exact package mapping and do not also pass `amount`/`unit`. CronoGPT resolves the requested package to grams for an unambiguous diary write and refuses missing or guessed weights. The explicit diary `meal` always wins over product/search categories: an energy drink requested for Lunch is logged to Lunch, never inferred as Supplements.
 
-`delete_diary_food_entry` remains conservative for normal use. If accidental rows are indistinguishable, preview the exact date/meal/name/amount match count and then pass an explicit `deleteCount`; CronoGPT deletes one row at a time and stops unless read-back proves the count dropped by exactly one. There is intentionally no delete-all mode.
+`delete_diary_food_entry` remains conservative for normal use. If accidental rows are indistinguishable, preview the exact date/meal/name/amount match count and then pass an explicit `deleteCount`; CronoGPT reloads the exact date, clears stale row selections, proves exactly one selected target, deletes one row at a time, and stops unless read-back proves both the matching count and total diary-row count dropped by exactly one. There is intentionally no delete-all mode.
 
 Use `delete_diary_food_entries` for a bounded multi-day cleanup. Each item still requires an explicit date, meal, exact visible name, and matching `confirmName`; the server runs the conservative single-row transaction sequentially and stops on unresolved outcomes. It does not accept a date-range delete or wildcard.
 
@@ -133,7 +133,7 @@ Clear it only after the cooldown is really over:
 npm run cronometer:cooldown -- clear
 ```
 
-Before a long ChatGPT workflow, call `cronometer_stability_check`. It verifies hosted login, Diary readability, and a small food search in one queued browser job without writing data.
+For operator troubleshooting with `CRONOGPT_FULL_TOOL_SURFACE=true`, `cronometer_stability_check` verifies hosted login, Diary readability, and a small food search in one queued browser job without writing data. It is intentionally absent from the default ChatGPT model surface.
 
 Run the no-write production smoke test after deploys:
 
@@ -162,7 +162,7 @@ To create a durable Cronometer session for Oracle, run this locally after confir
 npm run storage:cronometer
 ```
 
-The generator writes `.cronometer-storage-state.json` and `.cronometer-storage-state.base64` with mode `0600`; both are ignored by git. Add the base64 file contents to the Oracle secret file as `CRONOMETER_STORAGE_STATE_BASE64`, then redeploy. Set `HEADLESS=false` if Cronometer requires an interactive verification step. The MCP tool `refresh_cronometer_session` can warm and verify the hosted session without writing diary data.
+The generator writes `.cronometer-storage-state.json` and `.cronometer-storage-state.base64` with mode `0600`; both are ignored by git. Add the base64 file contents to the Oracle secret file as `CRONOMETER_STORAGE_STATE_BASE64`, then redeploy. Set `HEADLESS=false` if Cronometer requires an interactive verification step. With the full operator surface enabled, `refresh_cronometer_session` can warm and verify the hosted session without writing diary data; it is not part of the default ChatGPT catalog.
 
 For more reliable read data, add Terra:
 
@@ -202,11 +202,11 @@ npm run oracle:wipe-local-env
 
 By default, only these tools are model-visible:
 
+- `render_cronometer_dashboard`
 - `log_food`
 - `log_foods`
 - `log_food_plan`
 - `get_cronometer_operation`
-- `delete_diary_food_entry`
 - `delete_diary_food_entries`
 - `get_daily_summary`
 - `list_food_entries`
@@ -216,30 +216,16 @@ By default, only these tools are model-visible:
 - `search_foods`
 - `custom_food_nutrient_schema`
 - `list_custom_foods`
-- `find_duplicate_custom_foods`
 - `create_custom_food`
 - `create_and_log_custom_food`
-- `update_custom_food`
-- `delete_custom_food`
-- `retire_custom_food`
-- `list_private_recipe_names`
 - `find_private_recipe`
-- `list_custom_recipes`
-- `resolve_recipe_ingredients`
 - `ensure_private_recipe`
-- `create_recipe`
-- `update_custom_recipe`
-- `delete_custom_recipe`
-- `retire_custom_recipe`
-- `cronometer_runtime_status`
-- `cronometer_stability_check`
-- `refresh_cronometer_session`
 
-The rest—including unstructured targets/profile readers—remain app-callable for rollback and direct testing. Set `CRONOGPT_FULL_TOOL_SURFACE=true` only when deliberately exposing the legacy broad surface.
+`cronometer_capabilities` is app-only. The dashboard may call only that tool plus the six read tools (`get_daily_summary`, food entries, biometrics, exercises, and notes). Hidden/admin tools are not registered at all unless `CRONOGPT_FULL_TOOL_SURFACE=true`; even in full mode they are not exposed to the widget bridge.
 
 When this model-visible list or any tool description/schema changes, bump the package and MCP server version together, deploy, then use **Settings → Plugins → cronogpt → Refresh** in ChatGPT before testing. ChatGPT stores a developer-app metadata snapshot; redeploying the MCP endpoint alone does not update the tools available to an existing app connection. After refreshing, mention or re-add `cronogpt` in the target conversation so the next turn receives the current catalog.
 
-`log_food` is transactional and requires an explicit `Breakfast`, `Lunch`, `Dinner`, `Snacks`, or `Supplements` destination. There is no silent Breakfast/Snacks fallback. `dryRun=true` does not open Chromium and returns `ok=false`, `completed=false`, and `intentSatisfied=false`. Confirmed real writes run in the browser queue, verify date/meal/time/amount/unit before Save, write once, and read back the structured target diary row. Single-food writes wait briefly for verified completion by default; confirmed custom-food writes and deletes wait up to the hosted operation window. If the result is still `accepted`, poll `cronometer_runtime_status` for the final background result before retrying. Final states include `written`, `already_exists`, `busy`, `not_written_login_paused`, `not_written_ambiguous`, `not_written_not_found`, and `possibly_written_verify_failed`. For a whole meal, prefer `log_foods`; it reduces ChatGPT/tool-call drift by keeping all ingredients in one server-side transaction and returns exact per-item results.
+`log_food` is the one-call fast path for a clear single-food request. ChatGPT should pass the user's query, explicit `Breakfast`, `Lunch`, `Dinner`, `Snacks`, or `Supplements` destination, date, amount, and unit directly; it should not routinely call `search_foods`, `list_food_entries`, or a dry-run first. CronoGPT owns the exact-date baseline and high-confidence unique food selection internally, returning ambiguity instead of guessing. `dryRun=true` is only for an explicitly requested preview and does not open Chromium. Confirmed writes start from a full reload and a proven previous-day/target-day round trip, establish a stable exact-date baseline, re-read date/meal/amount/unit/optional time immediately before ADD, write once, reload Cronometer, and require repeated identical server-backed diary reads plus an exact matching-row delta before returning `written`. Optimistic editor/draft rows and unrelated tables are excluded. Because Cronometer's persisted diary rows do not expose time, a timestamped write remains `possibly_written_verify_failed` rather than claiming full success even after exact precommit readback. If the result is `accepted`, poll `get_cronometer_operation` with its operation ID; never resubmit the write as a polling mechanism. `possibly_written_verify_failed` always means indeterminate and requires diary inspection before any retry. For a whole meal, prefer `log_foods`; it stops after every non-success so stale UI state cannot affect later items.
 
 ## Backends
 
@@ -251,7 +237,7 @@ Set `CRONOMETER_BACKEND` in `.env`:
 
 The existing lowercase `email` and `password` keys are supported only for local browser-framework detection. Prefer `CRONOMETER_EMAIL` and `CRONOMETER_PASSWORD`.
 
-`resolve_recipe_ingredients` reuses a single Cronometer food-search dialog and stops before the hosted operation budget expires. If a large recipe returns skipped or unresolved ingredients, call it again with only those remaining ingredients. For model-initiated recipe writes, pass the chosen `selectedName` and `selectedSource` from `resolve_recipe_ingredients` into each `ensure_private_recipe` ingredient. `ensure_private_recipe` reads back the full exact same-named recipe and returns `already_exists` only for a semantic match; it can safely add missing ingredients to an unambiguous partial recipe and otherwise returns a structured conflict. Ambiguous matches return candidates instead of writing the wrong food. `create_recipe` is model-visible as a confirmed direct fallback only after `find_private_recipe` has proved the exact name absent, and independently refuses an exact-name duplicate. `delete_custom_recipe` is model-visible for exact-ID cleanup and retains its destructive annotation plus exact confirmation-name gate; when Cronometer reports existing diary uses, it clicks Cronometer's native `RETIRE` action by default and verifies the success message. It does not rename the recipe.
+For model-initiated recipe writes, pass a chosen `selectedName` and `selectedSource` from the visible `search_foods` tool into each `ensure_private_recipe` ingredient when automatic matching is ambiguous. `ensure_private_recipe` reads back the full exact same-named recipe and returns `already_exists` only for a semantic match; it can safely add missing ingredients to an unambiguous partial recipe and otherwise returns a structured conflict. Full-surface operator tools such as `resolve_recipe_ingredients`, `create_recipe`, and `delete_custom_recipe` remain available only when `CRONOGPT_FULL_TOOL_SURFACE=true`; they are not in the default ChatGPT catalog.
 
 ## Current tool map
 

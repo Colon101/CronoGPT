@@ -63,6 +63,32 @@ assert.equal(recipeIngredientAmountMatches(2, "2 tbsp", 26, "g", "26.0 g"), true
 assert.equal(recipeIngredientAmountMatches(2, "2 tbsp", 26, "g", "25.0 g"), false);
 assert.equal(recipeIngredientAmountMatches(0.8615, "2 scoops — 65 g", 56, "g"), true);
 assert.equal(recipeIngredientAmountMatches(0.861, "2 scoops — 65 g", 56, "g"), false);
+const roundedDiaryServingLog = normalizeFoodLogInput({
+  query: "Protein Powder",
+  selectedName: "Protein Powder",
+  meal: "Breakfast",
+  amount: 56,
+  unit: "g",
+}, "Asia/Jerusalem", new Date("2026-06-06T08:00:00.000Z"));
+assert.equal(verifyFoodLogInDiaryEntries([{
+  meal: "Breakfast",
+  name: "Protein Powder",
+  amount: 0.8615,
+  unit: "scoop — 65 g",
+}], roundedDiaryServingLog).status, "verified");
+const subGramDiaryServingLog = normalizeFoodLogInput({
+  query: "Trace Ingredient",
+  selectedName: "Trace Ingredient",
+  meal: "Breakfast",
+  amount: 0.005,
+  unit: "g",
+}, "Asia/Jerusalem", new Date("2026-06-06T08:00:00.000Z"));
+assert.equal(verifyFoodLogInDiaryEntries([{
+  meal: "Breakfast",
+  name: "Trace Ingredient",
+  amount: 0.0002,
+  unit: "serving — 70 g",
+}], subGramDiaryServingLog).status, "not_verified");
 
 const parsedRecipeTable = parseCustomRecipeIngredientTables([
   [
@@ -219,7 +245,23 @@ assert.equal(customFoodServingPreview({ portions: [{ name: "g", weightGrams: 1 }
 assert.equal(customFoodServingPreview({ portions: [{ name: "bag", weightGrams: 130 }, { name: "Bag", weightGrams: 130 }] }).valid, false);
 const customTransaction = customFoodTransactionPreview({ name: "Package food", portions: [{ name: "bag", weightGrams: 130 }], expectedExistingMatchCount: 0 });
 assert.equal(customTransaction.valid, true);
-assert.match(customTransaction.transactionDigest, /^txn-/);
+assert.match(customTransaction.transactionDigest, /^txn-[0-9a-f]{32}$/);
+assert.equal(
+  customFoodTransactionPreview({ name: "Package food", nutrients: { protein: 3, calories: 10 } }).transactionDigest,
+  customFoodTransactionPreview({ name: "Package food", nutrients: { calories: 10, protein: 3 } }).transactionDigest,
+);
+assert.equal(
+  customFoodTransactionPreview({ name: "Package food", nutrients: { " protein ": 4, protein: 3, "\u{10000}": 2, "\uE000": 1 } }).transactionDigest,
+  customFoodTransactionPreview({ name: "Package food", nutrients: { "\uE000": 1, "\u{10000}": 2, protein: 3, " protein ": 4 } }).transactionDigest,
+);
+assert.notEqual(
+  customFoodTransactionPreview({ name: "Package food", nutrients: { " protein ": 4, protein: 3 } }).transactionDigest,
+  customFoodTransactionPreview({ name: "Package food", nutrients: { protein: 4 } }).transactionDigest,
+);
+assert.notEqual(
+  customFoodTransactionPreview({ name: "Package food", nutrients: { calories: 10 } }).transactionDigest,
+  customFoodTransactionPreview({ name: "Package food", nutrients: { calories: 11 } }).transactionDigest,
+);
 assert.equal(expectedExistingMatchCountPreview(-1).valid, false);
 assert.equal(foodTransactionDigest({ query: "Food", meal: "Lunch", expectedExistingMatchCount: 0 }), foodTransactionDigest({ query: " food ", meal: "lunch", expectedExistingMatchCount: 0 }));
 assert.notEqual(foodTransactionDigest({ query: "Food", meal: "Lunch", expectedExistingMatchCount: 0 }), foodTransactionDigest({ query: "Food", meal: "Lunch", expectedExistingMatchCount: 1 }));
@@ -369,6 +411,20 @@ const staleLookingOnly = chooseFoodLogResult({ query: "Banana" }, [
   { name: "Today protein, crispy banana chocolate chips", source: "Custom Food", raw: "Today protein, crispy banana chocolate chips Custom Food" },
 ]);
 assert.equal(staleLookingOnly.status, "needs_manual_step");
+const unrelatedOnly = chooseFoodLogResult({ query: "protein bar" }, [
+  { name: "Banana", source: "CRDB", raw: "Banana CRDB" },
+]);
+assert.equal(unrelatedOnly.status, "needs_manual_step");
+const duplicatePinnedResult = chooseFoodLogResult({
+  query: "Banana",
+  selectedName: "Banana",
+  selectedSource: "NCCDB",
+  matchPolicy: "selected_only",
+}, [
+  { name: "Banana", source: "NCCDB", raw: "Banana NCCDB row 1" },
+  { name: "Banana", source: "NCCDB", raw: "Banana NCCDB row 2" },
+]);
+assert.equal(duplicatePinnedResult.status, "needs_manual_step");
 
 const bestEffort = chooseFoodLogResult({ query: "Banana", matchPolicy: "best_effort" }, [
   { name: "Banana cream", source: "Custom Recipe", raw: "Banana cream Custom Recipe" },

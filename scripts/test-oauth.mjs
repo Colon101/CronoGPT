@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { createHash, createHmac } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -45,6 +45,17 @@ try {
     scopes: ["cronometer:read", "cronometer:write"],
     reason: undefined,
   });
+  for (const malformedAuthorization of [
+    "Bearer oauth-test-api-token trailing",
+    "Bearer oauth-test-api-token ",
+    " Bearer oauth-test-api-token",
+  ]) {
+    const malformedStaticAuth = request("POST", "/mcp", "", {
+      authorization: malformedAuthorization,
+      host: "cronogpt.example",
+    });
+    assert.equal(authorizeMcpRequest(malformedStaticAuth).ok, false);
+  }
 
   const unsupported = await authorize({
     scope: "cronometer:read unsupported:scope",
@@ -66,6 +77,42 @@ try {
   assert.equal(authorized.status, 302);
   const code = new URL(authorized.headers.location).searchParams.get("code");
   assert.ok(code);
+  const [codeBody, codeSignature] = code.split(".");
+  assert.ok(codeBody);
+  assert.ok(codeSignature);
+
+  for (const malformedCode of [
+    `.${codeSignature}`,
+    `${codeBody}.`,
+    `${codeBody}..${codeSignature}`,
+    `${code}.suffix`,
+    `${codeBody}=.${codeSignature}`,
+    `${codeBody}.${codeSignature}=`,
+  ]) {
+    const malformed = await token({
+      grant_type: "authorization_code",
+      code: malformedCode,
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      code_verifier: verifier,
+    });
+    assert.equal(malformed.status, 400);
+    assert.equal(JSON.parse(malformed.body).error, "invalid_grant");
+  }
+
+  const nonCanonical = await authorizationCodeWithNonCanonicalBodyCandidate();
+  const forgedNonCanonicalCode = `${nonCanonical.nonCanonicalBody}.${createHmac("sha256", "oauth-test-api-token")
+    .update(nonCanonical.nonCanonicalBody)
+    .digest("base64url")}`;
+  const nonCanonicalExchange = await token({
+    grant_type: "authorization_code",
+    code: forgedNonCanonicalCode,
+    client_id: nonCanonical.clientId,
+    redirect_uri: redirectUri,
+    code_verifier: verifier,
+  });
+  assert.equal(nonCanonicalExchange.status, 400);
+  assert.equal(JSON.parse(nonCanonicalExchange.body).error, "invalid_grant");
 
   const missingClient = await token({
     grant_type: "authorization_code",
@@ -84,10 +131,24 @@ try {
   });
   assert.equal(exchanged.status, 200);
   assert.equal(statSync(oauthStateFile).mode & 0o777, 0o600);
+  const persistedReplayState = JSON.parse(readFileSync(oauthStateFile, "utf8"));
+  assert.deepEqual(Object.keys(persistedReplayState.consumedAuthorizationCodes), [
+    createHash("sha256").update(code).digest("base64url"),
+  ]);
   const tokenBody = JSON.parse(exchanged.body);
   assert.equal(tokenBody.scope, "cronometer:read");
 
   __resetConsumedAuthorizationCodesForTests();
+  const replayWithSuffix = await token({
+    grant_type: "authorization_code",
+    code: `${code}.replay`,
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    code_verifier: verifier,
+  });
+  assert.equal(replayWithSuffix.status, 400);
+  assert.equal(JSON.parse(replayWithSuffix.body).error, "invalid_grant");
+
   const replayed = await token({
     grant_type: "authorization_code",
     code,
@@ -121,6 +182,11 @@ try {
     scopes: ["cronometer:read"],
     reason: undefined,
   });
+  const oauthAuthWithTrailingCredential = request("POST", "/mcp", "", {
+    authorization: `Bearer ${tokenBody.access_token} trailing`,
+    host: "cronogpt.example",
+  });
+  assert.equal(authorizeMcpRequest(oauthAuthWithTrailingCredential).ok, false);
 
   const oversized = response();
   await handleOAuthRequest(
@@ -154,6 +220,42 @@ async function authorize(overrides) {
     new URL(`${origin}/oauth/authorize`),
   );
   return res;
+}
+
+async function authorizationCodeWithNonCanonicalBodyCandidate() {
+  for (let length = 1; length <= 3; length += 1) {
+    const candidateClientId = `${clientId}${"x".repeat(length)}`;
+    const authorized = await authorize({
+      client_id: candidateClientId,
+      scope: "cronometer:read",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    });
+    assert.equal(authorized.status, 302);
+    const candidateCode = new URL(authorized.headers.location).searchParams.get("code");
+    assert.ok(candidateCode);
+    const [body] = candidateCode.split(".");
+    const nonCanonicalBody = equivalentNonCanonicalBase64Url(body);
+    if (nonCanonicalBody) {
+      return { clientId: candidateClientId, nonCanonicalBody };
+    }
+  }
+  assert.fail("Expected an authorization-code body with base64url padding bits");
+}
+
+function equivalentNonCanonicalBase64Url(segment) {
+  const remainder = segment.length % 4;
+  if (remainder !== 2 && remainder !== 3) return undefined;
+
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const lastIndex = alphabet.indexOf(segment.at(-1));
+  const unusedBitMask = remainder === 2 ? 0b1111 : 0b11;
+  assert.equal(lastIndex & unusedBitMask, 0);
+  const replacement = alphabet[lastIndex | 1];
+  const candidate = `${segment.slice(0, -1)}${replacement}`;
+  assert.deepEqual(Buffer.from(candidate, "base64url"), Buffer.from(segment, "base64url"));
+  assert.notEqual(Buffer.from(candidate, "base64url").toString("base64url"), candidate);
+  return candidate;
 }
 
 async function token(params) {

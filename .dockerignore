@@ -8,6 +8,11 @@ exports
 !.env.example
 .cronometer-storage-state.*
 .cronometer-login-backoff.json
+.cronometer-operation-journal.json*
+.cronogpt-oauth-state.json*
+.claude/
+.agents/
+.codex/
 *.log
 *.tmp
 playwright-report

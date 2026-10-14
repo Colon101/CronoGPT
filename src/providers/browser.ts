@@ -100,6 +100,11 @@ interface DiaryDateStatus {
   strategy: "current" | "today" | "arrow" | "invalid" | "out_of_range" | "failed" | "not_verified";
   steps?: number;
   displayedDateLabel?: string;
+  previousDiaryFingerprint?: string;
+  contentTransitionRequired?: boolean;
+  contentTransitionVerified?: boolean;
+  freshDocumentReloadVerified?: boolean;
+  roundTripVerified?: boolean;
   warning?: string;
 }
 
@@ -179,6 +184,8 @@ interface PersistedBackgroundBrowserJob {
   canonicalPayload?: string;
   callerIdempotencyKey?: string;
   semanticKey?: string;
+  effectVerifierVersion?: number;
+  legacyVerifierQuarantined?: boolean;
   result?: ProviderResult;
   error?: string;
 }
@@ -220,6 +227,10 @@ const ACCOUNT_VERIFICATION_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_FOOD_WRITE_WAIT_SECONDS = 75;
 const DEFAULT_BATCH_WRITE_WAIT_SECONDS = 120;
 const DEFAULT_CUSTOM_WRITE_WAIT_SECONDS = 180;
+// Version the evidence rules independently from the journal's serialization
+// format. Completed food writes from before this verifier trusted Cronometer's
+// optimistic editor DOM and must never be replayed as durable successes.
+const FOOD_LOG_EFFECT_VERIFIER_VERSION = 2;
 const CRONOMETER_PAGE_HASHES = {
   diary: "#diary",
   customFoods: "#custom-foods",
@@ -273,9 +284,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     const journal = readOperationJournal(config.operationJournalFile);
     this.journalHealth = journal.health;
     for (const operation of journal.operations) {
-      const recovered = operation.status === "running"
-        ? { ...operation, status: "indeterminate" as const, error: "The process restarted before this operation reached a terminal state." }
-        : operation;
+      const recovered = recoverPersistedBrowserOperation(operation);
       this.persistedOperations.set(recovered.id, recovered);
     }
     this.persistOperationJournal();
@@ -301,6 +310,29 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       capabilities,
       browserConfigured ? undefined : "Set CRONOMETER_STORAGE_STATE_BASE64 or Cronometer credentials, and enable local Chromium or provide REMOTE_CHROME_WS_ENDPOINT.",
     );
+  }
+
+  async shutdown(timeoutMs = this.config.operationTimeoutMs) {
+    const startedAt = Date.now();
+    const deadline = startedAt + Math.max(0, timeoutMs);
+    while (Date.now() < deadline) {
+      const runningBackgroundJobs = Array.from(backgroundBrowserJobs.values())
+        .filter((job) => job.status === "running").length;
+      if (activeBrowserJobs === 0 && queuedBrowserJobs === 0 && runningBackgroundJobs === 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+
+    const runningBackgroundJobs = Array.from(backgroundBrowserJobs.values())
+      .filter((job) => job.status === "running").length;
+    const drained = activeBrowserJobs === 0 && queuedBrowserJobs === 0 && runningBackgroundJobs === 0;
+    await this.closeCachedLocalSession();
+    return {
+      drained,
+      waitedMs: Date.now() - startedAt,
+      activeBrowserJobs,
+      queuedBrowserJobs,
+      runningBackgroundJobs,
+    };
   }
 
   async runtimeStatus(): Promise<ProviderResult> {
@@ -386,20 +418,25 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       return this.result("get_cronometer_operation", persisted.result.status, {
         ...resultDataObject(persisted.result),
         operationId,
-        state: ["written", "already_exists", "ok"].includes(persisted.result.status) ? "succeeded" : "failed",
+        state: persisted.result.status === "possibly_written_verify_failed"
+          ? "indeterminate"
+          : ["written", "already_exists", "ok"].includes(persisted.result.status) ? "succeeded" : "failed",
         retryable: false,
         nextAction: persisted.result.status === "possibly_written_verify_failed" ? "inspect_diary" : "none",
         returnedFromJournal: true,
       }, persisted.result.warning, persisted.result.source);
     }
     if (!job && persisted?.status === "failed") {
-      return this.result("get_cronometer_operation", "error", {
+      const definitelyDidNotWrite = persistedOperationDefinitelyDidNotWrite(persisted);
+      return this.result("get_cronometer_operation", definitelyDidNotWrite ? "error" : "possibly_written_verify_failed", {
         operationId,
-        state: "failed",
+        state: definitelyDidNotWrite ? "failed" : "indeterminate",
         retryable: false,
-        nextAction: "manual_resolution",
+        nextAction: definitelyDidNotWrite ? "manual_resolution" : "inspect_diary",
         returnedFromJournal: true,
-      }, persisted.error ?? "Background Cronometer operation failed.", "browser");
+      }, persisted.error ?? (definitelyDidNotWrite
+        ? "Background Cronometer operation failed before any write attempt."
+        : "Background Cronometer operation failed without proving whether a write occurred. Inspect the diary before retrying."), "browser");
     }
     if (!job) {
       return this.result("get_cronometer_operation", "not_configured", {
@@ -414,19 +451,24 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       return this.result("get_cronometer_operation", job.result.status, {
         ...resultDataObject(job.result),
         operationId: job.id,
-        state: ["written", "already_exists", "ok"].includes(job.result.status) ? "succeeded" : "failed",
+        state: job.result.status === "possibly_written_verify_failed"
+          ? "indeterminate"
+          : ["written", "already_exists", "ok"].includes(job.result.status) ? "succeeded" : "failed",
         retryable: false,
         nextAction: job.result.status === "possibly_written_verify_failed" ? "inspect_diary" : "none",
         backgroundJob: summarizeBackgroundBrowserJob(job, Date.now()),
       }, job.result.warning, job.result.source);
     }
-    return this.result("get_cronometer_operation", "error", {
+    const definitelyDidNotWrite = providerResultDefinitelyDidNotWrite(job.result);
+    return this.result("get_cronometer_operation", definitelyDidNotWrite ? "error" : "possibly_written_verify_failed", {
       operationId: job.id,
-      state: "failed",
+      state: definitelyDidNotWrite ? "failed" : "indeterminate",
       retryable: false,
-      nextAction: "manual_resolution",
+      nextAction: definitelyDidNotWrite ? "manual_resolution" : "inspect_diary",
       backgroundJob: summarizeBackgroundBrowserJob(job, Date.now()),
-    }, job.error ?? "Background Cronometer operation failed.", "browser");
+    }, job.error ?? (definitelyDidNotWrite
+      ? "Background Cronometer operation failed before any write attempt."
+      : "Background Cronometer operation failed without proving whether a write occurred. Inspect the diary before retrying."), "browser");
   }
 
   async refreshSession(): Promise<ProviderResult> {
@@ -455,18 +497,19 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
     return this.withPage("cronometer_stability_check", async (page) => {
       const startedAt = Date.now();
-      await this.openApp(page, "#diary");
+      const dateStatus = await this.openDiary(page);
       const diaryText = await this.waitForDiaryText(page);
       const checks = {
         loggedIn: await this.isLoggedIn(page, diaryText),
         diaryReadable: /\bDiary\b/i.test(diaryText),
         hasMealSections: hasDiaryMealSections(diaryText),
         hasNavigation: /\b(Dashboard|Diary|Trends|Foods)\b/i.test(diaryText),
+        todaySelected: dateStatus.selected,
       };
 
       let foodSearch: { query: string; resultCount: number; firstResult?: SearchResult } | undefined;
       if (includeFoodSearch) {
-        const { results } = await this.searchFoodUi(page, foodQuery, 3);
+        const { results } = await this.searchFoodUi(page, foodQuery, 3, undefined, { provenDateStatus: dateStatus });
         foodSearch = {
           query: foodQuery,
           resultCount: results.length,
@@ -474,11 +517,12 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         };
       }
 
-      const ready = checks.loggedIn && checks.diaryReadable && checks.hasMealSections && checks.hasNavigation && (!includeFoodSearch || Boolean(foodSearch?.resultCount));
+      const ready = checks.loggedIn && checks.diaryReadable && checks.hasMealSections && checks.hasNavigation && checks.todaySelected && (!includeFoodSearch || Boolean(foodSearch?.resultCount));
       return this.result("cronometer_stability_check", ready ? "ok" : "needs_manual_step", {
         ready,
         elapsedMs: Date.now() - startedAt,
         checks,
+        dateStatus,
         foodSearch,
         diaryText: ready ? undefined : compactText(diaryText, 8000),
         runtime: {
@@ -489,7 +533,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           operationTimeoutMs: this.config.operationTimeoutMs,
           browserRetryCount: this.config.browserRetryCount,
         },
-      }, ready ? undefined : "Cronometer preflight did not pass every readiness check.");
+      }, ready ? undefined : dateStatus.warning ?? "Cronometer preflight did not pass every readiness check.");
     });
   }
 
@@ -600,14 +644,22 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       const days = [];
       for (const date of range.dates) {
         const dateStatus = await this.openDiary(page, date);
-        const diary = await extractDiaryFoodEntries(page);
-        const structureVerified = FOOD_LOG_MEALS.every((meal) => diary.mealSections.includes(meal));
+        const snapshot = dateStatus.selected
+          ? await waitForStableDiaryFoodEntries(page, date, todayIso(this.config.timeZone), 12000, 750)
+          : undefined;
+        const diary = snapshot?.stable ? snapshot.diary : { mealSections: [], entries: [] };
+        const structureVerified = Boolean(
+          dateStatus.selected
+          && snapshot?.stable
+          && FOOD_LOG_MEALS.every((meal) => diary.mealSections.includes(meal)),
+        );
         days.push({
           date,
           dateStatus,
           mealSections: diary.mealSections,
           entries: diary.entries.map((entry) => ({ date, ...entry })),
           structureVerified,
+          snapshot: structureVerified ? undefined : snapshot,
           rawText: structureVerified ? undefined : compactText(await this.waitForDiaryText(page), 8000),
         });
         if (!dateStatus.selected || !structureVerified) break;
@@ -650,13 +702,16 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       });
       const results = rankFoodResults(input.query, outcome.results, undefined, input.selectedSource);
       const selection = chooseFoodLogResult({ query: input.query }, results);
-      return this.result("search_foods", "ok", {
+      return this.result("search_foods", outcome.dateStatus.selected ? "ok" : "needs_manual_step", {
         query: input.query,
         searchScope: input.searchScope ?? "auto",
         selectedSource: input.selectedSource,
+        dateStatus: outcome.dateStatus,
         results,
         selection,
-      });
+        browserOpened: true,
+        writeAttempted: false,
+      }, outcome.dateStatus.selected ? undefined : outcome.dateStatus.warning ?? "Cronometer could not verify today's diary before food search, so no search was submitted.");
     });
   }
 
@@ -667,7 +722,16 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     return this.withPage("resolve_recipe_ingredients", async (page) => {
       const startedAt = Date.now();
       const deadline = startedAt + maxMs;
-      await this.openFoodSearchDialog(page);
+      const dateStatus = await this.openFoodSearchDialog(page);
+      if (!dateStatus.selected) {
+        return this.result("resolve_recipe_ingredients", "needs_manual_step", {
+          recipeName: input.recipeName,
+          dateStatus,
+          resolved: [],
+          browserOpened: true,
+          writeAttempted: false,
+        }, dateStatus.warning ?? "Cronometer could not verify today's diary before ingredient search, so no search was submitted.");
+      }
       await clickFoodDialogFilter(page, "All").catch(() => undefined);
 
       const resolved = [];
@@ -902,7 +966,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       {
         callerIdempotencyKey: batchIdempotencyKey,
         semanticPayload: normalizedItems.map((item) => canonicalFoodLogPayload(item.normalized)),
-        expectedExistingMatchCount: normalizedItems.some((item) => item.input.expectedExistingMatchCount !== undefined)
+        expectedExistingMatchCount: normalizedItems.every((item) => item.input.expectedExistingMatchCount !== undefined)
           ? normalizedItems.reduce((total, item) => total + (item.input.expectedExistingMatchCount ?? 0), 0)
           : undefined,
       },
@@ -935,7 +999,10 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       const summary = summarizeBatchFoodLogResult(item.index, item.normalized, result);
       itemResults.push(summary);
 
-      if (input.stopOnFirstFailure === true && !foodLogBatchItemSucceeded(result.status)) {
+      // Any unsuccessful item can leave Cronometer in an editor/search state
+      // that is unsafe to reuse for a later item. Determinism takes priority
+      // over best-effort partial progress: every non-success ends the batch.
+      if (!foodLogBatchItemSucceeded(result.status)) {
         stoppedEarly = true;
         break;
       }
@@ -970,9 +1037,12 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     preflightData: ReturnType<typeof foodLogBrowserPreflightData>,
   ): Promise<ProviderResult> {
     const requested = normalizedToFoodInput(normalized, input);
-    const initialDateStatus = await this.openDiary(page, normalized.date);
+    const initialDateStatus = await this.openDiaryForWrite(page, normalized.date);
     const beforeDiaryText = await this.visibleText(page).catch(() => "");
-    const beforeDiary = await extractDiaryFoodEntries(page).catch(() => undefined);
+    const beforeSnapshot = initialDateStatus.selected
+      ? await waitForStableDiaryFoodEntries(page, normalized.date, todayIso(this.config.timeZone), 12000, 1000)
+      : undefined;
+    const beforeDiary = beforeSnapshot?.stable ? beforeSnapshot.diary : undefined;
     const beforeMatch = beforeDiary?.mealSections.length
       ? matchFoodLogInDiaryEntries(beforeDiary.entries, normalized)
       : undefined;
@@ -993,8 +1063,25 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         initialDateStatus.warning ?? "Could not apply the requested diary date. No write was attempted.",
       );
     }
+    if (!beforeSnapshot?.stable || !beforeDiary || !FOOD_LOG_MEALS.every((meal) => beforeDiary.mealSections.includes(meal))) {
+      return this.result(
+        "log_food",
+        "needs_manual_step",
+        {
+          ...preflightData,
+          input: safeInput(input),
+          browserOpened: true,
+          writeAttempted: false,
+          dateStatus: initialDateStatus,
+          diarySnapshot: beforeSnapshot,
+          verification: beforeVerification,
+          retry: "Retry only after a read-only list_food_entries call can prove a stable diary on the exact requested date.",
+        },
+        "Cronometer's exact diary date and row structure did not remain stable long enough to establish a safe pre-write baseline. No write was attempted.",
+      );
+    }
 
-    const foodSearch = await this.searchFoodForLog(page, normalized, requested, input);
+    const foodSearch = await this.searchFoodForLog(page, normalized, requested, input, initialDateStatus);
     const { preview, dateStatus, queryUsed } = foodSearch;
     if (!dateStatus.selected) {
       return this.result(
@@ -1124,6 +1211,26 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     }
 
     await page.waitForTimeout(1000);
+    const identityReadback = await readFoodEditorIdentity(editor, selectedName, selectedSource);
+    if (!identityReadback.matches) {
+      return this.result(
+        "log_food",
+        "needs_manual_step",
+        {
+          ...preflightData,
+          input: safeInput(input),
+          selectedName,
+          selectedSource,
+          selection,
+          identityReadback,
+          browserOpened: true,
+          writeAttempted: false,
+          queryUsed,
+          retry: retryGuidanceForFoodLog("needs_manual_step"),
+        },
+        identityReadback.warning ?? "The selected food identity could not be verified. No food was written.",
+      );
+    }
     const timeFill = await fillFoodTime(page, editor, normalized.timestamp);
     if (!timeFill.filled) {
       return this.result(
@@ -1269,9 +1376,89 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       }, "The current diary baseline does not match expectedExistingMatchCount. No food was written.");
     }
 
-    markPageWriteAttempted(page);
-    const saved = await commitFoodEditor(editor);
-    if (!saved) {
+    await page.waitForTimeout(600);
+    const commitEditor = await waitForUniqueFoodEditor(page, 2500);
+    const commitMealReadback = commitEditor
+      ? await readFoodEditorMeal(commitEditor, normalized.meal)
+      : { matches: false, currentMeal: "", editorMealControlCount: 0 };
+    const expectedEditorAmount = convertedFoodAmount?.converted === true
+      ? convertedFoodAmount.convertedAmount
+      : normalized.amount;
+    const commitAmountReadback = commitEditor
+      ? await readFoodEditorAmount(commitEditor, expectedEditorAmount)
+      : { matches: false, actualValue: "", expectedAmount: expectedEditorAmount };
+    const commitUnitReadback = commitEditor
+      ? await readFoodEditorUnit(
+          commitEditor,
+          normalized.unit,
+          convertedFoodAmount?.converted === true ? unitFill.currentUnitText : undefined,
+        )
+      : { matches: false, currentUnitText: "", expectedUnit: normalized.unit };
+    const commitTimeReadback = commitEditor
+      ? await readFoodEditorTime(commitEditor, normalized.timestamp)
+      : { matches: false, timestamp: normalized.timestamp };
+    const commitIdentityReadback = commitEditor
+      ? await readFoodEditorIdentity(commitEditor, selectedName, selectedSource)
+      : { matches: false, expectedName: selectedName, expectedSource: selectedSource };
+    const commitDisplayedDateLabel = await readDiaryDateLabel(page);
+    const commitDateMatches = diaryDateLabelMatches(
+      commitDisplayedDateLabel,
+      normalized.date,
+      todayIso(this.config.timeZone),
+    );
+    if (
+      !commitEditor
+      || !commitDateMatches
+      || !commitIdentityReadback.matches
+      || !commitMealReadback.matches
+      || !commitAmountReadback.matches
+      || !commitUnitReadback.matches
+      || !commitTimeReadback.matches
+    ) {
+      return this.result(
+        "log_food",
+        "needs_manual_step",
+        {
+          ...preflightData,
+          input: safeInput(input),
+          selectedName,
+          selectedSource,
+          browserOpened: true,
+          writeAttempted: false,
+          identityReadback,
+          commitIdentityReadback,
+          commitMealReadback,
+          commitAmountReadback,
+          commitUnitReadback,
+          commitTimeReadback,
+          commitDisplayedDateLabel,
+          commitDateMatches,
+          retry: retryGuidanceForFoodLog("needs_manual_step"),
+        },
+        "The food editor did not retain the exact selected food, date, meal, amount, unit, and optional timestamp through a delayed final read immediately before commit. No food was written.",
+      );
+    }
+
+    const persisted = await commitAndVerifyPersistedFoodLog({
+      page,
+      editor: commitEditor,
+      normalized: verifiedLog,
+      beforeMatchCount: beforeSelectedMatch?.count,
+      timeZone: this.config.timeZone,
+      navigationTimeoutMs: this.config.navigationTimeoutMs,
+      // commitAndVerifyPersistedFoodLog already forced a full document reload.
+      // Re-opening #diary here caused a second navigation and another fixed
+      // settle delay. Wait for that fresh document, then select/verify its date
+      // directly so persistence evidence stays server-backed without duplicate
+      // network work.
+      selectDiaryDate: async () => {
+        await dismissCronometerMarketingOverlays(page);
+        await this.waitForDiaryText(page);
+        await this.ensureConfiguredAccount(page, "#diary");
+        return this.selectDiaryDate(page, normalized.date);
+      },
+    });
+    if (!persisted.saved) {
       return this.result(
         "log_food",
         "needs_manual_step",
@@ -1284,37 +1471,54 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           writeAttempted: false,
           queryUsed,
           timeFill,
+          identityReadback,
           mealSelection,
           mealReadback,
+          commitMealReadback,
+          commitAmountReadback,
+          commitUnitReadback,
+          commitTimeReadback,
+          commitIdentityReadback,
+          commitDisplayedDateLabel,
+          commitDateMatches,
           retry: retryGuidanceForFoodLog("needs_manual_step"),
         },
         "Selected the food but could not find a stable add/save button. Nothing was intentionally saved.",
       );
     }
-
-    await page.waitForTimeout(1500);
-    const afterText = await this.waitForDiaryText(page).catch(() => "");
-    const afterDiary = await extractDiaryFoodEntries(page).catch(() => undefined);
-    const afterMatch = afterDiary?.mealSections.length
-      ? matchFoodLogInDiaryEntries(afterDiary.entries, verifiedLog)
-      : undefined;
-    const verification = afterMatch?.verification
-      ?? verifyFoodLogInDiaryText(afterText || await this.visibleText(page).catch(() => ""), verifiedLog);
-    const countDelta = beforeSelectedMatch && afterMatch
-      ? foodLogCountDelta(beforeSelectedMatch.count, afterMatch.count)
-      : undefined;
-    const countVerified = countDelta?.verified === true;
+    const {
+      persistedDateStatus,
+      persistedSnapshot,
+      persistenceWarning,
+      verification,
+      countDelta,
+      persistedStructureVerified,
+      timestampPersistenceVerified,
+      countVerified,
+    } = persisted;
     const status = countVerified ? "written" : "possibly_written_verify_failed";
     return this.result("log_food", status, {
       ...preflightData,
       logged: { ...safeInput(input), selectedName, selectedSource },
-      dateStatus,
+      dateStatus: persistedDateStatus ?? dateStatus,
+      preCommitDateStatus: dateStatus,
+      persistedStructureVerified,
+      persistedSnapshot,
       selection,
       unitFill,
       amountFill,
       timeFill,
+      identityReadback,
       mealSelection,
       mealReadback,
+      commitMealReadback,
+      commitAmountReadback,
+      commitUnitReadback,
+      commitTimeReadback,
+      commitIdentityReadback,
+      commitDisplayedDateLabel,
+      commitDateMatches,
+      timestampPersistenceVerified,
       convertedFoodAmount,
       browserOpened: true,
       writeAttempted: true,
@@ -1323,27 +1527,35 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       countDelta,
       retry: retryGuidanceForFoodLog(status),
       visibleText: countVerified ? undefined : compactText(await this.visibleText(page).catch(() => ""), 6000),
-    }, countVerified ? undefined : countDelta?.reason ?? "Food may have been written, but a structured before/after row-count delta could not prove exactly one new entry. Do not blindly retry.");
+    }, countVerified
+      ? undefined
+      : persistenceWarning
+        ?? (normalized.timestamp && !timestampPersistenceVerified
+          ? "The food row persisted, but Cronometer's diary table does not expose the saved timestamp for server-backed verification. The operation is indeterminate rather than claiming success."
+          : undefined)
+        ?? countDelta?.reason
+        ?? "Food may have been written, but a fresh, stable, exact-date diary reload could not prove exactly one persisted new entry. Do not blindly retry.");
   }
 
   async deleteDiaryFoodEntry(input: DiaryFoodDeleteInput & { confirmed?: boolean }) {
     const target = normalizeDiaryFoodDeleteInput(input, this.config.timeZone);
     const confirmedDelete = input.dryRun === false && input.confirmed === true;
     if (confirmedDelete) {
-      const backgroundKey = backgroundBrowserJobKey("delete_diary_food_entry", {
-        date: target.date,
-        meal: target.meal,
-        name: target.name,
-        amount: target.amount,
-        unit: target.unit,
-        deleteCount: target.deleteCount,
-        confirmName: input.confirmName,
-      });
+      const callerIdempotencyKey = input.idempotencyKey?.trim() || undefined;
+      const semanticPayload = canonicalDiaryFoodDeletePayload(target);
+      const backgroundKey = callerIdempotencyKey
+        ? backgroundBrowserJobKey("delete_diary_food_entry", { idempotencyKey: callerIdempotencyKey })
+        : backgroundBrowserJobKey("delete_diary_food_entry", semanticPayload);
       const accepted = this.startBackgroundBrowserJob(
         "delete_diary_food_entry",
         backgroundKey,
         safeInput(input),
         () => this.runDeleteDiaryFoodEntry(input),
+        {
+          callerIdempotencyKey,
+          semanticPayload,
+          expectedExistingMatchCount: expectedExistingMatchCount(input),
+        },
       );
       return this.waitForAcceptedBackgroundJob(
         "delete_diary_food_entry",
@@ -1373,15 +1585,10 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     }
 
     return this.withPage("delete_diary_food_entry", async (page) => {
-      const dateStatus = await this.openDiary(page, target.date);
-      const beforeText = await this.waitForDiaryText(page).catch(async () => await this.visibleText(page).catch(() => ""));
-      const matches = findDiaryFoodEntryMatches(beforeText, target);
-      const preview = {
-        target: safeInput(target),
-        matchCount: matches.length,
-        matches: matches.map((match) => ({ entryText: compactText(match.entryText, 500) })),
-      };
-
+      // Always discard the current SPA state before a destructive diary
+      // operation. In particular, a row selected by an earlier failed delete
+      // must not remain part of Cronometer's "selected entries" set.
+      const dateStatus = await this.openDiaryForWrite(page, target.date);
       if (!dateStatus.selected) {
         return this.result(
           "delete_diary_food_entry",
@@ -1389,12 +1596,62 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           {
             input: safeInput(input),
             dateStatus,
-            preview,
+            preview: { target: safeInput(target), matchCount: 0, matches: [] },
             browserOpened: true,
             writeAttempted: false,
           },
           dateStatus.warning ?? "Could not apply the requested diary date. No delete was attempted.",
         );
+      }
+
+      let currentSelectionReset = await clearDiaryEntrySelections(page);
+      if (!currentSelectionReset.cleared) {
+        return this.result("delete_diary_food_entry", "needs_manual_step", {
+          input: safeInput(input),
+          dateStatus,
+          selectionReset: currentSelectionReset,
+          browserOpened: true,
+          writeAttempted: false,
+        }, "A fresh diary reload still contained selected diary rows that could not be safely cleared. No delete was attempted.");
+      }
+
+      const beforeSnapshot = await waitForStableDiaryFoodEntries(
+        page,
+        target.date,
+        todayIso(this.config.timeZone),
+        12000,
+        1500,
+      );
+      if (!beforeSnapshot.stable) {
+        return this.result("delete_diary_food_entry", "needs_manual_step", {
+          input: safeInput(input),
+          dateStatus,
+          beforeSnapshot,
+          browserOpened: true,
+          writeAttempted: false,
+        }, "The exact requested diary date and rows did not remain stable long enough to preview a safe deletion. No delete was attempted.");
+      }
+      const targetFoodLog = diaryDeleteTargetAsFoodLog(target);
+      const structuredMatches = matchFoodLogInDiaryEntries(beforeSnapshot.diary.entries, targetFoodLog).matches;
+      const matches = structuredMatches.map((entry) => ({ entryText: JSON.stringify(entry) }));
+      const preview = {
+        target: safeInput(target),
+        matchCount: matches.length,
+        matches: matches.map((match) => ({ entryText: compactText(match.entryText, 500) })),
+      };
+
+      const expectedMatchCount = expectedExistingMatchCount(input);
+      if (expectedMatchCount !== undefined && matches.length !== expectedMatchCount) {
+        return this.result("delete_diary_food_entry", "needs_manual_step", {
+          input: safeInput(input),
+          dateStatus,
+          preview,
+          expectedExistingMatchCount: expectedMatchCount,
+          actualExistingMatchCount: matches.length,
+          browserOpened: true,
+          writeAttempted: false,
+          nextAction: "inspect_diary",
+        }, `The fresh diary baseline has ${matches.length} exact matches, not expectedExistingMatchCount ${expectedMatchCount}. No delete command was sent.`);
       }
 
       if (matches.length === 0) {
@@ -1452,10 +1709,12 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       }
 
       let currentMatches = matches;
+      let currentSnapshot = beforeSnapshot;
       const deletions = [];
       for (let index = 0; index < target.deleteCount; index += 1) {
         const beforeCount = currentMatches.length;
-        const clicked = await clickDiaryFoodEntryRow(page, target, currentMatches[0]);
+        const beforeTotalCount = currentSnapshot.diary.entries.length;
+        const clicked = await clickDiaryFoodEntryRow(page, target);
         if (!clicked.clicked) {
           return this.result("delete_diary_food_entry", "needs_manual_step", {
             input: safeInput(input), dateStatus, preview, deletions, click: clicked,
@@ -1463,7 +1722,17 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           }, clicked.warning ?? "Could not select a matching diary row with stable UI selectors.");
         }
 
-        const deleteTrigger = await triggerSelectedDiaryEntryDelete(page);
+        const selectionProof = await proveTargetedDiaryEntrySelection(page, dateStatus, clicked);
+        const selectedAfterClick = selectionProof.selectedAfterClick;
+        if (!selectionProof.verified || !selectionProof.deleteTrigger?.triggered) {
+          return this.result("delete_diary_food_entry", "needs_manual_step", {
+            input: safeInput(input), dateStatus, preview, deletions, click: clicked,
+            selectionReset: currentSelectionReset, selectedAfterClick, selectionProof,
+            browserOpened: true, writeAttempted: deletions.length > 0,
+          }, selectionProof.warning ?? "Cronometer did not acknowledge the exact target-row selection with its delete confirmation. No delete was confirmed.");
+        }
+
+        const deleteTrigger = selectionProof.deleteTrigger;
         const confirmation = await confirmSelectedDiaryEntryDelete(page);
         if (!confirmation.confirmed) {
           return this.result("delete_diary_food_entry", deletions.length > 0 ? "possibly_written_verify_failed" : "needs_manual_step", {
@@ -1473,20 +1742,70 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           }, confirmation.warning ?? "Cronometer did not show the expected selected-entry delete confirmation.");
         }
 
-        await page.waitForTimeout(2500);
-        const afterText = await this.waitForDiaryText(page).catch(async () => await this.visibleText(page).catch(() => ""));
-        currentMatches = findDiaryFoodEntryMatches(afterText, target);
-        const countDelta = foodLogCountDelta(beforeCount, currentMatches.length, -1);
-        deletions.push({ index, beforeCount, afterCount: currentMatches.length, clicked, deleteTrigger, deleteConfirmation: confirmation, countDelta });
-        if (!countDelta.verified) {
+        await page.waitForTimeout(3000);
+        let refreshedDateStatus: DiaryDateStatus | undefined;
+        let refreshedSelectionReset: Awaited<ReturnType<typeof clearDiaryEntrySelections>> | undefined;
+        let afterSnapshot: Awaited<ReturnType<typeof waitForStableDiaryFoodEntries>> | undefined;
+        try {
+          refreshedDateStatus = await this.openDiaryForWrite(page, target.date);
+          if (refreshedDateStatus.selected) {
+            refreshedSelectionReset = await clearDiaryEntrySelections(page);
+            if (refreshedSelectionReset.cleared) {
+              afterSnapshot = await waitForStableDiaryFoodEntries(
+                page,
+                target.date,
+                todayIso(this.config.timeZone),
+                15000,
+                2000,
+              );
+            }
+          }
+        } catch {
+          // The indeterminate result below preserves the no-blind-retry rule.
+        }
+        if (!refreshedDateStatus?.selected || !refreshedSelectionReset?.cleared || !afterSnapshot?.stable) {
+          return this.result("delete_diary_food_entry", "possibly_written_verify_failed", {
+            input: safeInput(input), dateStatus, refreshedDateStatus, preview, deletions,
+            click: clicked, deleteTrigger, deleteConfirmation: confirmation,
+            selectionReset: refreshedSelectionReset, afterSnapshot,
+            deletedCount: index,
+            browserOpened: true, writeAttempted: true,
+          }, "A delete was attempted, but a fresh, selection-free, stable reload of the exact requested date could not verify its persisted effect. Stopped before deleting anything else.");
+        }
+        const deletionEffect = verifyDiaryFoodDeletionEffect(
+          currentSnapshot.diary.entries,
+          afterSnapshot.diary.entries,
+          targetFoodLog,
+        );
+        currentMatches = deletionEffect.afterMatches
+          .map((entry) => ({ entryText: JSON.stringify(entry) }));
+        deletions.push({
+          index,
+          beforeCount,
+          beforeTotalCount,
+          afterCount: currentMatches.length,
+          afterTotalCount: afterSnapshot.diary.entries.length,
+          clicked,
+          deleteTrigger,
+          deleteConfirmation: confirmation,
+          refreshedDateStatus,
+          selectionReset: currentSelectionReset,
+          selectedAfterClick,
+          selectionProof,
+          refreshedSelectionReset,
+          targetCountDelta: deletionEffect.targetCountDelta,
+          totalCountDelta: deletionEffect.totalCountDelta,
+        });
+        if (!deletionEffect.verified) {
           return this.result("delete_diary_food_entry", "possibly_written_verify_failed", {
             input: safeInput(input), dateStatus, preview, deletions,
             deletedCount: index,
             remainingMatchCount: currentMatches.length,
             browserOpened: true, writeAttempted: true,
-            afterText: compactText(afterText, 4000),
-          }, "A delete was attempted, but read-back did not prove that exactly one matching row disappeared. Stopped before deleting anything else.");
+          }, "A delete was attempted, but read-back did not prove both that exactly one matching row disappeared and that the diary's total structured row count decreased by exactly one. Stopped before deleting anything else.");
         }
+        currentSnapshot = afterSnapshot;
+        currentSelectionReset = refreshedSelectionReset;
       }
 
       return this.result("delete_diary_food_entry", "ok", {
@@ -1508,6 +1827,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     normalized: NormalizedFoodLog,
     requested: FoodLogInput,
     original: FoodLogInput,
+    provenDateStatus: DiaryDateStatus,
   ) {
     let lastOutcome: FoodSearchOutcome | undefined;
     let lastQuery = normalized.searchQueries[0] ?? normalized.query;
@@ -1516,13 +1836,14 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       const outcome = await this.searchFoodUi(page, query, 5, normalized.date, {
         searchScope: original.searchScope,
         selectedSource: original.selectedSource,
+        provenDateStatus,
       });
       lastOutcome = outcome;
       if (outcome.results.length > 0 || !outcome.dateStatus.selected) {
         return { preview: outcome.results, dateStatus: outcome.dateStatus, queryUsed: query };
       }
     }
-    const fallbackDateStatus = lastOutcome?.dateStatus ?? await this.openDiary(page, normalized.date);
+    const fallbackDateStatus = lastOutcome?.dateStatus ?? provenDateStatus;
     return { preview: lastOutcome?.results ?? [], dateStatus: fallbackDateStatus, queryUsed: lastQuery };
   }
 
@@ -2968,10 +3289,16 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     query: string,
     limit: number,
     date?: string,
-    options: { searchScope?: FoodLogInput["searchScope"]; selectedSource?: string } = {},
+    options: {
+      searchScope?: FoodLogInput["searchScope"];
+      selectedSource?: string;
+      provenDateStatus?: DiaryDateStatus;
+    } = {},
   ): Promise<FoodSearchOutcome> {
-    const dateStatus = await this.openFoodSearchDialog(page, date);
-    if (date && !dateStatus.selected) return { results: [], dateStatus };
+    const dateStatus = options.provenDateStatus
+      ? await this.openFoodSearchDialogOnProvenDiary(page, options.provenDateStatus)
+      : await this.openFoodSearchDialog(page, date);
+    if (!dateStatus.selected) return { results: [], dateStatus };
 
     const attempts = foodSearchTabAttempts(options.searchScope, options.selectedSource);
     let fallbackTab: string | undefined;
@@ -3008,12 +3335,52 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   private async openFoodSearchDialog(page: Page, date?: string) {
     const dateStatus = await this.openDiary(page, date);
+    if (!dateStatus.selected) return dateStatus;
     const alreadyOpen = await foodDialogIsOpen(page);
     if (!alreadyOpen) {
       await clickByText(page, /^FOOD$/i);
     }
-    await waitForFoodDialogReady(page, Math.min(this.config.navigationTimeoutMs, 12000));
-    return dateStatus;
+    const ready = await waitForFoodDialogReady(page, Math.min(this.config.navigationTimeoutMs, 12000));
+    return ready
+      ? dateStatus
+      : {
+          ...dateStatus,
+          selected: false,
+          warning: "Food search did not become ready on the verified diary date. No food search or write was attempted.",
+        };
+  }
+
+  private async openFoodSearchDialogOnProvenDiary(page: Page, proven: DiaryDateStatus) {
+    if (!proven.selected) return proven;
+    const alreadyOpen = await foodDialogIsOpen(page);
+    if (!alreadyOpen) {
+      const displayedDateLabel = await readDiaryDateLabel(page);
+      if (!diaryDateLabelMatches(displayedDateLabel, proven.appliedDate, proven.currentDate)) {
+        return {
+          ...proven,
+          selected: false,
+          displayedDateLabel,
+          warning: `The proven diary date changed to ${displayedDateLabel || "an unreadable label"} before food search opened. No write was attempted.`,
+        };
+      }
+      const clicked = await clickByText(page, /^FOOD$/i);
+      if (!clicked) {
+        return {
+          ...proven,
+          selected: false,
+          displayedDateLabel,
+          warning: "Could not open food search from the already-proven diary document. No write was attempted.",
+        };
+      }
+    }
+    const ready = await waitForFoodDialogReady(page, Math.min(this.config.navigationTimeoutMs, 12000));
+    return ready
+      ? proven
+      : {
+          ...proven,
+          selected: false,
+          warning: "Food search did not become ready on the already-proven diary document. No write was attempted.",
+        };
   }
 
   private async openDiary(page: Page, date?: string) {
@@ -3022,9 +3389,70 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     return this.selectDiaryDate(page, date);
   }
 
+  /**
+   * Establish a server-backed diary date before any mutation.
+   *
+   * A matching "Today" label is not sufficient: the live incident showed a
+   * Today-looking editor whose hidden GWT save target was still the prior day.
+   * Start from a full document reload, navigate to the target, then force a
+   * previous-day/target-day round trip with observed diary-table mutations.
+   */
+  private async openDiaryForWrite(page: Page, date?: string): Promise<DiaryDateStatus> {
+    await this.openApp(page, "#diary");
+    try {
+      await page.reload({ waitUntil: "domcontentloaded", timeout: this.config.navigationTimeoutMs });
+      await page.waitForTimeout(1200);
+      await dismissCronometerMarketingOverlays(page);
+      await this.waitForDiaryText(page);
+    } catch (error) {
+      const currentDate = todayIso(this.config.timeZone);
+      const parsed = normalizeDiaryDateInput(date, currentDate);
+      return {
+        requestedDate: date,
+        normalizedDate: parsed.date,
+        currentDate,
+        appliedDate: parsed.date ?? currentDate,
+        selected: false,
+        strategy: "not_verified",
+        freshDocumentReloadVerified: false,
+        roundTripVerified: false,
+        warning: `Could not establish a fresh Cronometer diary document before the write: ${error instanceof Error ? error.message : "reload failed"}. No write was attempted.`,
+      };
+    }
+
+    const selected = await this.selectDiaryDate(page, date);
+    if (!selected.selected) {
+      return {
+        ...selected,
+        freshDocumentReloadVerified: true,
+        roundTripVerified: false,
+      };
+    }
+
+    const roundTrip = await proveDiaryDateRoundTrip(
+      page,
+      selected.appliedDate,
+      selected.currentDate,
+      Math.min(this.config.navigationTimeoutMs, 15000),
+    );
+    return {
+      ...selected,
+      selected: roundTrip.verified,
+      displayedDateLabel: roundTrip.displayedDateLabel,
+      contentTransitionRequired: true,
+      contentTransitionVerified: roundTrip.verified,
+      freshDocumentReloadVerified: true,
+      roundTripVerified: roundTrip.verified,
+      warning: roundTrip.warning,
+    };
+  }
+
   private async selectDiaryDate(page: Page, requestedDate?: string): Promise<DiaryDateStatus> {
     const currentDate = todayIso(this.config.timeZone);
-    const parsed = normalizeDiaryDateInput(requestedDate, currentDate);
+    const hasExplicitRequestedDate = Boolean(requestedDate?.trim());
+    const parsed = hasExplicitRequestedDate
+      ? normalizeDiaryDateInput(requestedDate, currentDate)
+      : { date: currentDate };
     const base = {
       requestedDate,
       normalizedDate: parsed.date,
@@ -3034,17 +3462,6 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
     const initialDisplayedDateLabel = await readDiaryDateLabel(page);
     const initialDisplayedDate = diaryDateLabelToIso(initialDisplayedDateLabel, currentDate);
-    if (!requestedDate) {
-      const selected = diaryDateLabelMatches(initialDisplayedDateLabel, currentDate, currentDate);
-      return {
-        ...base,
-        appliedDate: currentDate,
-        selected,
-        strategy: selected ? "current" : "not_verified",
-        displayedDateLabel: initialDisplayedDateLabel,
-        warning: selected ? undefined : `Cronometer opened the diary, but its date label was ${initialDisplayedDateLabel || "not visible"} instead of Today. No date-specific write was attempted.`,
-      };
-    }
     if (!parsed.date) {
       return {
         ...base,
@@ -3070,7 +3487,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       return {
         ...base,
         selected,
-        strategy: selected ? "today" : "not_verified",
+        strategy: selected ? (hasExplicitRequestedDate ? "today" : "current") : "not_verified",
         steps: 0,
         displayedDateLabel: initialDisplayedDateLabel,
         warning: selected ? undefined : `Cronometer's diary date label was ${initialDisplayedDateLabel || "not visible"}; expected Today. No write was attempted.`,
@@ -3086,28 +3503,52 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       };
     }
 
+    const preNavigationDiary = await extractDiaryFoodEntries(page).catch(() => ({ mealSections: [], entries: [] }));
+    const previousDiaryFingerprint = diaryEntriesFingerprint(preNavigationDiary);
     const direction = days > 0 ? "next" : "previous";
     for (let index = 0; index < Math.abs(days); index += 1) {
+      const mutationWatchId = await armDiaryRowMutationWatch(page);
       const clicked = await clickDiaryDateArrow(page, direction);
       if (!clicked) {
+        await clearDiaryRowMutationWatch(page, mutationWatchId);
         return {
           ...base,
           selected: false,
           strategy: "failed",
           steps: index,
+          previousDiaryFingerprint,
+          contentTransitionRequired: true,
           warning: "Could not find Cronometer's diary date arrow. No date-specific write was attempted.",
         };
       }
       const expectedStepDate = addDaysIso(initialDisplayedDate, direction === "next" ? index + 1 : -(index + 1));
       const displayedDateLabel = await waitForDiaryDateLabel(page, expectedStepDate, currentDate, 3000);
       if (!diaryDateLabelMatches(displayedDateLabel, expectedStepDate, currentDate)) {
+        await clearDiaryRowMutationWatch(page, mutationWatchId);
         return {
           ...base,
           selected: false,
           strategy: "not_verified",
           steps: index + 1,
           displayedDateLabel,
+          previousDiaryFingerprint,
+          contentTransitionRequired: true,
+          contentTransitionVerified: false,
           warning: `Clicked Cronometer's ${direction} date control, but the displayed date ${displayedDateLabel || "could not be read"} did not verify as ${expectedStepDate}. No write was attempted.`,
+        };
+      }
+      const contentTransitionVerified = await waitForDiaryRowMutation(page, mutationWatchId, 4000);
+      if (!contentTransitionVerified) {
+        return {
+          ...base,
+          selected: false,
+          strategy: "not_verified",
+          steps: index + 1,
+          displayedDateLabel,
+          previousDiaryFingerprint,
+          contentTransitionRequired: true,
+          contentTransitionVerified: false,
+          warning: `Cronometer changed the diary date label to ${displayedDateLabel}, but no diary-row refresh was observed. No write was attempted.`,
         };
       }
     }
@@ -3121,11 +3562,17 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       strategy: selected ? "arrow" : "not_verified",
       steps: Math.abs(days),
       displayedDateLabel,
+      previousDiaryFingerprint,
+      contentTransitionRequired: true,
+      contentTransitionVerified: selected,
       warning: selected ? undefined : `Cronometer date navigation finished, but ${displayedDateLabel || "the missing date label"} did not verify as ${parsed.date}. No write was attempted.`,
     };
   }
 
   private async openApp(page: Page, hash = "") {
+    // Defend against modal state left by an older server version or an
+    // interrupted reused-context operation before navigating the app shell.
+    await closeFoodDialog(page, Math.min(this.config.navigationTimeoutMs, 10000)).catch(() => undefined);
     const targetUrl = `${CRONOMETER_ORIGIN}/${hash}`;
     await gotoAllowingAbort(page, targetUrl, this.config.navigationTimeoutMs);
     await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
@@ -3397,14 +3844,14 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     const canonicalPayload = stableJson(safety?.semanticPayload ?? input);
     const semanticKey = backgroundBrowserJobKey(feature, safety?.semanticPayload ?? input);
     const expectedCount = safety?.expectedExistingMatchCount;
-    const conflictingSemanticOperation = Array.from(this.persistedOperations.values()).find((operation) =>
-      operation.feature === feature
-      && operation.semanticKey === semanticKey
-      && ["running", "indeterminate", "completed"].includes(operation.status)
-      && operation.result?.status !== "written"
-      && operation.result?.status !== "already_exists"
-      && !persistedOperationDefinitelyDidNotWrite(operation),
-    );
+    const conflictingSemanticOperation = Array.from(this.persistedOperations.values())
+      .filter((operation) =>
+        operation.feature === feature
+        && operation.semanticKey === semanticKey
+        && ["running", "indeterminate", "completed", "failed"].includes(operation.status)
+        && !persistedOperationEffectIsResolved(operation),
+      )
+      .sort(comparePersistedOperationsNewestFirst)[0];
     if (conflictingSemanticOperation && expectedCount === undefined) {
       return this.result(feature, "possibly_written_verify_failed", {
         operationId: conflictingSemanticOperation.id,
@@ -3426,7 +3873,9 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
     const existingId = backgroundBrowserJobKeys.get(key);
     const existing = existingId ? backgroundBrowserJobs.get(existingId) : undefined;
-    const persistedExisting = Array.from(this.persistedOperations.values()).find((operation) => operation.key === key);
+    const persistedExisting = Array.from(this.persistedOperations.values())
+      .filter((operation) => operation.key === key)
+      .sort(comparePersistedOperationsNewestFirst)[0];
     const persistedExistingDidNotWrite = persistedOperationDefinitelyDidNotWrite(persistedExisting);
     if (persistedExisting && !persistedExistingDidNotWrite && persistedExisting.canonicalPayload && persistedExisting.canonicalPayload !== canonicalPayload) {
       return this.result(feature, "needs_manual_step", {
@@ -3436,7 +3885,17 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         nextAction: "use_new_idempotency_key",
       }, "This idempotency key is already bound to a different canonical payload. Use a new key after reviewing the previous operation.");
     }
-    if (!existing && persistedExisting?.status === "indeterminate") {
+    if (
+      !existing
+      && persistedExisting?.status === "indeterminate"
+      && persistedExisting.legacyVerifierQuarantined
+      && expectedCount !== undefined
+    ) {
+      // A caller that first observed the exact current row count can safely
+      // supersede a quarantined optimistic-era record. logFoodOnPage rechecks
+      // this count against its fresh round-trip baseline before committing.
+      this.persistedOperations.delete(persistedExisting.id);
+    } else if (!existing && persistedExisting?.status === "indeterminate") {
       return this.result(feature, "possibly_written_verify_failed", {
         operationId: persistedExisting.id,
         state: "indeterminate",
@@ -3444,6 +3903,31 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         nextAction: "inspect_diary",
         operation: persistedExisting,
       }, "A previous process started this same operation but restarted before recording a terminal result. Inspect the diary; the operation will not be replayed automatically.");
+    }
+    if (!existing && persistedExisting?.status === "failed" && !persistedExistingDidNotWrite) {
+      return this.result(feature, "possibly_written_verify_failed", {
+        operationId: persistedExisting.id,
+        state: "indeterminate",
+        retryable: false,
+        nextAction: "inspect_diary",
+        operation: persistedExisting,
+      }, "A previous process recorded this same operation as failed without durable proof that no write occurred. Inspect the diary; the operation will not be replayed automatically.");
+    }
+    if (
+      !existing
+      && feature === "delete_diary_food_entry"
+      && !safety?.callerIdempotencyKey
+      && persistedExisting
+      && !persistedExistingDidNotWrite
+      && persistedOperationIsVerifiedSuccess(persistedExisting)
+    ) {
+      return this.result(feature, "needs_manual_step", {
+        operationId: persistedExisting.id,
+        returnedFromJournal: false,
+        browserOpened: false,
+        writeAttempted: false,
+        nextAction: "use_new_idempotency_key",
+      }, "A verified earlier delete has the same legacy derived key. CronoGPT will not replay that old success as current diary evidence. Inspect the diary and use a new idempotencyKey for a new user-approved delete intent.");
     }
     if (!existing && !persistedExistingDidNotWrite && persistedExisting?.status === "completed" && persistedExisting.result && persistedExisting.result.status !== "busy") {
       return this.result(feature, persistedExisting.result.status, {
@@ -3454,6 +3938,22 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     }
     if (existing?.status === "running") {
       return this.backgroundBrowserJobAcceptedResult(feature, existing, true);
+    }
+    if (
+      existing?.status === "completed"
+      && feature === "delete_diary_food_entry"
+      && !safety?.callerIdempotencyKey
+      && !providerResultDefinitelyDidNotWrite(existing.result)
+      && persistedOperationIsVerifiedSuccess(existing)
+    ) {
+      return this.result(feature, "needs_manual_step", {
+        operationId: existing.id,
+        backgroundJob: summarizeBackgroundBrowserJob(existing, Date.now()),
+        returnedFromBackgroundJob: false,
+        browserOpened: false,
+        writeAttempted: false,
+        nextAction: "use_new_idempotency_key",
+      }, "A verified earlier delete has the same legacy derived key. CronoGPT will not replay that old success as current diary evidence. Inspect the diary and use a new idempotencyKey for a new user-approved delete intent.");
     }
     const existingDidNotWrite = existing?.status === "completed" && providerResultDefinitelyDidNotWrite(existing.result);
     if (existing?.status === "completed" && !existingDidNotWrite && existing.result && existing.result.status !== "busy") {
@@ -3490,6 +3990,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       canonicalPayload,
       callerIdempotencyKey: safety?.callerIdempotencyKey,
       semanticKey,
+      effectVerifierVersion: FOOD_LOG_EFFECT_VERIFIER_VERSION,
     };
     if (!this.persistOperationJournal({ ...job })) {
       return this.result(feature, "error", {
@@ -3581,11 +4082,17 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         }, job.result.warning, job.result.source);
       }
       if (job.status === "failed") {
-        return this.result(feature, "error", {
+        const definitelyDidNotWrite = providerResultDefinitelyDidNotWrite(job.result);
+        return this.result(feature, definitelyDidNotWrite ? "error" : "possibly_written_verify_failed", {
           backgroundJob: summarizeBackgroundBrowserJob(job, Date.now()),
           returnedFromBackgroundJob: true,
           waitedForCompletionMs: Date.now() - startedAt,
-        }, job.error ?? "Background Cronometer browser job failed.", "browser");
+          state: definitelyDidNotWrite ? "failed" : "indeterminate",
+          retryable: false,
+          nextAction: definitelyDidNotWrite ? "manual_resolution" : "inspect_diary",
+        }, job.error ?? (definitelyDidNotWrite
+          ? "Background Cronometer browser job failed before any write attempt."
+          : "Background Cronometer browser job failed without proving whether a write occurred. Inspect the diary before retrying."), "browser");
       }
       await delay(500);
     }
@@ -3616,12 +4123,16 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
     const operationTimeoutMs = this.featureOperationTimeoutMs(feature);
     const queueWaitMs = this.featureQueueWaitTimeoutMs(feature);
+    // Queueing, browser acquisition, retries, the UI transaction, and
+    // persisted verification all consume one admitted-operation deadline.
+    // This keeps graceful shutdown long enough even when a writer was queued.
+    const operationDeadline = Date.now() + operationTimeoutMs;
 
     return enqueueBrowserJob(
-      () => this.withPageAttemptWithRetry(feature, handler),
+      () => this.withPageAttemptWithRetry(feature, handler, operationDeadline, operationTimeoutMs),
       {
         feature,
-        maxQueueWaitMs: queueWaitMs,
+        maxQueueWaitMs: Math.min(queueWaitMs, operationTimeoutMs),
         staleJobMs: operationTimeoutMs + 30000,
       },
     ).catch((error) => {
@@ -3643,25 +4154,45 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     });
   }
 
-  private async withPageAttemptWithRetry(feature: string, handler: (page: Page) => Promise<ProviderResult>): Promise<ProviderResult> {
+  private async withPageAttemptWithRetry(
+    feature: string,
+    handler: (page: Page) => Promise<ProviderResult>,
+    operationDeadline = Date.now() + this.featureOperationTimeoutMs(feature),
+    totalTimeoutMs = this.featureOperationTimeoutMs(feature),
+  ): Promise<ProviderResult> {
     const attempts = this.isShortBrowserProbe(feature)
       ? 1
       : Math.max(1, Math.min(this.config.browserRetryCount + 1, 3));
     let lastResult: ProviderResult | undefined;
 
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
-      const result = await this.withPageAttempt(feature, handler, attempt);
+      const remainingMs = operationDeadline - Date.now();
+      if (remainingMs <= 0) break;
+      const result = await this.withPageAttempt(feature, handler, attempt, remainingMs, totalTimeoutMs);
       lastResult = result;
       if (result.status !== "error" || attempt >= attempts || !isTransientAutomationError(result.warning ?? "")) {
         return result;
       }
-      await delay(350 * attempt);
+      const retryDelayMs = Math.min(350 * attempt, Math.max(0, operationDeadline - Date.now()));
+      if (retryDelayMs > 0) await delay(retryDelayMs);
     }
 
-    return lastResult ?? this.result(feature, "error", undefined, "Browser automation failed before producing a result.", "browser");
+    return lastResult ?? this.result(
+      feature,
+      "error",
+      { operationTimeoutMs: totalTimeoutMs },
+      `Browser automation exhausted its shared ${totalTimeoutMs}ms operation deadline before producing a result.`,
+      "browser",
+    );
   }
 
-  private async withPageAttempt(feature: string, handler: (page: Page) => Promise<ProviderResult>, attempt: number): Promise<ProviderResult> {
+  private async withPageAttempt(
+    feature: string,
+    handler: (page: Page) => Promise<ProviderResult>,
+    attempt: number,
+    attemptBudgetMs = this.featureOperationTimeoutMs(feature),
+    totalTimeoutMs = attemptBudgetMs,
+  ): Promise<ProviderResult> {
     let session: BrowserSession | undefined;
     try {
       const loginBackoff = this.currentLoginBackoff();
@@ -3669,7 +4200,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         const waitSeconds = Math.ceil((loginBackoff.until - Date.now()) / 1000);
         return this.loginPausedResult(feature, waitSeconds, loginBackoff.reason, { attempt });
       }
-      const operationTimeoutMs = this.featureOperationTimeoutMs(feature);
+      const operationDeadline = Date.now() + attemptBudgetMs;
       let newSessionTimedOut = false;
       const newSessionPromise = this.newSession().then((openedSession) => {
         if (newSessionTimedOut) void closeBrowserSession(openedSession);
@@ -3677,19 +4208,39 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       });
       session = await withTimeoutCleanup(
         newSessionPromise,
-        operationTimeoutMs,
-        `Timed out opening Cronometer browser session after ${operationTimeoutMs}ms.`,
+        attemptBudgetMs,
+        `Timed out opening Cronometer browser session within the shared ${totalTimeoutMs}ms browser-operation deadline.`,
         () => {
           newSessionTimedOut = true;
         },
       );
+      // A cached page can survive many serialized operations. The possible-
+      // write marker is attempt-local evidence, never permanent page state.
+      resetPageWriteAttemptMarker(session.page);
+      const handlerTimeoutMs = Math.max(1, operationDeadline - Date.now());
       const result = await withTimeoutCleanup(
         handler(session.page),
-        operationTimeoutMs,
-        `Timed out running ${feature} after ${operationTimeoutMs}ms.`,
+        handlerTimeoutMs,
+        `Timed out running ${feature} within the shared ${totalTimeoutMs}ms browser-operation deadline.`,
         () => closeBrowserSession(session),
       );
       cachedStorageState = await session.context.storageState().catch(() => cachedStorageState);
+      // Search and editor tools deliberately leave Cronometer inside a modal
+      // while they work. A reused browser must never leak that modal into the
+      // next operation, where it can obscure the diary and its selected date.
+      // Escape is the bounded normal path after the handler's shared
+      // deadline. If it fails, retire a reusable local session instead of
+      // extending the operation with another navigation.
+      if (session.closeContext === false) {
+        const neutralFoodUi = await closeFoodDialog(
+          session.page,
+          Math.min(this.config.navigationTimeoutMs, 10000),
+          false,
+        ).catch(() => ({ closed: false, strategy: "error" as const }));
+        if (!neutralFoodUi.closed && !this.config.remoteWsEndpoint && this.config.reuseLocalBrowser) {
+          await this.closeCachedLocalSession();
+        }
+      }
       return result;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown browser automation error";
@@ -4156,6 +4707,17 @@ function markPageWriteAttempted(page: Page) {
   pagesWithPossibleWrites.add(page);
 }
 
+function resetPageWriteAttemptMarker(page: Page) {
+  pagesWithPossibleWrites.delete(page);
+}
+
+export function __exercisePageWriteAttemptMarkerForTests(page: Page) {
+  markPageWriteAttempted(page);
+  const marked = pagesWithPossibleWrites.has(page);
+  resetPageWriteAttemptMarker(page);
+  return { marked, cleared: !pagesWithPossibleWrites.has(page) };
+}
+
 function deleteDialogHasDependencyWarning(text: string) {
   const normalized = text.replace(/\s+/g, " ").trim();
   if (!normalized) return false;
@@ -4428,6 +4990,41 @@ function acquireOperationJournalLock(filePath?: string) {
   }
 }
 
+function recoverPersistedBrowserOperation(operation: PersistedBackgroundBrowserJob): PersistedBackgroundBrowserJob {
+  if (operation.status === "running") {
+    return {
+      ...operation,
+      status: "indeterminate",
+      error: "The process restarted before this operation reached a terminal state.",
+    };
+  }
+
+  const foodEffectFeatures = new Set([
+    "log_food",
+    "log_foods",
+    "log_food_plan",
+    "create_and_log_custom_food",
+  ]);
+  const legacyVerifier = !Number.isInteger(operation.effectVerifierVersion)
+    || (operation.effectVerifierVersion ?? 0) < FOOD_LOG_EFFECT_VERIFIER_VERSION;
+  if (
+    operation.status === "completed"
+    && operation.result?.status === "written"
+    && foodEffectFeatures.has(operation.feature)
+    && legacyVerifier
+  ) {
+    return {
+      ...operation,
+      status: "indeterminate",
+      result: undefined,
+      legacyVerifierQuarantined: true,
+      error: "This food-write result predates the persisted exact-date/meal/amount verifier and was quarantined instead of being replayed as a success. Inspect the diary before retrying.",
+    };
+  }
+
+  return operation;
+}
+
 function readOperationJournal(filePath?: string): { operations: PersistedBackgroundBrowserJob[]; health: OperationJournalHealth } {
   if (!filePath) return { operations: [], health: { configured: false, readable: true, writable: false, durableAdmission: false, reason: "No operation journal file is configured." } };
   if (!existsSync(filePath)) return { operations: [], health: { configured: true, readable: true, writable: true, durableAdmission: true } };
@@ -4454,10 +5051,25 @@ function writeOperationJournal(filePath: string | undefined, operations: Persist
   if (!filePath) return { ok: false, health: { configured: false, readable: true, writable: false, durableAdmission: false, reason: "No operation journal file is configured." } satisfies OperationJournalHealth };
   const maxAgeMs = 24 * 60 * 60 * 1000;
   const now = Date.now();
-  const retained = operations
-    .filter((operation) => operation.status === "running" || operation.status === "indeterminate" || now - operation.updatedAt <= maxAgeMs)
-    .sort((left, right) => right.updatedAt - left.updatedAt || compareStringsOrdinal(left.id, right.id))
+  // Never age or cap away an unresolved side effect or a verified idempotent
+  // success. A large experiment history may bound known-safe no-write
+  // diagnostics, but old crash/indeterminate and success records must continue
+  // blocking blind replay.
+  const durableSafetyRecords = operations
+    .filter((operation) =>
+      !persistedOperationEffectIsResolved(operation)
+      || persistedOperationIsVerifiedSuccess(operation),
+    )
+    .sort(comparePersistedOperationsNewestFirst);
+  const terminalHistory = operations
+    .filter((operation) =>
+      persistedOperationEffectIsResolved(operation)
+      && !persistedOperationIsVerifiedSuccess(operation)
+      && now - operation.updatedAt <= maxAgeMs,
+    )
+    .sort(comparePersistedOperationsNewestFirst)
     .slice(0, 100);
+  const retained = [...durableSafetyRecords, ...terminalHistory].sort(comparePersistedOperationsNewestFirst);
   const temporaryPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   try {
     writeFileSync(temporaryPath, JSON.stringify({ version: 2, operations: retained }, null, 2), { mode: 0o600, flag: "wx" });
@@ -4487,6 +5099,17 @@ function canonicalFoodLogPayload(normalized: NormalizedFoodLog) {
     unit: normalized.unit,
     portion: normalized.portion,
     timestamp: normalized.timestamp,
+  };
+}
+
+function canonicalDiaryFoodDeletePayload(target: NormalizedDiaryFoodDelete) {
+  return {
+    date: target.date,
+    meal: target.meal,
+    name: target.name.normalize("NFKC").toLowerCase().replace(/[,()[\]{}%]/g, " ").replace(/\s+/g, " ").trim(),
+    amount: target.amount,
+    unit: target.unit,
+    deleteCount: target.deleteCount,
   };
 }
 
@@ -4571,7 +5194,32 @@ export function providerResultDefinitelyDidNotWrite(result: ProviderResult | und
 }
 
 function persistedOperationDefinitelyDidNotWrite(operation: PersistedBackgroundBrowserJob | undefined) {
-  return operation?.status === "completed" && providerResultDefinitelyDidNotWrite(operation.result);
+  return Boolean(
+    operation
+    && ["completed", "failed"].includes(operation.status)
+    && providerResultDefinitelyDidNotWrite(operation.result),
+  );
+}
+
+function persistedOperationEffectIsResolved(operation: PersistedBackgroundBrowserJob) {
+  if (persistedOperationDefinitelyDidNotWrite(operation)) return true;
+  return persistedOperationIsVerifiedSuccess(operation);
+}
+
+function persistedOperationIsVerifiedSuccess(operation: PersistedBackgroundBrowserJob) {
+  if (operation.status !== "completed" || !operation.result) return false;
+  return ["written", "already_exists", "ok"].includes(operation.result.status)
+    && Number.isInteger(operation.effectVerifierVersion)
+    && (operation.effectVerifierVersion ?? 0) >= FOOD_LOG_EFFECT_VERIFIER_VERSION;
+}
+
+function comparePersistedOperationsNewestFirst(
+  left: PersistedBackgroundBrowserJob,
+  right: PersistedBackgroundBrowserJob,
+) {
+  return right.updatedAt - left.updatedAt
+    || right.startedAt - left.startedAt
+    || compareStringsOrdinal(right.id, left.id);
 }
 
 function compactBackgroundResultData(data: Record<string, unknown>) {
@@ -4865,6 +5513,34 @@ function diaryDeleteTargetAsFoodLog(target: NormalizedDiaryFoodDelete): Normaliz
   };
 }
 
+function verifyDiaryFoodDeletionEffect(
+  beforeEntries: DiaryFoodEntry[],
+  afterEntries: DiaryFoodEntry[],
+  target: NormalizedFoodLog,
+) {
+  const beforeMatches = matchFoodLogInDiaryEntries(beforeEntries, target).matches;
+  const afterMatches = matchFoodLogInDiaryEntries(afterEntries, target).matches;
+  const targetCountDelta = foodLogCountDelta(beforeMatches.length, afterMatches.length, -1);
+  const totalCountDelta = foodLogCountDelta(beforeEntries.length, afterEntries.length, -1);
+  return {
+    verified: targetCountDelta.verified && totalCountDelta.verified,
+    beforeMatches,
+    afterMatches,
+    targetCountDelta,
+    totalCountDelta,
+  };
+}
+
+export function __verifyDiaryFoodDeletionEffectForTests(
+  beforeEntries: DiaryFoodEntry[],
+  afterEntries: DiaryFoodEntry[],
+  input: DiaryFoodDeleteInput,
+  timeZone = "UTC",
+) {
+  const target = normalizeDiaryFoodDeleteInput(input, timeZone);
+  return verifyDiaryFoodDeletionEffect(beforeEntries, afterEntries, diaryDeleteTargetAsFoodLog(target));
+}
+
 function findDiaryFoodEntryMatches(text: string, target: NormalizedDiaryFoodDelete): DiaryFoodEntryMatch[] {
   const sectionText = diaryMealSectionText(text, target.meal);
   if (!sectionText) return [];
@@ -4902,43 +5578,263 @@ function diaryMealSectionText(text: string, meal: string) {
   return lines.slice(start, end).join("\n");
 }
 
-async function clickDiaryFoodEntryRow(page: Page, target: NormalizedDiaryFoodDelete, match: DiaryFoodEntryMatch) {
-  const normalizedTargetName = normalizeFoodName(target.name);
-  const rows = page.locator("tr:visible,[role='row']:visible");
-  const count = await rows.count().catch(() => 0);
-  for (let index = 0; index < count; index += 1) {
-    const row = rows.nth(index);
-    const rowText = await row.innerText().catch(() => "");
-    if (!rowText || !rowText.includes(target.name)) continue;
-    if (!findDiaryFoodEntryMatches(`${target.meal}\n${rowText}`, target).length) continue;
-    await row.scrollIntoViewIfNeeded().catch(() => undefined);
-    const box = await row.boundingBox().catch(() => undefined);
-    if (box) {
-      await page.mouse.click(box.x + Math.min(30, Math.max(8, box.width / 2)), box.y + box.height / 2);
-    } else {
-      await row.click().catch(async () => row.click({ force: true }));
+async function inspectDiaryEntrySelections(page: Page) {
+  return page.evaluate(() => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
+    const visible = (element: Element) => {
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
+    const dialogSelector = ".pretty-dialog,[role='dialog'],.gwt-DialogBox,.popupContent";
+    const diaryTables = Array.from(document.querySelectorAll("table"))
+      .filter((table) => table.querySelector(".diary-group-title") && visible(table) && !table.closest(dialogSelector));
+    const diaryTableSet = new Set(diaryTables);
+    const selectedControls = diaryTables.flatMap((table) => Array.from(table.querySelectorAll(
+      "input[type='checkbox']:checked,[role='checkbox'][aria-checked='true']",
+    ))).filter((control) => {
+      const row = control.closest("tr");
+      return !control.closest(dialogSelector) && Boolean(row ? visible(row) : visible(control));
+    });
+    const selectedRows = Array.from(document.querySelectorAll(
+      "tr[aria-selected='true'],tr.selected,tr.is-selected,tr.gwt-TableRow-selected",
+    )).filter((row) => {
+      const table = row.closest("table");
+      return Boolean(table && diaryTableSet.has(table) && visible(row) && !row.closest(dialogSelector));
+    });
+    const selectedEntries = new Set<Element>();
+    for (const control of selectedControls) selectedEntries.add(control.closest("tr") ?? control);
+    for (const row of selectedRows) selectedEntries.add(row);
+    return {
+      checkedControlCount: selectedControls.length,
+      selectedRowIndicatorCount: selectedRows.length,
+      selectedEntryCount: selectedEntries.size,
+      samples: Array.from(selectedEntries).slice(0, 5).map((entry) => compactSelectionText(normalize(entry.textContent))),
+    };
+
+    function compactSelectionText(value: string) {
+      return value.length > 240 ? `${value.slice(0, 237)}...` : value;
     }
-    await page.waitForTimeout(500);
-    return { clicked: true as const, strategy: "row" as const, rowText: compactText(rowText, 500) };
+  });
+}
+
+async function clearDiaryEntrySelections(page: Page) {
+  const before = await inspectDiaryEntrySelections(page);
+  await page.keyboard.press("Escape").catch(() => undefined);
+  await page.waitForTimeout(150);
+  const afterEscape = await inspectDiaryEntrySelections(page);
+  let checkedControlClicks = 0;
+
+  // Only checkbox-like controls are safe to toggle automatically. A selected
+  // row without one is reported and blocks the delete instead of guessing that
+  // clicking it again will deselect rather than open an editor.
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const controls = page.locator([
+      "table:has(.diary-group-title) input[type='checkbox']:checked",
+      "table:has(.diary-group-title) [role='checkbox'][aria-checked='true']",
+    ].join(","));
+    const count = await controls.count().catch(() => 0);
+    let clicked = false;
+    for (let index = 0; index < count; index += 1) {
+      const control = controls.nth(index);
+      const belongsToVisibleDiary = await control.evaluate((element) => {
+        const dialog = element.closest(".pretty-dialog,[role='dialog'],.gwt-DialogBox,.popupContent");
+        const table = element.closest("table");
+        const row = element.closest("tr");
+        if (dialog || !table?.querySelector(".diary-group-title")) return false;
+        const subject = row ?? element;
+        const style = window.getComputedStyle(subject);
+        const rect = subject.getBoundingClientRect();
+        return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+      }).catch(() => false);
+      if (!belongsToVisibleDiary) continue;
+      clicked = await control.click({ force: true }).then(() => true).catch(async () =>
+        control.evaluate((element) => {
+          if (!(element instanceof HTMLElement)) return false;
+          element.click();
+          return true;
+        }).catch(() => false));
+      if (clicked) {
+        checkedControlClicks += 1;
+        await page.waitForTimeout(150);
+        break;
+      }
+    }
+    if (!clicked) break;
   }
 
-  const exactFood = page.getByText(target.name, { exact: true });
-  const exactCount = await exactFood.count().catch(() => 0);
-  if (exactCount === 1 || (exactCount > 0 && normalizeFoodName(match.entryText).includes(normalizedTargetName))) {
-    const first = exactFood.first();
-    if (await first.isVisible().catch(() => false)) {
-      await first.click().catch(async () => first.click({ force: true }));
-      await page.waitForTimeout(500);
-      return { clicked: true as const, strategy: "exact-text" as const, rowText: compactText(match.entryText, 500) };
+  const after = await inspectDiaryEntrySelections(page);
+  return {
+    cleared: after.selectedEntryCount === 0,
+    before,
+    afterEscape,
+    after,
+    checkedControlClicks,
+  };
+}
+
+export async function __clearDiaryEntrySelectionsForTests(page: Page) {
+  return clearDiaryEntrySelections(page);
+}
+
+async function clickDiaryFoodEntryRow(page: Page, target: NormalizedDiaryFoodDelete) {
+  const rows = page.locator("tr");
+  const scopedRowIndices = await rows.evaluateAll((elements, requestedMeal) => {
+    const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+    const knownMeals = new Set(["breakfast", "lunch", "dinner", "snacks", "supplements"]);
+    const visible = (element: Element) => {
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
+    let currentTable: Element | null = null;
+    let currentMeal = "";
+    const indices: number[] = [];
+    elements.forEach((row, index) => {
+      const table = row.closest("table");
+      if (table !== currentTable) {
+        currentTable = table;
+        currentMeal = "";
+      }
+      if (!visible(row) || row.closest(".pretty-dialog,[role='dialog'],.gwt-DialogBox,.popupContent")) return;
+      const title = normalize(row.querySelector(".diary-group-title")?.textContent);
+      if (title) {
+        currentMeal = knownMeals.has(title) ? title : "";
+        return;
+      }
+      if (currentMeal === normalize(requestedMeal)) indices.push(index);
+    });
+    return indices;
+  }, target.meal).catch(() => [] as number[]);
+
+  for (const index of scopedRowIndices) {
+    const row = rows.nth(index);
+    const rowText = await row.innerText().catch(() => "");
+    if (!rowText || !normalizeFoodName(rowText).includes(normalizeFoodName(target.name))) continue;
+    if (!findDiaryFoodEntryMatches(`${target.meal}\n${rowText}`, target).length) continue;
+    await row.scrollIntoViewIfNeeded().catch(() => undefined);
+    // Click the uniquely identified food-name cell, not a fixed offset into
+    // the row. Cronometer's leading cells can be timestamp/amount editors; a
+    // click there may look successful to Playwright without selecting the
+    // diary entry in GWT's internal selection model.
+    const cells = row.locator("td,[role='gridcell'],[role='cell']");
+    const exactNameCellIndices = await cells.evaluateAll((elements, requestedName) => {
+      const normalize = (value: string | null | undefined) => (value ?? "")
+        .replace(/\u00a0/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+      const expected = normalize(requestedName);
+      return elements.flatMap((element, cellIndex) => normalize(element.textContent) === expected ? [cellIndex] : []);
+    }, target.name).catch(() => [] as number[]);
+    if (exactNameCellIndices.length !== 1) {
+      return {
+        clicked: false as const,
+        targetCorrelated: false as const,
+        warning: exactNameCellIndices.length > 1
+          ? "The matching diary row exposed more than one exact food-name cell. Refused to guess which cell selects the entry."
+          : "The matching diary row did not expose one exact food-name cell. Refused to click an editable amount or timestamp cell.",
+        rowText: compactText(rowText, 500),
+      };
     }
+    const nameCell = cells.nth(exactNameCellIndices[0]);
+    const clicked = await nameCell.click().then(() => true).catch(async () =>
+      nameCell.click({ force: true }).then(() => true).catch(() => false));
+    if (!clicked) {
+      return {
+        clicked: false as const,
+        targetCorrelated: false as const,
+        warning: "Could not click the uniquely matched diary food-name cell.",
+        rowText: compactText(rowText, 500),
+      };
+    }
+    await page.waitForTimeout(500);
+    return {
+      clicked: true as const,
+      targetCorrelated: true as const,
+      strategy: "exact-food-name-cell" as const,
+      rowText: compactText(rowText, 500),
+      clickedCellText: target.name,
+    };
   }
 
   return {
     clicked: false as const,
-    warning: exactCount > 1
-      ? "Multiple visible rows share that food name; refused to use a broad text click."
-      : "Could not find a visible matching diary row.",
+    warning: "Could not prove a matching row inside the requested diary meal section. Refused to use a global food-name click.",
   };
+}
+
+export async function __clickDiaryFoodEntryRowForTests(
+  page: Page,
+  input: DiaryFoodDeleteInput,
+  timeZone = "UTC",
+) {
+  return clickDiaryFoodEntryRow(page, normalizeDiaryFoodDeleteInput(input, timeZone));
+}
+
+/**
+ * Prove selection without depending on Cronometer's obfuscated GWT row class.
+ *
+ * The Delete key is a safe probe: Cronometer does not mutate the diary until
+ * the subsequent confirmation is accepted. An exact confirmation appearing
+ * after a fresh-document, exact-target click is stronger evidence than a CSS
+ * class name and remains fail-closed when the click did not select an entry.
+ */
+async function proveTargetedDiaryEntrySelection(
+  page: Page,
+  dateStatus: DiaryDateStatus,
+  click: { clicked: boolean; targetCorrelated?: boolean; strategy?: string },
+): Promise<{
+  verified: boolean;
+  strategy: "structural-indicator-and-confirmation" | "fresh-targeted-click-and-confirmation" | "not_verified";
+  selectedAfterClick: Awaited<ReturnType<typeof inspectDiaryEntrySelections>>;
+  deleteTrigger?: Awaited<ReturnType<typeof triggerSelectedDiaryEntryDelete>>;
+  warning?: string;
+}> {
+  const selectedAfterClick = await inspectDiaryEntrySelections(page);
+  if (!dateStatus.freshDocumentReloadVerified || !dateStatus.roundTripVerified || !click.clicked || !click.targetCorrelated) {
+    return {
+      verified: false,
+      strategy: "not_verified",
+      selectedAfterClick,
+      warning: "The delete selection was not rooted in a fresh, exact-date diary document and one exact food-name-cell click. No delete command was sent.",
+    };
+  }
+  if (selectedAfterClick.selectedEntryCount > 1) {
+    return {
+      verified: false,
+      strategy: "not_verified",
+      selectedAfterClick,
+      warning: "Selecting the target exposed more than one selected diary row. No delete command was sent.",
+    };
+  }
+
+  const deleteTrigger = await triggerSelectedDiaryEntryDelete(page);
+  if (!deleteTrigger.triggered) {
+    return {
+      verified: false,
+      strategy: "not_verified",
+      selectedAfterClick,
+      deleteTrigger,
+      warning: "The exact target-row click did not open Cronometer's selected-entry delete confirmation. No delete was confirmed.",
+    };
+  }
+  return {
+    verified: true,
+    strategy: selectedAfterClick.selectedEntryCount === 1
+      ? "structural-indicator-and-confirmation"
+      : "fresh-targeted-click-and-confirmation",
+    selectedAfterClick,
+    deleteTrigger,
+  };
+}
+
+export async function __proveTargetedDiaryEntrySelectionForTests(
+  page: Page,
+  dateStatus: DiaryDateStatus,
+  click: { clicked: boolean; targetCorrelated?: boolean; strategy?: string },
+) {
+  return proveTargetedDiaryEntrySelection(page, dateStatus, click);
 }
 
 async function confirmSelectedDiaryEntryDelete(page: Page) {
@@ -4969,49 +5865,27 @@ async function confirmSelectedDiaryEntryDelete(page: Page) {
 }
 
 async function triggerSelectedDiaryEntryDelete(page: Page) {
-  const attempts = [];
-  for (const key of ["Delete", "Backspace"]) {
-    await page.keyboard.press(key).catch(() => undefined);
-    await page.waitForTimeout(600);
-    if (await deleteConfirmationVisible(page)) {
-      return { triggered: true as const, strategy: `keyboard:${key}`, attempts };
-    }
-    attempts.push(`keyboard:${key}`);
+  // Cronometer documents Delete as the web diary's selected-entry action.
+  // Backspace and broad visible "delete" fallbacks can target an inline editor
+  // or an unrelated menu, so determinism requires this single stable action.
+  const pressed = await page.keyboard.press("Delete").then(() => true).catch(() => false);
+  if (!pressed) {
+    return { triggered: false as const, attempts: ["keyboard:Delete"], warning: "Could not send the Delete key to the exact selected diary row." };
   }
-
-  const textClicked = await clickByText(page, /^(DELETE|Delete|delete|REMOVE|Remove|remove|delete_outline|delete_forever|trash)$/i);
-  if (textClicked) {
-    await page.waitForTimeout(700);
-    if (await deleteConfirmationVisible(page)) {
-      return { triggered: true as const, strategy: "visible-text", attempts };
-    }
-    attempts.push("visible-text");
+  await page.waitForTimeout(700);
+  if (await deleteConfirmationVisible(page)) {
+    return { triggered: true as const, strategy: "keyboard:Delete" as const, attempts: [] as string[] };
   }
-
-  const iconClicked = await clickFirstVisible(page.locator([
-    "[aria-label*='delete' i]:visible",
-    "[aria-label*='remove' i]:visible",
-    "[title*='delete' i]:visible",
-    "[title*='remove' i]:visible",
-    "button:visible:has-text('delete')",
-    "[role='button']:visible:has-text('delete')",
-    ".material-icons:visible:has-text('delete')",
-  ].join(",")));
-  if (iconClicked) {
-    await page.waitForTimeout(700);
-    if (await deleteConfirmationVisible(page)) {
-      return { triggered: true as const, strategy: "icon-selector", attempts };
-    }
-    attempts.push("icon-selector");
-  }
-
-  return { triggered: false as const, attempts, warning: "Could not trigger Cronometer's selected diary-entry delete confirmation." };
+  return {
+    triggered: false as const,
+    attempts: ["keyboard:Delete"],
+    warning: "Delete did not open Cronometer's exact selected-entry confirmation.",
+  };
 }
 
 async function deleteConfirmationVisible(page: Page) {
   const text = await page.locator("body").innerText({ timeout: 1200 }).catch(() => "");
-  return /Delete Items\?\s*Delete the selected entries\?/i.test(text) ||
-    /\bDelete\b[\s\S]{0,80}\bselected entr/i.test(text);
+  return /Delete Items\?\s*Delete the selected entries\?/i.test(text);
 }
 
 async function extractDiaryFoodEntries(page: Page): Promise<{ mealSections: string[]; entries: DiaryFoodEntry[] }> {
@@ -5030,9 +5904,23 @@ async function extractDiaryFoodEntries(page: Page): Promise<{ mealSections: stri
     const mealSections: string[] = [];
     const entries: DiaryFoodEntry[] = [];
     let currentMeal: string | undefined;
+    let currentTable: Element | null = null;
 
     for (const row of Array.from(document.querySelectorAll("tr"))) {
       if (!visible(row)) continue;
+      // Food-editor/search dialogs also contain tables and can temporarily
+      // mirror the requested amount/meal before the server has committed it.
+      // They are never diary evidence.
+      if (row.closest(".pretty-dialog,[role='dialog'],.gwt-DialogBox,.popupContent")) continue;
+      const table = row.closest("table");
+      if (table !== currentTable) {
+        currentTable = table;
+        currentMeal = undefined;
+      }
+      // Never carry a meal heading into a neighboring nutrition/search table.
+      // Only a table containing Cronometer's semantic diary group marker can
+      // contribute persisted diary rows.
+      if (!table || !table.querySelector(".diary-group-title")) continue;
       const title = normalize(row.querySelector(".diary-group-title")?.textContent);
       if (title) {
         currentMeal = mealSet.has(title.toLowerCase())
@@ -5061,6 +5949,226 @@ async function extractDiaryFoodEntries(page: Page): Promise<{ mealSections: stri
 
     return { mealSections, entries };
   }, [...FOOD_LOG_MEALS]);
+}
+
+async function waitForStableDiaryFoodEntries(
+  page: Page,
+  expectedDate: string,
+  currentDate: string,
+  timeoutMs: number,
+  stableForMs: number,
+) {
+  const deadline = Date.now() + timeoutMs;
+  let lastKey = "";
+  let stableSince = 0;
+  let identicalSamples = 0;
+  let displayedDateLabel = "";
+  let diary: Awaited<ReturnType<typeof extractDiaryFoodEntries>> = { mealSections: [], entries: [] };
+
+  while (Date.now() < deadline) {
+    displayedDateLabel = await readDiaryDateLabel(page);
+    diary = await extractDiaryFoodEntries(page).catch(() => ({ mealSections: [], entries: [] }));
+    const exactDate = diaryDateLabelMatches(displayedDateLabel, expectedDate, currentDate);
+    const completeStructure = FOOD_LOG_MEALS.every((meal) => diary.mealSections.includes(meal));
+    const key = JSON.stringify({ displayedDateLabel, mealSections: diary.mealSections, entries: diary.entries });
+
+    if (exactDate && completeStructure && key === lastKey) {
+      identicalSamples += 1;
+      if (stableSince > 0 && identicalSamples >= 3 && Date.now() - stableSince >= stableForMs) {
+        return {
+          stable: true as const,
+          expectedDate,
+          displayedDateLabel,
+          stableForMs: Date.now() - stableSince,
+          identicalSamples,
+          diary,
+        };
+      }
+    } else if (exactDate && completeStructure) {
+      lastKey = key;
+      stableSince = Date.now();
+      identicalSamples = 1;
+    } else {
+      lastKey = "";
+      stableSince = 0;
+      identicalSamples = 0;
+    }
+
+    await page.waitForTimeout(250);
+  }
+
+  return {
+    stable: false as const,
+    expectedDate,
+    displayedDateLabel,
+    stableForMs: stableSince > 0 ? Date.now() - stableSince : 0,
+    identicalSamples,
+    diary,
+    warning: diaryDateLabelMatches(displayedDateLabel, expectedDate, currentDate)
+      ? "The diary row structure did not remain identical long enough to prove a settled read."
+      : `The displayed diary date ${displayedDateLabel || "could not be read"} did not remain on ${expectedDate}.`,
+  };
+}
+
+interface PersistedFoodLogVerificationOptions {
+  page: Page;
+  editor: ReturnType<Page["locator"]>;
+  normalized: NormalizedFoodLog;
+  beforeMatchCount?: number;
+  timeZone: string;
+  navigationTimeoutMs: number;
+  selectDiaryDate: () => Promise<DiaryDateStatus>;
+  settleMs?: number;
+  postReloadMs?: number;
+  stableForMs?: number;
+  snapshotTimeoutMs?: number;
+}
+
+/**
+ * Commit and verify against a fresh server-backed diary document. Keeping the
+ * click/reload/count-delta transaction in one shared function lets the DOM
+ * regression exercise the exact production evidence path.
+ */
+async function commitAndVerifyPersistedFoodLog(options: PersistedFoodLogVerificationOptions) {
+  const {
+    page,
+    editor,
+    normalized,
+    beforeMatchCount,
+    timeZone,
+    navigationTimeoutMs,
+    selectDiaryDate,
+    settleMs = 4000,
+    postReloadMs = 1200,
+    stableForMs = 2500,
+    snapshotTimeoutMs = Math.min(navigationTimeoutMs, 15000),
+  } = options;
+
+  markPageWriteAttempted(page);
+  const saved = await commitFoodEditor(editor);
+  if (!saved) {
+    return {
+      saved: false as const,
+      persistedStructureVerified: false,
+      timestampPersistenceVerified: !normalized.timestamp,
+      countVerified: false,
+    };
+  }
+
+  // Cronometer may briefly render the editor's draft as an optimistic diary
+  // row. Only a full reload plus repeated, exact structured reads can turn a
+  // possible write into a reported success.
+  await page.waitForTimeout(settleMs);
+  let persistedDateStatus: DiaryDateStatus | undefined;
+  let persistedSnapshot: Awaited<ReturnType<typeof waitForStableDiaryFoodEntries>> | undefined;
+  let persistenceWarning: string | undefined;
+  try {
+    await page.reload({ waitUntil: "domcontentloaded", timeout: navigationTimeoutMs });
+    await page.waitForTimeout(postReloadMs);
+    persistedDateStatus = await selectDiaryDate();
+    if (persistedDateStatus.selected) {
+      persistedSnapshot = await waitForStableDiaryFoodEntries(
+        page,
+        normalized.date,
+        todayIso(timeZone),
+        snapshotTimeoutMs,
+        stableForMs,
+      );
+    } else {
+      persistenceWarning = persistedDateStatus.warning;
+    }
+  } catch (error) {
+    persistenceWarning = error instanceof Error ? error.message : "Cronometer failed during the persisted diary reload.";
+  }
+
+  const afterDiary = persistedSnapshot?.stable ? persistedSnapshot.diary : undefined;
+  const afterText = afterDiary ? JSON.stringify(afterDiary.entries) : "";
+  const afterMatch = afterDiary?.mealSections.length
+    ? matchFoodLogInDiaryEntries(afterDiary.entries, normalized)
+    : undefined;
+  const visibleText = afterText || await page.locator("body").innerText().catch(() => "");
+  const verification = afterMatch?.verification
+    ?? verifyFoodLogInDiaryText(visibleText, normalized);
+  const countDelta = beforeMatchCount !== undefined && afterMatch
+    ? foodLogCountDelta(beforeMatchCount, afterMatch.count)
+    : undefined;
+  const persistedStructureVerified = Boolean(
+    persistedDateStatus?.selected
+    && persistedSnapshot?.stable
+    && afterDiary
+    && FOOD_LOG_MEALS.every((meal) => afterDiary.mealSections.includes(meal)),
+  );
+  // The current diary rows do not expose time. Timestamped writes therefore
+  // receive real-key-event and delayed precommit protection, but cannot be
+  // reported as fully verified until Cronometer exposes server-backed time.
+  const timestampPersistenceVerified = !normalized.timestamp;
+  const countVerified = persistedStructureVerified
+    && countDelta?.verified === true
+    && timestampPersistenceVerified;
+
+  return {
+    saved: true as const,
+    persistedDateStatus,
+    persistedSnapshot,
+    persistenceWarning,
+    afterDiary,
+    afterMatch,
+    verification,
+    countDelta,
+    persistedStructureVerified,
+    timestampPersistenceVerified,
+    countVerified,
+  };
+}
+
+export async function __commitAndVerifyPersistedFoodLogForTests(
+  page: Page,
+  normalized: NormalizedFoodLog,
+  beforeMatchCount: number,
+  timeZone: string,
+  options: {
+    editorSelector?: string;
+    navigationTimeoutMs?: number;
+    settleMs?: number;
+    postReloadMs?: number;
+    stableForMs?: number;
+    snapshotTimeoutMs?: number;
+  } = {},
+) {
+  const currentDate = todayIso(timeZone);
+  return commitAndVerifyPersistedFoodLog({
+    page,
+    editor: page.locator(options.editorSelector ?? ".pretty-dialog,[role='dialog']").first(),
+    normalized,
+    beforeMatchCount,
+    timeZone,
+    navigationTimeoutMs: options.navigationTimeoutMs ?? 3000,
+    settleMs: options.settleMs ?? 50,
+    postReloadMs: options.postReloadMs ?? 50,
+    stableForMs: options.stableForMs ?? 300,
+    snapshotTimeoutMs: options.snapshotTimeoutMs ?? 2500,
+    selectDiaryDate: async () => {
+      const displayedDateLabel = await readDiaryDateLabel(page);
+      const selected = diaryDateLabelMatches(displayedDateLabel, normalized.date, currentDate);
+      return {
+        requestedDate: normalized.date,
+        normalizedDate: normalized.date,
+        currentDate,
+        appliedDate: normalized.date,
+        selected,
+        strategy: selected ? "today" : "not_verified",
+        displayedDateLabel,
+        warning: selected ? undefined : `Persisted fixture landed on ${displayedDateLabel || "an unreadable date"}, not ${normalized.date}.`,
+      };
+    },
+  });
+}
+
+function diaryEntriesFingerprint(diary: { mealSections: string[]; entries: DiaryFoodEntry[] }) {
+  return createHash("sha256")
+    .update(JSON.stringify({ mealSections: diary.mealSections, entries: diary.entries }))
+    .digest("hex")
+    .slice(0, 24);
 }
 
 async function extractDiarySectionEntries(page: Page, requestedTitles: string[]) {
@@ -5119,6 +6227,171 @@ async function clickDiaryDateArrow(page: Page, direction: "previous" | "next") {
   const arrow = page.locator(className).first();
   if (!(await arrow.isVisible().catch(() => false))) return false;
   return arrow.click().then(() => true).catch(() => false);
+}
+
+async function proveDiaryDateRoundTrip(
+  page: Page,
+  targetDate: string,
+  currentDate: string,
+  timeoutMs: number,
+) {
+  const initialLabel = await readDiaryDateLabel(page);
+  if (!diaryDateLabelMatches(initialLabel, targetDate, currentDate)) {
+    return {
+      verified: false as const,
+      displayedDateLabel: initialLabel,
+      warning: `The freshly loaded diary label was ${initialLabel || "not visible"}, not ${targetDate}. No write was attempted.`,
+    };
+  }
+
+  const adjacentDate = addDaysIso(targetDate, -1);
+  const stepTimeoutMs = Math.max(1200, Math.min(5000, timeoutMs));
+  const previousWatchId = await armDiaryRowMutationWatch(page);
+  if (!(await clickDiaryDateArrow(page, "previous"))) {
+    await clearDiaryRowMutationWatch(page, previousWatchId);
+    return {
+      verified: false as const,
+      displayedDateLabel: initialLabel,
+      warning: "Could not start the required diary date round trip. No write was attempted.",
+    };
+  }
+  const adjacentLabel = await waitForDiaryDateLabel(page, adjacentDate, currentDate, stepTimeoutMs);
+  if (!diaryDateLabelMatches(adjacentLabel, adjacentDate, currentDate)) {
+    await clearDiaryRowMutationWatch(page, previousWatchId);
+    return {
+      verified: false as const,
+      displayedDateLabel: adjacentLabel,
+      warning: `The write-safety round trip did not reach ${adjacentDate}. No write was attempted.`,
+    };
+  }
+  if (!(await waitForDiaryRowMutation(page, previousWatchId, stepTimeoutMs))) {
+    return {
+      verified: false as const,
+      displayedDateLabel: adjacentLabel,
+      warning: "Cronometer changed the date label during the write-safety round trip without an observable diary-table refresh. No write was attempted.",
+    };
+  }
+  const adjacentSnapshot = await waitForStableDiaryFoodEntries(
+    page,
+    adjacentDate,
+    currentDate,
+    Math.max(1500, Math.min(timeoutMs, 7000)),
+    500,
+  );
+  if (!adjacentSnapshot.stable) {
+    return {
+      verified: false as const,
+      displayedDateLabel: adjacentSnapshot.displayedDateLabel,
+      warning: "The adjacent diary day did not settle during the write-safety round trip. No write was attempted.",
+    };
+  }
+
+  const targetWatchId = await armDiaryRowMutationWatch(page);
+  if (!(await clickDiaryDateArrow(page, "next"))) {
+    await clearDiaryRowMutationWatch(page, targetWatchId);
+    return {
+      verified: false as const,
+      displayedDateLabel: adjacentLabel,
+      warning: "Could not return to the requested diary date during the write-safety round trip. No write was attempted.",
+    };
+  }
+  const targetLabel = await waitForDiaryDateLabel(page, targetDate, currentDate, stepTimeoutMs);
+  if (!diaryDateLabelMatches(targetLabel, targetDate, currentDate)) {
+    await clearDiaryRowMutationWatch(page, targetWatchId);
+    return {
+      verified: false as const,
+      displayedDateLabel: targetLabel,
+      warning: `The write-safety round trip returned to ${targetLabel || "an unreadable date"}, not ${targetDate}. No write was attempted.`,
+    };
+  }
+  if (!(await waitForDiaryRowMutation(page, targetWatchId, stepTimeoutMs))) {
+    return {
+      verified: false as const,
+      displayedDateLabel: targetLabel,
+      warning: "Cronometer returned the requested date label without proving that its diary rows and save target refreshed. No write was attempted.",
+    };
+  }
+  const targetSnapshot = await waitForStableDiaryFoodEntries(
+    page,
+    targetDate,
+    currentDate,
+    Math.max(1500, Math.min(timeoutMs, 7000)),
+    750,
+  );
+  if (!targetSnapshot.stable) {
+    return {
+      verified: false as const,
+      displayedDateLabel: targetSnapshot.displayedDateLabel,
+      warning: "The requested diary date did not settle after the write-safety round trip. No write was attempted.",
+    };
+  }
+
+  return {
+    verified: true as const,
+    displayedDateLabel: targetSnapshot.displayedDateLabel,
+    warning: undefined,
+  };
+}
+
+async function armDiaryRowMutationWatch(page: Page) {
+  return page.evaluate(() => {
+    const windowWithWatches = window as typeof window & {
+      __cronogptDiaryMutationWatches?: Record<string, { changed: boolean; observer: MutationObserver }>;
+    };
+    const watches = windowWithWatches.__cronogptDiaryMutationWatches ??= {};
+    const id = `diary-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const rowTouched = (node: Node | null) => {
+      const element = node instanceof Element ? node : node?.parentElement;
+      if (!element) return false;
+      const containingTable = element.closest("table");
+      if (containingTable?.querySelector(".diary-group-title")) return true;
+      // A whole diary table/container can be added or removed, in which case
+      // closest() may not reach the live document. Require the mutated subtree
+      // itself to contain Cronometer's diary section marker; unrelated visible
+      // tables must never satisfy this gate.
+      return Boolean(
+        element.matches("table,.diary-group-title") && (element.matches(".diary-group-title") || element.querySelector(".diary-group-title"))
+        || element.querySelector("table .diary-group-title"),
+      );
+    };
+    const observer = new MutationObserver((mutations) => {
+      if (!mutations.some((mutation) =>
+        rowTouched(mutation.target)
+        || [...mutation.addedNodes].some(rowTouched)
+        || [...mutation.removedNodes].some(rowTouched)
+      )) return;
+      const watch = watches[id];
+      if (watch) watch.changed = true;
+      observer.disconnect();
+    });
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    watches[id] = { changed: false, observer };
+    return id;
+  });
+}
+
+async function waitForDiaryRowMutation(page: Page, watchId: string, timeoutMs: number) {
+  const changed = await page.waitForFunction((id) => {
+    const watches = (window as typeof window & {
+      __cronogptDiaryMutationWatches?: Record<string, { changed: boolean }>;
+    }).__cronogptDiaryMutationWatches;
+    return watches?.[id]?.changed === true;
+  }, watchId, { timeout: timeoutMs }).then(() => true).catch(() => false);
+  await clearDiaryRowMutationWatch(page, watchId);
+  return changed;
+}
+
+async function clearDiaryRowMutationWatch(page: Page, watchId: string) {
+  await page.evaluate((id) => {
+    const windowWithWatches = window as typeof window & {
+      __cronogptDiaryMutationWatches?: Record<string, { changed: boolean; observer: MutationObserver }>;
+    };
+    const watch = windowWithWatches.__cronogptDiaryMutationWatches?.[id];
+    watch?.observer.disconnect();
+    if (windowWithWatches.__cronogptDiaryMutationWatches) {
+      delete windowWithWatches.__cronogptDiaryMutationWatches[id];
+    }
+  }, watchId).catch(() => undefined);
 }
 
 async function readDiaryDateLabel(page: Page) {
@@ -5451,7 +6724,48 @@ async function foodEditor(page: Page) {
 }
 
 async function foodDialogIsOpen(page: Page) {
-  return Boolean(await foodEditor(page));
+  return page.locator(".pretty-dialog:visible, [role='dialog']:visible, .gwt-DialogBox:visible, .popupContent:visible").evaluateAll((elements) =>
+    elements.some((element) => {
+      const text = (element.textContent ?? "").replace(/\s+/g, " ");
+      if (/(Add Food to Diary|Description\s+Source)/i.test(text)) return true;
+
+      // Cronometer can expose a search-only phase before the final food editor
+      // exists. Recognize it without treating every generic SEARCH dialog as a
+      // food dialog.
+      const searchInput = Array.from(element.querySelectorAll("input")).some((input) =>
+        /search.*food|food.*search/i.test(`${input.getAttribute("placeholder") ?? ""} ${input.getAttribute("aria-label") ?? ""}`),
+      );
+      const searchControl = Array.from(element.querySelectorAll("button,[role='button'],input[type='button'],input[type='submit']")).some((control) =>
+        /^SEARCH$/i.test(((control instanceof HTMLInputElement ? control.value : control.textContent) ?? "").trim()),
+      );
+      return searchInput && searchControl;
+    }),
+  ).catch(() => false);
+}
+
+async function closeFoodDialog(page: Page, navigationTimeoutMs = 10000, reloadFallback = true) {
+  if (!(await foodDialogIsOpen(page))) {
+    return { closed: true as const, strategy: "not-open" as const };
+  }
+
+  await page.keyboard.press("Escape").catch(() => undefined);
+  await page.waitForTimeout(350);
+  if (!(await foodDialogIsOpen(page))) {
+    return { closed: true as const, strategy: "escape" as const };
+  }
+
+  if (!reloadFallback) {
+    return { closed: false as const, strategy: "still-open" as const };
+  }
+
+  await page.reload({ waitUntil: "domcontentloaded", timeout: navigationTimeoutMs }).catch(() => undefined);
+  await page.waitForTimeout(600);
+  const closed = !(await foodDialogIsOpen(page));
+  return { closed, strategy: closed ? "reload" as const : "failed" as const };
+}
+
+export async function __closeFoodDialogForTests(page: Page, reloadFallback = true) {
+  return closeFoodDialog(page, 2500, reloadFallback);
 }
 
 async function waitForFoodDialogReady(page: Page, timeoutMs: number) {
@@ -5607,20 +6921,22 @@ async function searchCurrentFoodDialog(page: Page, query: string, limit: number)
   const previousKey = foodResultsKey(previousResults);
   const previousInputValue = await searchBox.inputValue().catch(() => "");
   await searchBox.click();
-  await page.keyboard.press("Control+A").catch(() => undefined);
-  await page.keyboard.type(query, { delay: 10 });
-  await searchBox.fill(query).catch(() => undefined);
-  await searchBox.evaluate((element, value) => {
-    if (!(element instanceof HTMLInputElement)) return;
-    element.value = value;
-    element.dispatchEvent(new Event("input", { bubbles: true }));
-    element.dispatchEvent(new Event("change", { bubbles: true }));
-  }, query).catch(() => undefined);
-  await searchBox.press("Enter").catch(() => undefined);
-  const searched = await clickDialogButton(page, /^SEARCH$/i);
-  if (!searched) {
-    await clickByText(page, /^SEARCH$/i);
+  await searchBox.press("Control+A");
+  await searchBox.pressSequentially(query, { delay: 10 });
+  const queryReadback = await searchBox.inputValue();
+  if (queryReadback !== query) {
+    throw new Error(`Cronometer food search retained ${JSON.stringify(queryReadback)} instead of the exact requested query.`);
   }
+
+  // One exact query gets one submission. Enter plus button clicks used to
+  // create overlapping searches whose late result could replace the intended
+  // result table immediately before selection.
+  const searchButton = activeDialog(page).getByRole("button", { name: /^SEARCH$/i });
+  const searchButtonCount = await searchButton.count().catch(() => 0);
+  if (searchButtonCount !== 1 || !(await searchButton.isVisible().catch(() => false))) {
+    throw new Error(`Cronometer food search exposed ${searchButtonCount} exact SEARCH buttons; expected one.`);
+  }
+  await searchButton.click();
   await waitForFoodSearchSettle(page, previousKey, Math.min(limit, 5), 2600);
 
   const results = await collectFoodSearchResults(page, limit);
@@ -5633,6 +6949,10 @@ async function searchCurrentFoodDialog(page: Page, query: string, limit: number)
     return [];
   }
   return results;
+}
+
+export async function __searchCurrentFoodDialogForTests(page: Page, query: string, limit = 20) {
+  return searchCurrentFoodDialog(page, query, limit);
 }
 
 async function waitForFoodSearchSettle(page: Page, previousKey: string, limit: number, timeoutMs: number) {
@@ -5670,36 +6990,56 @@ async function clickFoodSearchResult(page: Page, selectedName: string, selectedS
   const dialog = activeDialog(page);
   const rows = dialog.locator("tr:visible");
   const count = await rows.count().catch(() => 0);
+  const matchingRows: Array<ReturnType<Page["locator"]>> = [];
   for (let index = 0; index < count; index += 1) {
     const row = rows.nth(index);
     const parsed = parseFoodRowText(await row.innerText().catch(() => ""));
     if (!parsed) continue;
     if (normalizeFoodName(parsed.name) !== normalizeFoodName(selectedName)) continue;
     if (selectedSource && normalizeSource(parsed.source) !== normalizeSource(selectedSource)) continue;
-
-    await row.scrollIntoViewIfNeeded().catch(() => undefined);
-    await row.focus().catch(() => undefined);
-    await row.click().catch(() => undefined);
-    await page.keyboard.press("Enter").catch(() => undefined);
-    return true;
+    matchingRows.push(row);
   }
+  if (matchingRows.length === 1) {
+    const row = matchingRows[0];
+    try {
+      const handle = await row.elementHandle();
+      if (!handle) return false;
+      const finalParsed = parseFoodRowText(await handle.innerText());
+      if (!finalParsed) return false;
+      if (normalizeFoodName(finalParsed.name) !== normalizeFoodName(selectedName)) return false;
+      if (selectedSource && normalizeSource(finalParsed.source) !== normalizeSource(selectedSource)) return false;
+      await handle.scrollIntoViewIfNeeded();
+      await handle.click();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  if (matchingRows.length > 1) return false;
 
   if (selectedSource) return false;
 
   const exactCell = dialog.locator(".gwt-HTML").filter({ hasText: new RegExp(`^${escapeRegExp(selectedName)}$`, "i") });
-  if ((await exactCell.count().catch(() => 0)) > 0 && (await exactCell.first().isVisible().catch(() => false))) {
-    await exactCell.first().click();
-    return true;
+  const visibleExactCells: Array<ReturnType<Page["locator"]>> = [];
+  const exactCellCount = await exactCell.count().catch(() => 0);
+  for (let index = 0; index < exactCellCount; index += 1) {
+    if (await exactCell.nth(index).isVisible().catch(() => false)) visibleExactCells.push(exactCell.nth(index));
   }
+  if (visibleExactCells.length === 1) {
+    return visibleExactCells[0].click().then(() => true).catch(() => false);
+  }
+  if (visibleExactCells.length > 1) return false;
 
-  const row = dialog.locator("tr").filter({ hasText: selectedName }).filter({ hasNotText: /^DescriptionSource$/i }).first();
-  if ((await row.count().catch(() => 0)) > 0 && (await row.isVisible().catch(() => false))) {
-    await row.click().catch(() => undefined);
-    await page.keyboard.press("Enter").catch(() => undefined);
-    return true;
+  const fallbackRows = dialog.locator("tr:visible").filter({ hasText: selectedName }).filter({ hasNotText: /^DescriptionSource$/i });
+  if ((await fallbackRows.count().catch(() => 0)) === 1) {
+    return fallbackRows.first().click().then(() => true).catch(() => false);
   }
 
   return false;
+}
+
+export async function __clickFoodSearchResultForTests(page: Page, selectedName: string, selectedSource?: string) {
+  return clickFoodSearchResult(page, selectedName, selectedSource);
 }
 
 async function fillFoodAmount(page: Page, editor: ReturnType<Page["locator"]>, amount?: number, selectedName?: string) {
@@ -5712,19 +7052,41 @@ async function fillFoodAmount(page: Page, editor: ReturnType<Page["locator"]>, a
     : await editableAmountInputInScope(editor, selectedPanel);
   if (!input) return { filled: false as const, warning: "No visible food amount input was found." };
   const value = String(amount);
-  await input.fill(value);
-  await page.keyboard.press("Tab").catch(() => undefined);
+  // Cronometer's GWT editor can read the visible DOM value while retaining its
+  // previous model value if automation only assigns/fills the input. Real key
+  // events plus blur are required so a later ADD cannot silently persist the
+  // default 100 g amount.
+  try {
+    await input.click();
+    await input.press("Control+A");
+    await input.pressSequentially(value, { delay: 25 });
+    await input.press("Tab");
+  } catch (error) {
+    return {
+      filled: false as const,
+      value,
+      selectedPanel,
+      warning: `Food amount could not be entered with required real keyboard and blur events: ${error instanceof Error ? error.message : "interaction failed"}. No food was written.`,
+    };
+  }
+  await page.waitForTimeout(350);
   const actualValue = await input.inputValue().catch(() => "");
-  if (!numericInputMatches(actualValue, amount)) {
+  const blurred = await input.evaluate((element) => document.activeElement !== element).catch(() => false);
+  if (!numericInputMatches(actualValue, amount) || !blurred) {
     return {
       filled: false as const,
       value,
       actualValue,
+      blurred,
       selectedPanel,
       warning: `Food amount did not verify after filling. Requested ${value}, current value is ${actualValue || "blank"}.`,
     };
   }
-  return { filled: true as const, value, actualValue, selectedPanel };
+  return { filled: true as const, value, actualValue, blurred, selectedPanel };
+}
+
+export async function __fillFoodAmountForTests(page: Page, editorSelector: string, amount: number) {
+  return fillFoodAmount(page, page.locator(editorSelector).first(), amount);
 }
 
 async function fillFoodTime(page: Page, editor: ReturnType<Page["locator"]>, timestamp?: string) {
@@ -5737,17 +7099,38 @@ async function fillFoodTime(page: Page, editor: ReturnType<Page["locator"]>, tim
     return { filled: false as const, timestamp, warning: "The food editor did not expose both hour and minute inputs." };
   }
 
-  await textBoxes.nth(0).fill(String(parsed.hour12));
-  await textBoxes.nth(1).fill(String(parsed.minute).padStart(2, "0"));
-  await textBoxes.nth(1).press("Tab").catch(() => undefined);
+  const hourInput = textBoxes.nth(0);
+  const minuteInput = textBoxes.nth(1);
+  try {
+    await hourInput.click();
+    await hourInput.press("Control+A");
+    await hourInput.pressSequentially(String(parsed.hour12), { delay: 25 });
+    await hourInput.press("Tab");
+    await minuteInput.click();
+    await minuteInput.press("Control+A");
+    await minuteInput.pressSequentially(String(parsed.minute).padStart(2, "0"), { delay: 25 });
+    await minuteInput.press("Tab");
+  } catch (error) {
+    return {
+      filled: false as const,
+      timestamp,
+      warning: `Food time could not be entered with required real keyboard and blur events: ${error instanceof Error ? error.message : "interaction failed"}. No food was written.`,
+    };
+  }
+  // GWT can expose the assigned input value before its backing model receives
+  // the keyboard/blur events. Delay the first readback and repeat it again at
+  // the final pre-commit gate.
+  await page.waitForTimeout(350);
   const actualHour = await textBoxes.nth(0).inputValue().catch(() => "");
   const actualMinute = await textBoxes.nth(1).inputValue().catch(() => "");
-  if (Number(actualHour) !== parsed.hour12 || Number(actualMinute) !== parsed.minute) {
+  const minuteBlurred = await minuteInput.evaluate((element) => document.activeElement !== element).catch(() => false);
+  if (Number(actualHour) !== parsed.hour12 || Number(actualMinute) !== parsed.minute || !minuteBlurred) {
     return {
       filled: false as const,
       timestamp,
       actualHour,
       actualMinute,
+      minuteBlurred,
       warning: `Food time inputs did not read back as ${parsed.hour12}:${String(parsed.minute).padStart(2, "0")}.`,
     };
   }
@@ -5764,7 +7147,19 @@ async function fillFoodTime(page: Page, editor: ReturnType<Page["locator"]>, tim
       await page.keyboard.press("Escape").catch(() => undefined);
       return { filled: false as const, timestamp, actualHour, actualMinute, currentPeriod: current, warning: `The ${parsed.period} food-time option was not visible.` };
     }
-    await option.click().catch(() => undefined);
+    try {
+      await option.click();
+    } catch (error) {
+      return {
+        filled: false as const,
+        timestamp,
+        actualHour,
+        actualMinute,
+        currentPeriod: current,
+        warning: `The ${parsed.period} food-time option could not be selected: ${error instanceof Error ? error.message : "interaction failed"}.`,
+      };
+    }
+    await page.waitForTimeout(350);
   }
   const actualPeriod = (await periodButton.innerText().catch(() => "")).trim().toUpperCase();
   if (actualPeriod !== parsed.period) {
@@ -5776,7 +7171,38 @@ async function fillFoodTime(page: Page, editor: ReturnType<Page["locator"]>, tim
     normalizedTimestamp: parsed.normalized,
     actualHour,
     actualMinute,
+    minuteBlurred,
     actualPeriod,
+  };
+}
+
+async function readFoodEditorTime(editor: ReturnType<Page["locator"]>, timestamp?: string) {
+  if (!timestamp) return { matches: true as const, skipped: true as const };
+  const parsed = parseTime(timestamp);
+  if (!parsed) return { matches: false as const, timestamp, warning: "Timestamp could not be parsed during final readback." };
+  const textBoxes = editor.locator("input.text-box:visible");
+  const inputCount = await textBoxes.count().catch(() => 0);
+  if (inputCount < 2) {
+    return { matches: false as const, timestamp, inputCount, warning: "Food time inputs disappeared before commit." };
+  }
+  const actualHour = await textBoxes.nth(0).inputValue().catch(() => "");
+  const actualMinute = await textBoxes.nth(1).inputValue().catch(() => "");
+  const periodButtons = editor.locator("button.dropdown-toggle:visible").filter({ hasText: /^(AM|PM)$/i });
+  const periodControlCount = await periodButtons.count().catch(() => 0);
+  const actualPeriod = periodControlCount === 1
+    ? (await periodButtons.first().innerText().catch(() => "")).trim().toUpperCase()
+    : "";
+  return {
+    matches: Number(actualHour) === parsed.hour12
+      && Number(actualMinute) === parsed.minute
+      && actualPeriod === parsed.period,
+    timestamp,
+    normalizedTimestamp: parsed.normalized,
+    actualHour,
+    actualMinute,
+    actualPeriod,
+    inputCount,
+    periodControlCount,
   };
 }
 
@@ -8136,6 +9562,98 @@ async function readFoodEditorMeal(editor: ReturnType<Page["locator"]>, expectedM
   return { matches: foodLogMealTextMatches(currentMeal, expectedMeal), currentMeal, editorMealControlCount: count };
 }
 
+async function readFoodEditorIdentity(
+  editor: ReturnType<Page["locator"]>,
+  expectedName: string,
+  expectedSource?: string,
+) {
+  const identityCandidates = editor.locator([
+    ".food-search-name:visible",
+    ".selected-food:visible",
+    "[data-testid*='food-name' i]:visible",
+    "[aria-label*='selected food' i]:visible",
+  ].join(","));
+  const candidateCount = await identityCandidates.count().catch(() => 0);
+  const candidateTexts: string[] = [];
+  for (let index = 0; index < candidateCount; index += 1) {
+    const text = (await identityCandidates.nth(index).innerText().catch(() => ""))
+      .replace(/\s+/g, " ")
+      .trim();
+    if (text && !candidateTexts.includes(text)) candidateTexts.push(text);
+  }
+  // Some GWT versions render the selected name as a plain exact HTML cell.
+  const exactHtml = editor.locator(".gwt-HTML:visible").filter({
+    hasText: new RegExp(`^${escapeRegExp(expectedName)}$`, "i"),
+  });
+  const exactHtmlCount = await exactHtml.count().catch(() => 0);
+  for (let index = 0; index < exactHtmlCount; index += 1) {
+    const text = (await exactHtml.nth(index).innerText().catch(() => ""))
+      .replace(/\s+/g, " ")
+      .trim();
+    if (text && !candidateTexts.includes(text)) candidateTexts.push(text);
+  }
+  const normalizedExpectedName = normalizeFoodName(expectedName);
+  const matchingTexts = candidateTexts.filter((text) => normalizeFoodName(text) === normalizedExpectedName);
+  const editorText = await editor.innerText().catch(() => "");
+  const sourceVisible = Boolean(expectedSource && normalizeUiText(editorText).includes(normalizeUiText(expectedSource)));
+  const anyKnownSourceVisible = /\b(Custom Recipe|Custom Food|Custom Meal|Recipe|NCCDB|USDA|FDC UPC|CRDB|CNF|Nutritionix|CoFID|NEVO|NUTTAB|CFCD|Restaurant|Brand|Common Food|Survey|Label)\b/i.test(editorText);
+  const sourceVerified = !expectedSource || !anyKnownSourceVisible || sourceVisible;
+  return {
+    matches: matchingTexts.length === 1 && sourceVerified,
+    expectedName,
+    expectedSource,
+    matchingTexts,
+    candidateTexts,
+    sourceVisible,
+    sourceVerified,
+    warning: matchingTexts.length === 1 && sourceVerified
+      ? undefined
+      : !sourceVerified
+        ? `The food editor exposed a different source than ${expectedSource} for ${expectedName}.`
+        : `The food editor did not expose exactly one selected-food identity matching ${expectedName}.`,
+  };
+}
+
+export async function __readFoodEditorIdentityForTests(
+  page: Page,
+  editorSelector: string,
+  expectedName: string,
+  expectedSource?: string,
+) {
+  return readFoodEditorIdentity(page.locator(editorSelector).first(), expectedName, expectedSource);
+}
+
+async function readFoodEditorAmount(editor: ReturnType<Page["locator"]>, expectedAmount?: number) {
+  if (expectedAmount === undefined) return { matches: true as const, skipped: true as const };
+  const textBoxes = editor.locator("input.text-box:visible");
+  const count = await textBoxes.count().catch(() => 0);
+  if (count === 0) return { matches: false as const, actualValue: "", expectedAmount, inputCount: count };
+  const actualValue = await textBoxes.nth(count - 1).inputValue().catch(() => "");
+  return {
+    matches: numericInputMatches(actualValue, expectedAmount),
+    actualValue,
+    expectedAmount,
+    inputCount: count,
+  };
+}
+
+async function readFoodEditorUnit(
+  editor: ReturnType<Page["locator"]>,
+  expectedUnit?: string,
+  expectedVisibleUnit?: string,
+) {
+  if (!expectedUnit) return { matches: true as const, skipped: true as const };
+  const currentUnitText = await currentFoodLogUnitText(editor);
+  const matches = expectedVisibleUnit
+    ? normalizeUiText(currentUnitText) === normalizeUiText(expectedVisibleUnit)
+    : foodLogUnitTextMatches(currentUnitText, expectedUnit);
+  return { matches, currentUnitText, expectedUnit, expectedVisibleUnit };
+}
+
+function normalizeUiText(value: string) {
+  return value.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
 async function commitFoodEditor(editor: ReturnType<Page["locator"]>) {
   const controls = editor.locator("button,.gwt-Button,[role='button'],input[type='button'],input[type='submit']");
   const count = await controls.count().catch(() => 0);
@@ -8985,7 +10503,9 @@ export function parseFoodSearchResults(rawText: string, limit: number): SearchRe
     if (results.length >= limit) break;
   }
 
-  return mergeFoodResults(results).slice(0, limit);
+  // Preserve duplicate visible rows. Without stable food IDs, collapsing two
+  // identical name/source rows would make a later click inherently ambiguous.
+  return results.slice(0, limit);
 }
 
 function foodSearchResultMarkerIndex(rawText: string) {
@@ -9027,9 +10547,15 @@ async function extractFoodSearchResults(page: Page, limit: number): Promise<Sear
 
 async function collectFoodSearchResults(page: Page, limit: number) {
   const tableResults = await extractFoodSearchResults(page, limit * 2);
+  // Structured rows are the source of truth and preserve one item per visible
+  // click target. Parsing the same dialog text as well would double every row.
+  if (tableResults.length > 0) return tableResults.slice(0, limit);
   const dialogText = await activeDialog(page).innerText().catch(() => "");
-  const textResults = parseFoodSearchResults(dialogText, limit * 2);
-  return mergeFoodResults([...tableResults, ...textResults]).slice(0, limit);
+  return parseFoodSearchResults(dialogText, limit * 2).slice(0, limit);
+}
+
+export async function __collectFoodSearchResultsForTests(page: Page, limit = 20) {
+  return collectFoodSearchResults(page, limit);
 }
 
 function parseFoodRowText(rawText: string): SearchResult | undefined {
@@ -9048,20 +10574,6 @@ function parseFoodRowText(rawText: string): SearchResult | undefined {
   const name = sourceMatch ? compact.slice(0, sourceMatch.index).trim() : compact;
   if (!name || /^(Description|Source)$/i.test(name)) return undefined;
   return { name, source: sourceMatch?.[1], raw: compact };
-}
-
-function mergeFoodResults(results: SearchResult[]) {
-  const merged: SearchResult[] = [];
-  for (const result of results) {
-    const name = result.name.replace(/\s+/g, " ").trim();
-    if (!name || /^(Description|Source)$/i.test(name)) continue;
-    if (merged.some((candidate) =>
-      normalizeFoodName(candidate.name) === normalizeFoodName(name) &&
-      normalizeSource(candidate.source) === normalizeSource(result.source)
-    )) continue;
-    merged.push({ ...result, name });
-  }
-  return merged;
 }
 
 export function foodSearchTabAttempts(scope: FoodLogInput["searchScope"], selectedSource?: string) {
@@ -9114,7 +10626,7 @@ export function chooseFoodLogResult(input: FoodLogInput, results: SearchResult[]
       normalizeFoodName(result.name) === normalizedSelected &&
       (!selectedSource || normalizeSource(result.source) === selectedSource)
     );
-    if (matches.length === 1 || (matches.length > 1 && selectedSource)) {
+    if (matches.length === 1) {
       return {
         status: "ok" as const,
         policy,
@@ -9127,7 +10639,9 @@ export function chooseFoodLogResult(input: FoodLogInput, results: SearchResult[]
       status: "needs_manual_step" as const,
       policy,
       candidates,
-      warning: selectedSource
+      warning: matches.length > 1 && (selectedSource || new Set(matches.map((match) => normalizeSource(match.source))).size <= 1)
+        ? `Multiple visible Cronometer rows matched ${selectedName}${input.selectedSource ? ` from ${input.selectedSource}` : ""}; no stable food ID distinguished them.`
+        : selectedSource
         ? `The selected food ${selectedName} from ${input.selectedSource} was not found in the visible Cronometer results.`
         : `Multiple or no visible Cronometer rows matched selectedName=${selectedName}. Pass selectedSource from search_foods to avoid logging the wrong row.`,
       nextStep: "Call search_foods for the query, then call log_food with the chosen selectedName and selectedSource.",
@@ -9152,6 +10666,20 @@ export function chooseFoodLogResult(input: FoodLogInput, results: SearchResult[]
       candidates,
       warning: "No Cronometer food result was found.",
       nextStep: "Try a more specific food query or create a custom food first.",
+    };
+  }
+
+  const duplicateTopIdentityCount = ranked.filter((candidate) =>
+    normalizeFoodName(candidate.name) === normalizeFoodName(top.name)
+    && normalizeSource(candidate.source) === normalizeSource(top.source)
+  ).length;
+  if (duplicateTopIdentityCount > 1) {
+    return {
+      status: "needs_manual_step" as const,
+      policy,
+      candidates,
+      warning: `Cronometer showed ${duplicateTopIdentityCount} indistinguishable rows for ${top.name}${top.source ? ` from ${top.source}` : ""}; no stable food ID distinguished them.`,
+      nextStep: "Choose a result with a unique visible name/source identity, or resolve the duplicate rows in Cronometer before writing.",
     };
   }
 
@@ -9186,7 +10714,11 @@ export function foodLogConfidence(query: string, top: SearchResult, next?: Searc
   const exactName = normalizedName === normalizedQuery;
   const sameWords = foodNameWordKey(normalizedName) === foodNameWordKey(normalizedQuery);
   const plainName = normalizedName === `${normalizedQuery} plain`;
-  const highConfidence = exactName || sameWords || plainName || !next || (topScore >= 85 && scoreGap >= 30) || (topScore >= 70 && scoreGap >= 45);
+  // A single result is not evidence that it is the requested food. Cronometer
+  // sometimes returns one unrelated fallback row, and accepting that row used
+  // to turn queries such as "protein bar" into a Banana write. Require the
+  // same lexical floor regardless of result count.
+  const highConfidence = exactName || sameWords || plainName || (topScore >= 85 && scoreGap >= 30) || (topScore >= 70 && scoreGap >= 45);
   return {
     highConfidence,
     exactName,

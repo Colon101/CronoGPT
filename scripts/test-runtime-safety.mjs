@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +8,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import {
   BrowserCronometerProvider,
+  __exercisePageWriteAttemptMarkerForTests,
   __resetBrowserQueueForTests,
   __runBrowserQueueJobForTests,
   __setActiveBrowserJobForTests,
@@ -14,14 +16,30 @@ import {
   providerResultDefinitelyDidNotWrite,
 } from "../dist/providers/browser.js";
 import { MockCronometerProvider } from "../dist/providers/mock.js";
-import { createCronoServer, MCP_SERVER_VERSION, STABLE_MODEL_VISIBLE_TOOLS } from "../dist/mcp.js";
+import {
+  APP_CALLABLE_READ_TOOLS,
+  createCronoServer,
+  MCP_SERVER_VERSION,
+  STABLE_MODEL_VISIBLE_TOOLS,
+  WIDGET_URI,
+} from "../dist/mcp.js";
 import { capabilitiesForMode } from "../dist/features.js";
-import { toMcpToolResponse } from "../dist/tool-response.js";
+import { isoDateInTimeZone, stableJson } from "../dist/determinism.js";
+import {
+  MCP_NEXT_ACTION_VALUES,
+  MCP_OPERATION_STATE_VALUES,
+  toMcpToolResponse,
+} from "../dist/tool-response.js";
 import { runCooldownCommand } from "./cronometer-login-cooldown.mjs";
 
 const tempDir = mkdtempSync(join(tmpdir(), "cronogpt-runtime-safety-"));
 const cooldownFile = join(tempDir, "cooldown.json");
 const operationJournalFile = join(tempDir, "operations.json");
+const legacyOperationJournalFile = join(tempDir, "legacy-operations.json");
+const failedOperationJournalFile = join(tempDir, "failed-operations.json");
+const retentionOperationJournalFile = join(tempDir, "retention-operations.json");
+const deleteOperationJournalFile = join(tempDir, "delete-operations.json");
+const unresolvedDeleteOperationJournalFile = join(tempDir, "unresolved-delete-operations.json");
 const fixedNow = Date.parse("2200-05-18T03:33:20.000Z");
 
 try {
@@ -32,6 +50,7 @@ try {
   assert.match(browserSource, /added_ingredient_not_verified/, "recipe creation must refuse Save when an amount does not read back");
   assert.equal(providerResultDefinitelyDidNotWrite({ provider: "browser", mode: "browser", feature: "delete", status: "needs_manual_step", data: { writeAttempted: false } }), true);
   assert.equal(providerResultDefinitelyDidNotWrite({ provider: "browser", mode: "browser", feature: "delete", status: "possibly_written_verify_failed", data: { writeAttempted: false } }), false);
+  assert.deepEqual(__exercisePageWriteAttemptMarkerForTests({}), { marked: true, cleared: true });
   assert.equal(MCP_SERVER_VERSION, packageVersion, "MCP server identity must change whenever the app package version changes");
 
   let status = runCooldown(["status"]);
@@ -54,28 +73,26 @@ try {
   assert.equal(status.active, true);
   assert.equal(status.secondsRemaining, 900);
 
-  for (const toolName of [
+  assert.deepEqual([...STABLE_MODEL_VISIBLE_TOOLS], [
+    "render_cronometer_dashboard",
     "get_daily_summary",
     "list_food_entries",
     "list_biometrics",
     "list_exercises",
     "list_notes",
+    "log_food",
+    "log_foods",
     "log_food_plan",
     "delete_diary_food_entries",
+    "search_foods",
+    "custom_food_nutrient_schema",
     "list_custom_foods",
-    "find_duplicate_custom_foods",
-    "list_private_recipe_names",
+    "create_custom_food",
+    "create_and_log_custom_food",
     "find_private_recipe",
-    "list_custom_recipes",
-    "resolve_recipe_ingredients",
     "ensure_private_recipe",
-    "create_recipe",
-    "update_custom_recipe",
-    "delete_custom_recipe",
-    "retire_custom_recipe",
-  ]) {
-    assert.ok(STABLE_MODEL_VISIBLE_TOOLS.includes(toolName), `${toolName} should be ChatGPT-visible by default`);
-  }
+    "get_cronometer_operation",
+  ], "the default model surface must stay intentionally small and deterministic");
   assert.equal(STABLE_MODEL_VISIBLE_TOOLS.includes("get_targets"), false, "unstructured target scraping must not be ChatGPT-visible by default");
   const browserCapabilities = new Map(capabilitiesForMode("browser").map((capability) => [capability.id, capability.currentBackendStatus]));
   assert.equal(browserCapabilities.get("create_and_log_custom_food"), "ok");
@@ -90,32 +107,37 @@ try {
   await scopedClient.connect(clientTransport);
   assert.equal(scopedClient.getServerVersion()?.version, MCP_SERVER_VERSION);
   const listedTools = await scopedClient.listTools();
+  assert.equal(listedTools.tools.length, STABLE_MODEL_VISIBLE_TOOLS.length + 1, "default tools/list must contain only the stable model tools plus app-only capabilities");
   for (const toolName of STABLE_MODEL_VISIBLE_TOOLS) {
     const tool = listedTools.tools.find((candidate) => candidate.name === toolName);
     assert.ok(tool, `${toolName} must be present in tools/list`);
-    assert.deepEqual(tool._meta?.ui?.visibility, ["model"], `${toolName} must be explicitly model-visible`);
+    const expectedVisibility = APP_CALLABLE_READ_TOOLS.includes(toolName) ? ["model", "app"] : ["model"];
+    assert.deepEqual(tool._meta?.ui?.visibility, expectedVisibility, `${toolName} must have explicit least-privilege visibility`);
+    for (const annotation of ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"]) {
+      assert.equal(typeof tool.annotations?.[annotation], "boolean", `${toolName}.${annotation} must be explicit`);
+    }
   }
+  const capabilityTool = listedTools.tools.find((tool) => tool.name === "cronometer_capabilities");
+  assert.deepEqual(capabilityTool?._meta?.ui?.visibility, ["app"]);
+  assert.equal(listedTools.tools.some((tool) => tool.name === "delete_account"), false);
+  assert.equal(listedTools.tools.some((tool) => tool.name === "run_cronometer_ui_flow"), false);
+  assert.equal(listedTools.tools.some((tool) => tool.name === "create_recipe"), false);
+  const dashboardTool = listedTools.tools.find((tool) => tool.name === "render_cronometer_dashboard");
+  assert.equal(dashboardTool?._meta?.ui?.resourceUri, WIDGET_URI);
+  assert.equal(dashboardTool?._meta?.["openai/outputTemplate"], WIDGET_URI);
+  assert.match(WIDGET_URI, new RegExp(`v${MCP_SERVER_VERSION.replaceAll(".", "\\.")}\\.html$`));
+  const resources = await scopedClient.listResources();
+  const dashboardResource = resources.resources.find((resource) => resource.uri === WIDGET_URI);
+  assert.ok(dashboardResource, "the versioned dashboard resource must be listed");
+  const dashboardContents = await scopedClient.readResource({ uri: WIDGET_URI });
+  assert.equal(dashboardContents.contents[0]?._meta?.ui?.prefersBorder, true);
+  assert.equal(dashboardContents.contents[0]?._meta?.["openai/widgetPrefersBorder"], true);
+  assert.match(dashboardContents.contents[0]?.text ?? "", /date: "today"/);
   const ensureRecipeTool = listedTools.tools.find((tool) => tool.name === "ensure_private_recipe");
   assert.ok(ensureRecipeTool?.inputSchema?.required?.includes("name"));
   assert.ok(ensureRecipeTool?.inputSchema?.required?.includes("ingredients"));
   assert.match(ensureRecipeTool?.description ?? "", /preferred recipe-writing workflow/i);
   assert.match(ensureRecipeTool?.description ?? "", /semantic match/i);
-  const updateRecipeTool = listedTools.tools.find((tool) => tool.name === "update_custom_recipe");
-  assert.deepEqual(updateRecipeTool?._meta?.ui?.visibility, ["model"]);
-  const resolveRecipeTool = listedTools.tools.find((tool) => tool.name === "resolve_recipe_ingredients");
-  assert.match(resolveRecipeTool?.description ?? "", /ensure_private_recipe/);
-  const directCreateRecipeTool = listedTools.tools.find((tool) => tool.name === "create_recipe");
-  assert.deepEqual(directCreateRecipeTool?._meta?.ui?.visibility, ["model"]);
-  assert.match(directCreateRecipeTool?.description ?? "", /only after find_private_recipe has confirmed/i);
-  const deleteRecipeTool = listedTools.tools.find((tool) => tool.name === "delete_custom_recipe");
-  assert.deepEqual(deleteRecipeTool?._meta?.ui?.visibility, ["model"]);
-  assert.equal(deleteRecipeTool?.annotations?.destructiveHint, true);
-  assert.match(deleteRecipeTool?.description ?? "", /default behavior is to click Cronometer's native Retire action/i);
-  assert.match(deleteRecipeTool?.description ?? "", /native Retire action/i);
-  assert.match(deleteRecipeTool?.inputSchema?.properties?.ifUsed?.description ?? "", /defaults to retire/i);
-  const retireRecipeTool = listedTools.tools.find((tool) => tool.name === "retire_custom_recipe");
-  assert.match(retireRecipeTool?.description ?? "", /native Retire action/i);
-  assert.equal(retireRecipeTool?.inputSchema?.properties?.retiredName, undefined);
   const preferredCustomFoodTool = listedTools.tools.find((tool) => tool.name === "create_and_log_custom_food");
   assert.ok(preferredCustomFoodTool);
   assert.match(preferredCustomFoodTool.description ?? "", /preferred one-call workflow/i);
@@ -128,6 +150,11 @@ try {
   assert.deepEqual(logFoodTool?.inputSchema?.properties?.meal?.enum, ["Breakfast", "Lunch", "Dinner", "Snacks", "Supplements"]);
   assert.deepEqual(logFoodTool?.inputSchema?.properties?.matchPolicy?.enum, ["high_confidence", "selected_only"]);
   assert.ok(logFoodTool?.inputSchema?.properties?.portion, "log_food must expose explicit whole-package portion semantics");
+  assert.match(logFoodTool?.description ?? "", /only initial tool call/i, "clear single-food requests should be one direct MCP call");
+  assert.match(logFoodTool?.description ?? "", /do not preflight with search_foods, list_food_entries, or dryRun/i);
+  assert.match(logFoodTool?.inputSchema?.properties?.dryRun?.description ?? "", /omit for a normal user-requested write/i);
+  const listFoodEntriesTool = listedTools.tools.find((tool) => tool.name === "list_food_entries");
+  assert.match(listFoodEntriesTool?.description ?? "", /do not call it as routine preflight/i);
   const logFoodsTool = listedTools.tools.find((tool) => tool.name === "log_foods");
   assert.ok(logFoodsTool?.inputSchema?.properties?.items?.items?.properties?.portion, "log_foods items must expose whole-package portions");
   const logFoodPlanTool = listedTools.tools.find((tool) => tool.name === "log_food_plan");
@@ -137,11 +164,13 @@ try {
   assert.equal(logFoodPlanTool?.annotations?.idempotentHint, true);
   const operationTool = listedTools.tools.find((tool) => tool.name === "get_cronometer_operation");
   assert.ok(operationTool?.inputSchema?.required?.includes("operationId"));
-  const deleteDiaryTool = listedTools.tools.find((tool) => tool.name === "delete_diary_food_entry");
-  assert.ok(deleteDiaryTool?.inputSchema?.properties?.deleteCount);
   const deleteDiaryEntriesTool = listedTools.tools.find((tool) => tool.name === "delete_diary_food_entries");
   assert.equal(deleteDiaryEntriesTool?.annotations?.destructiveHint, true);
   assert.ok(deleteDiaryEntriesTool?.inputSchema?.properties?.items?.items?.required?.includes("confirmName"));
+  assert.ok(deleteDiaryEntriesTool?.inputSchema?.properties?.idempotencyKey);
+  assert.ok(deleteDiaryEntriesTool?.inputSchema?.properties?.items?.items?.properties?.idempotencyKey);
+  assert.ok(deleteDiaryEntriesTool?.inputSchema?.properties?.items?.items?.properties?.expectedExistingMatchCount);
+  assert.match(deleteDiaryEntriesTool?.description ?? "", /fresh plan idempotencyKey/i);
   const createCustomFoodTool = listedTools.tools.find((tool) => tool.name === "create_custom_food");
   const createAndLogTool = listedTools.tools.find((tool) => tool.name === "create_and_log_custom_food");
   assert.ok(createCustomFoodTool?.inputSchema?.required?.includes("nutrients"));
@@ -151,6 +180,7 @@ try {
   assert.equal(logFoodTool?.annotations?.openWorldHint, false);
   assert.equal(logFoodTool?.annotations?.idempotentHint, true);
   assert.match(scopedClient.getInstructions() ?? "", /barcode links the private custom food/i);
+  assert.match(scopedClient.getInstructions() ?? "", /call log_food directly once/i);
   assert.ok(createCustomFoodTool?.inputSchema?.properties?.portions);
   assert.equal(createCustomFoodTool?.inputSchema?.required?.includes("servingSize"), false, "servingSize remains optional when custom-food portions supply the preferred 1 g base serving");
   assert.ok(createCustomFoodTool?.inputSchema?.properties?.expectedExistingMatchCount);
@@ -159,7 +189,6 @@ try {
   assert.ok(createAndLogTool?.inputSchema?.properties?.expectedExistingMatchCount);
   assert.ok(logFoodTool?.inputSchema?.properties?.expectedExistingMatchCount);
   assert.ok(logFoodsTool?.inputSchema?.properties?.expectedExistingMatchCount);
-  assert.ok(deleteDiaryTool?.inputSchema?.properties?.deleteCount);
   const rejectedWrite = await scopedClient.callTool({
     name: "create_custom_food",
     arguments: {
@@ -274,9 +303,10 @@ try {
   const deletePlan = await multiDayClient.callTool({
     name: "delete_diary_food_entries",
     arguments: {
+      idempotencyKey: "test-delete-plan",
       confirmed: true,
       items: [
-        { date: "2026-07-16", meal: "Breakfast", name: "Banana", confirmName: "Banana", amount: 100, unit: "g" },
+        { date: "2026-07-16", meal: "Breakfast", name: "Banana", confirmName: "Banana", amount: 100, unit: "g", expectedExistingMatchCount: 1 },
         { date: "2026-07-17", meal: "Lunch", name: "Milk", confirmName: "Milk", amount: 200, unit: "g" },
       ],
     },
@@ -285,6 +315,27 @@ try {
   assert.equal(deletePlan.structuredContent?.data?.completed, true);
   assert.equal(multiDayProvider.deletes.length, 2);
   assert.equal(multiDayProvider.deletes[0].dryRun, false);
+  assert.equal(multiDayProvider.deletes[0].idempotencyKey, "test-delete-plan:item:0");
+  assert.equal(multiDayProvider.deletes[1].idempotencyKey, "test-delete-plan:item:1");
+  assert.equal(multiDayProvider.deletes[0].expectedExistingMatchCount, 1);
+
+  const todayInDeletePlanTimeZone = isoDateInTimeZone(process.env.CRONOMETER_TIME_ZONE?.trim() || "Asia/Jerusalem");
+  const overlappingDeletePlan = await multiDayClient.callTool({
+    name: "delete_diary_food_entries",
+    arguments: {
+      idempotencyKey: "overlapping-delete-plan",
+      confirmed: true,
+      items: [
+        { date: "today", meal: "Breakfast", name: "Orange Juice, Fresh", confirmName: "Orange Juice, Fresh", amount: 1, unit: "oz" },
+        { date: todayInDeletePlanTimeZone, meal: "Breakfast", name: "orange juice, fresh", confirmName: "orange juice, fresh", amount: 1, unit: "ounce" },
+      ],
+    },
+  });
+  assert.equal(overlappingDeletePlan.structuredContent?.status, "needs_manual_step");
+  assert.equal(overlappingDeletePlan.structuredContent?.data?.attemptedCount, 0);
+  assert.equal(overlappingDeletePlan.structuredContent?.data?.writeAttempted, false);
+  assert.deepEqual(overlappingDeletePlan.structuredContent?.data?.overlappingTargets, [{ indices: [0, 1] }]);
+  assert.equal(multiDayProvider.deletes.length, 2, "overlapping delete plans must make zero provider calls");
   await multiDayClient.close();
   await multiDayServer.close();
 
@@ -429,6 +480,369 @@ try {
   assert.equal(newProvider.created.length, 1);
   assert.equal(newProvider.updated.length, 0);
 
+  const legacyIdempotencyKey = "legacy-orange-juice";
+  const legacyBackgroundKey = `log_food:${createHash("sha256")
+    .update(JSON.stringify({ idempotencyKey: legacyIdempotencyKey }))
+    .digest("hex")
+    .slice(0, 24)}`;
+  writeFileSync(legacyOperationJournalFile, JSON.stringify({
+    version: 2,
+    operations: [{
+      id: "bg_legacy_false_written",
+      key: legacyBackgroundKey,
+      feature: "log_food",
+      status: "completed",
+      startedAt: 1,
+      updatedAt: 2,
+      input: { query: "fresh orange juice", date: "2026-07-18", meal: "Breakfast", amount: 272, unit: "g" },
+      result: {
+        provider: "browser",
+        mode: "browser",
+        feature: "log_food",
+        status: "written",
+        data: { writeAttempted: true },
+      },
+    }],
+  }), { mode: 0o600 });
+  const legacyProvider = new BrowserCronometerProvider({
+    localChromium: false,
+    writeEnabled: true,
+    requireFoodConfirmation: false,
+    navigationTimeoutMs: 1000,
+    loginBackoffMs: 1000,
+    operationJournalFile: legacyOperationJournalFile,
+    operationTimeoutMs: 1000,
+    browserRetryCount: 0,
+    timeZone: "Asia/Jerusalem",
+  });
+  const legacyOperation = await legacyProvider.getOperation("bg_legacy_false_written");
+  assert.equal(legacyOperation.status, "possibly_written_verify_failed");
+  assert.equal(legacyOperation.data.state, "indeterminate");
+  assert.match(legacyOperation.warning, /predates the persisted exact-date\/meal\/amount verifier/i);
+  const legacyReplay = await legacyProvider.logFood({
+    query: "fresh orange juice",
+    date: "2026-07-18",
+    meal: "Breakfast",
+    amount: 272,
+    unit: "g",
+    idempotencyKey: legacyIdempotencyKey,
+    confirmed: true,
+    waitForCompletionSeconds: 0,
+  });
+  assert.equal(legacyReplay.status, "possibly_written_verify_failed");
+  assert.equal(legacyReplay.data.operationId, "bg_legacy_false_written");
+  assert.equal(legacyReplay.data.retryable, false);
+  assert.equal(legacyReplay.data.nextAction, "inspect_diary");
+  const migratedLegacyJournal = JSON.parse(readFileSync(legacyOperationJournalFile, "utf8"));
+  assert.equal(migratedLegacyJournal.operations[0].status, "indeterminate");
+  assert.equal(migratedLegacyJournal.operations[0].result, undefined, "legacy optimistic success evidence must not survive migration");
+
+  const newestIdempotencyKey = "newest-operation-wins";
+  const newestBackgroundKey = `log_food:${createHash("sha256")
+    .update(JSON.stringify({ idempotencyKey: newestIdempotencyKey }))
+    .digest("hex")
+    .slice(0, 24)}`;
+  const unknownFailedIdempotencyKey = "unknown-failed-operation";
+  const unknownFailedBackgroundKey = `log_food:${createHash("sha256")
+    .update(JSON.stringify({ idempotencyKey: unknownFailedIdempotencyKey }))
+    .digest("hex")
+    .slice(0, 24)}`;
+  writeFileSync(failedOperationJournalFile, JSON.stringify({
+    version: 2,
+    operations: [
+      {
+        id: "bg_old_unknown_failure",
+        key: newestBackgroundKey,
+        feature: "log_food",
+        status: "failed",
+        startedAt: 1,
+        updatedAt: 2,
+        input: {},
+        error: "process exited unexpectedly",
+      },
+      {
+        id: "bg_new_verified_success",
+        key: newestBackgroundKey,
+        feature: "log_food",
+        status: "completed",
+        startedAt: 3,
+        updatedAt: 4,
+        input: {},
+        effectVerifierVersion: 2,
+        result: {
+          provider: "browser",
+          mode: "browser",
+          feature: "log_food",
+          status: "written",
+          data: { writeAttempted: true },
+        },
+      },
+      {
+        id: "bg_latest_unknown_failure",
+        key: unknownFailedBackgroundKey,
+        feature: "log_food",
+        status: "failed",
+        startedAt: 5,
+        updatedAt: 6,
+        input: {},
+        error: "unknown post-crash effect",
+      },
+    ],
+  }), { mode: 0o600 });
+  const failedJournalProvider = new BrowserCronometerProvider({
+    localChromium: false,
+    writeEnabled: true,
+    requireFoodConfirmation: false,
+    navigationTimeoutMs: 1000,
+    loginBackoffMs: 1000,
+    operationJournalFile: failedOperationJournalFile,
+    operationTimeoutMs: 1000,
+    browserRetryCount: 0,
+    timeZone: "Asia/Jerusalem",
+  });
+  const newestReplay = await failedJournalProvider.logFood({
+    query: "banana",
+    date: "2026-07-18",
+    meal: "Breakfast",
+    amount: 100,
+    unit: "g",
+    idempotencyKey: newestIdempotencyKey,
+    confirmed: true,
+    waitForCompletionSeconds: 0,
+  });
+  assert.equal(newestReplay.status, "written", "the newest same-key verified success must win over an older failed record");
+  assert.equal(newestReplay.data.operationId, "bg_new_verified_success");
+  assert.equal(newestReplay.data.returnedFromJournal, true);
+  const unknownFailureReplay = await failedJournalProvider.logFood({
+    query: "banana",
+    date: "2026-07-18",
+    meal: "Breakfast",
+    amount: 100,
+    unit: "g",
+    idempotencyKey: unknownFailedIdempotencyKey,
+    confirmed: true,
+    waitForCompletionSeconds: 0,
+  });
+  assert.equal(unknownFailureReplay.status, "possibly_written_verify_failed");
+  assert.equal(unknownFailureReplay.data.operationId, "bg_latest_unknown_failure");
+  assert.equal(unknownFailureReplay.data.nextAction, "inspect_diary");
+  const unknownFailurePoll = await failedJournalProvider.getOperation("bg_latest_unknown_failure");
+  assert.equal(unknownFailurePoll.status, "possibly_written_verify_failed");
+  assert.equal(unknownFailurePoll.data.state, "indeterminate");
+
+  const testBackgroundKey = (feature, payload) => `${feature}:${createHash("sha256")
+    .update(stableJson(payload))
+    .digest("hex")
+    .slice(0, 24)}`;
+  const deleteSemanticPayload = {
+    date: "2026-07-18",
+    meal: "Breakfast",
+    name: "journal orange juice",
+    amount: 272,
+    unit: "g",
+    deleteCount: 1,
+  };
+  const deleteSemanticKey = testBackgroundKey("delete_diary_food_entry", deleteSemanticPayload);
+  const explicitDeleteKeyA = "delete-intent-a";
+  writeFileSync(deleteOperationJournalFile, JSON.stringify({
+    version: 2,
+    operations: [
+      {
+        id: "bg_legacy_verified_delete",
+        key: deleteSemanticKey,
+        feature: "delete_diary_food_entry",
+        status: "completed",
+        startedAt: 10,
+        updatedAt: 11,
+        input: {},
+        canonicalPayload: stableJson(deleteSemanticPayload),
+        semanticKey: deleteSemanticKey,
+        effectVerifierVersion: 2,
+        result: {
+          provider: "browser",
+          mode: "browser",
+          feature: "delete_diary_food_entry",
+          status: "ok",
+          data: { deleted: true, writeAttempted: true },
+        },
+      },
+      {
+        id: "bg_explicit_verified_delete_a",
+        key: testBackgroundKey("delete_diary_food_entry", { idempotencyKey: explicitDeleteKeyA }),
+        feature: "delete_diary_food_entry",
+        status: "completed",
+        startedAt: 12,
+        updatedAt: 13,
+        input: {},
+        canonicalPayload: stableJson(deleteSemanticPayload),
+        callerIdempotencyKey: explicitDeleteKeyA,
+        semanticKey: deleteSemanticKey,
+        effectVerifierVersion: 2,
+        result: {
+          provider: "browser",
+          mode: "browser",
+          feature: "delete_diary_food_entry",
+          status: "ok",
+          data: { deleted: true, writeAttempted: true },
+        },
+      },
+    ],
+  }), { mode: 0o600 });
+  const deleteJournalProvider = new BrowserCronometerProvider({
+    localChromium: false,
+    writeEnabled: true,
+    requireFoodConfirmation: false,
+    navigationTimeoutMs: 1000,
+    loginBackoffMs: 1000,
+    operationJournalFile: deleteOperationJournalFile,
+    operationTimeoutMs: 1000,
+    browserRetryCount: 0,
+    timeZone: "Asia/Jerusalem",
+  });
+  const deleteIntent = {
+    date: "2026-07-18",
+    meal: "Breakfast",
+    name: "Journal Orange Juice",
+    amount: 272,
+    unit: "g",
+    deleteCount: 1,
+    confirmName: "Journal Orange Juice",
+    confirmed: true,
+    dryRun: false,
+    waitForCompletionSeconds: 0,
+  };
+  const legacyDeleteReplay = await deleteJournalProvider.deleteDiaryFoodEntry(deleteIntent);
+  assert.equal(legacyDeleteReplay.status, "needs_manual_step", "legacy derived delete keys must never replay stale ok as current evidence");
+  assert.equal(legacyDeleteReplay.data.operationId, "bg_legacy_verified_delete");
+  assert.equal(legacyDeleteReplay.data.writeAttempted, false);
+  assert.equal(legacyDeleteReplay.data.nextAction, "use_new_idempotency_key");
+  const explicitDeleteReplay = await deleteJournalProvider.deleteDiaryFoodEntry({ ...deleteIntent, idempotencyKey: explicitDeleteKeyA });
+  assert.equal(explicitDeleteReplay.status, "ok", "the same explicit deletion intent key must replay its verified terminal result");
+  assert.equal(explicitDeleteReplay.data.operationId, "bg_explicit_verified_delete_a");
+  assert.equal(explicitDeleteReplay.data.returnedFromJournal, true);
+  const newDeleteIntent = await deleteJournalProvider.deleteDiaryFoodEntry({ ...deleteIntent, idempotencyKey: "delete-intent-b" });
+  assert.equal(newDeleteIntent.status, "accepted", "a distinct key for a new approved deletion intent must not return the old ok result");
+  assert.notEqual(newDeleteIntent.data.operationId, "bg_explicit_verified_delete_a");
+
+  const unresolvedDeleteSemanticPayload = {
+    ...deleteSemanticPayload,
+    name: "unresolved delete food",
+  };
+  const unresolvedDeleteSemanticKey = testBackgroundKey("delete_diary_food_entry", unresolvedDeleteSemanticPayload);
+  writeFileSync(unresolvedDeleteOperationJournalFile, JSON.stringify({
+    version: 2,
+    operations: [{
+      id: "bg_unresolved_delete",
+      key: testBackgroundKey("delete_diary_food_entry", { idempotencyKey: "unresolved-delete-a" }),
+      feature: "delete_diary_food_entry",
+      status: "indeterminate",
+      startedAt: 20,
+      updatedAt: 21,
+      input: {},
+      canonicalPayload: stableJson(unresolvedDeleteSemanticPayload),
+      callerIdempotencyKey: "unresolved-delete-a",
+      semanticKey: unresolvedDeleteSemanticKey,
+      effectVerifierVersion: 2,
+      error: "process restarted after a possible Delete confirmation",
+    }],
+  }), { mode: 0o600 });
+  const unresolvedDeleteProvider = new BrowserCronometerProvider({
+    localChromium: false,
+    writeEnabled: true,
+    requireFoodConfirmation: false,
+    navigationTimeoutMs: 1000,
+    loginBackoffMs: 1000,
+    operationJournalFile: unresolvedDeleteOperationJournalFile,
+    operationTimeoutMs: 1000,
+    browserRetryCount: 0,
+    timeZone: "Asia/Jerusalem",
+  });
+  const unresolvedDeleteIntent = {
+    ...deleteIntent,
+    name: "Unresolved Delete Food",
+    confirmName: "Unresolved Delete Food",
+  };
+  const unsafeDeleteSupersession = await unresolvedDeleteProvider.deleteDiaryFoodEntry({
+    ...unresolvedDeleteIntent,
+    idempotencyKey: "unresolved-delete-b",
+  });
+  assert.equal(unsafeDeleteSupersession.status, "possibly_written_verify_failed");
+  assert.equal(unsafeDeleteSupersession.data.operationId, "bg_unresolved_delete");
+  const baselineGuardedDeleteSupersession = await unresolvedDeleteProvider.deleteDiaryFoodEntry({
+    ...unresolvedDeleteIntent,
+    idempotencyKey: "unresolved-delete-c",
+    expectedExistingMatchCount: 1,
+  });
+  assert.equal(baselineGuardedDeleteSupersession.status, "accepted", "a new key plus a fresh baseline may supersede an unresolved delete");
+
+  const recentBase = Date.now();
+  const safelyTerminalHistory = Array.from({ length: 120 }, (_, index) => ({
+    id: `bg_safe_terminal_${String(index).padStart(3, "0")}`,
+    key: `safe:${index}`,
+    feature: "log_food",
+    status: "completed",
+    startedAt: recentBase + index,
+    updatedAt: recentBase + index,
+    input: {},
+    effectVerifierVersion: 2,
+    result: {
+      provider: "browser",
+      mode: "browser",
+      feature: "log_food",
+      status: "needs_manual_step",
+      data: { writeAttempted: false },
+    },
+  }));
+  writeFileSync(retentionOperationJournalFile, JSON.stringify({
+    version: 2,
+    operations: [
+      {
+        id: "bg_old_unresolved_failed",
+        key: "old-unresolved-failed",
+        feature: "log_food",
+        status: "failed",
+        startedAt: 1,
+        updatedAt: 1,
+        input: {},
+        error: "unknown effect",
+      },
+      {
+        id: "bg_old_unresolved_completed",
+        key: "old-unresolved-completed",
+        feature: "log_food",
+        status: "completed",
+        startedAt: 2,
+        updatedAt: 2,
+        input: {},
+        effectVerifierVersion: 2,
+        result: {
+          provider: "browser",
+          mode: "browser",
+          feature: "log_food",
+          status: "possibly_written_verify_failed",
+          data: { writeAttempted: true },
+        },
+      },
+      ...safelyTerminalHistory,
+    ],
+  }), { mode: 0o600 });
+  new BrowserCronometerProvider({
+    localChromium: false,
+    writeEnabled: true,
+    requireFoodConfirmation: false,
+    navigationTimeoutMs: 1000,
+    loginBackoffMs: 1000,
+    operationJournalFile: retentionOperationJournalFile,
+    operationTimeoutMs: 1000,
+    browserRetryCount: 0,
+    timeZone: "Asia/Jerusalem",
+  });
+  const retainedJournal = JSON.parse(readFileSync(retentionOperationJournalFile, "utf8"));
+  const retainedIds = new Set(retainedJournal.operations.map((operation) => operation.id));
+  assert.equal(retainedJournal.operations.length, 102, "only safely terminal history is capped; unresolved effects are retained in addition");
+  assert.equal(retainedIds.has("bg_old_unresolved_failed"), true);
+  assert.equal(retainedIds.has("bg_old_unresolved_completed"), true);
+
   const provider = new BrowserCronometerProvider({
     email: "test@example.com",
     password: "secret",
@@ -550,7 +964,97 @@ try {
   assert.equal(dryRunResponse.structuredContent.ok, false);
   assert.equal(dryRunResponse.structuredContent.completed, false);
   assert.equal(dryRunResponse.structuredContent.intentSatisfied, false);
+  assert.equal(dryRunResponse.structuredContent.state, "succeeded");
+  assert.equal(dryRunResponse.structuredContent.retryable, false);
+  assert.equal(dryRunResponse.structuredContent.nextAction, "none");
+  assert.match(dryRunResponse.content[0].text, /completed a preview/i);
   assert.match(acceptedResponse.content[0].text, /not complete/i);
+
+  assert.deepEqual(MCP_OPERATION_STATE_VALUES, ["pending", "running", "succeeded", "failed", "indeterminate"]);
+  assert.deepEqual(MCP_NEXT_ACTION_VALUES, [
+    "none",
+    "poll",
+    "poll_operation",
+    "inspect_diary",
+    "retry_with_same_key",
+    "manual_resolution",
+    "repair_operation_journal",
+    "use_new_idempotency_key",
+  ]);
+  const unresolvedOperationResponse = toMcpToolResponse({
+    provider: "browser",
+    mode: "browser",
+    feature: "log_food",
+    status: "possibly_written_verify_failed",
+    data: { state: "completed", retryable: true, nextAction: "poll_operation", operationId: "bg_prior" },
+  });
+  assert.equal(unresolvedOperationResponse.structuredContent.state, "indeterminate");
+  assert.equal(unresolvedOperationResponse.structuredContent.retryable, false);
+  assert.equal(unresolvedOperationResponse.structuredContent.nextAction, "poll_operation");
+  const journalFailureResponse = toMcpToolResponse({
+    provider: "browser",
+    mode: "browser",
+    feature: "log_food",
+    status: "error",
+    data: { nextAction: "repair_operation_journal" },
+  });
+  assert.equal(journalFailureResponse.structuredContent.nextAction, "repair_operation_journal");
+  const invalidMetadataResponse = toMcpToolResponse({
+    provider: "browser",
+    mode: "browser",
+    feature: "log_food",
+    status: "error",
+    data: { state: "completed", retryable: "yes", nextAction: "invent_action", operationId: 123 },
+  });
+  assert.equal(invalidMetadataResponse.structuredContent.state, "failed");
+  assert.equal(invalidMetadataResponse.structuredContent.retryable, false);
+  assert.equal(invalidMetadataResponse.structuredContent.nextAction, "manual_resolution");
+  assert.equal(invalidMetadataResponse.structuredContent.operationId, undefined);
+  const redactedErrorResponse = toMcpToolResponse({
+    provider: "browser",
+    mode: "browser",
+    feature: "search_foods",
+    status: "error",
+    warning: "connect wss://agent:super-secret@example.test/session?token=abc123 failed \u001b[31mnow\u001b[0m",
+    data: { endpoint: "https://user:pass@example.test/path?api_key=secret-value" },
+  });
+  assert.equal(redactedErrorResponse.structuredContent.warning.includes("super-secret"), false);
+  assert.equal(redactedErrorResponse.structuredContent.warning.includes("abc123"), false);
+  assert.equal(redactedErrorResponse.content[0].text.includes("\u001b["), false);
+  assert.equal(redactedErrorResponse.structuredContent.data.endpoint.includes("pass"), false);
+  assert.equal(redactedErrorResponse.structuredContent.data.endpoint.includes("secret-value"), false);
+  const busyResponse = toMcpToolResponse({
+    provider: "browser",
+    mode: "browser",
+    feature: "search_foods",
+    status: "busy",
+  });
+  assert.equal(busyResponse.structuredContent.state, "pending");
+  assert.equal(busyResponse.structuredContent.retryable, true);
+  assert.equal(busyResponse.structuredContent.nextAction, "retry_with_same_key");
+
+  const mockProvider = new MockCronometerProvider({
+    timeZone: "Asia/Jerusalem",
+    clock: () => new Date("2026-07-18T12:00:00.000Z"),
+  });
+  const mockReadResult = await mockProvider.getDailySummary({ date: "2026-07-18" });
+  assert.equal(mockReadResult.status, "ok");
+  assert.equal(mockReadResult.source, "mock-fixture");
+  const mockReadResponse = toMcpToolResponse(mockReadResult);
+  assert.equal(mockReadResponse.structuredContent.ok, true);
+  assert.equal(mockReadResponse.structuredContent.completed, true);
+  assert.equal(mockReadResponse.structuredContent.state, "succeeded");
+  const mockStabilityResult = await mockProvider.stabilityCheck({ includeFoodSearch: true });
+  assert.equal(mockStabilityResult.status, "ok");
+  assert.equal(mockStabilityResult.source, "mock-fixture");
+  const mockResolutionResult = await mockProvider.resolveRecipeIngredients({
+    recipeName: "Fixture recipe",
+    ingredients: [{ query: "banana", amount: 100, unit: "g" }],
+  });
+  assert.equal(mockResolutionResult.status, "ok");
+  assert.equal(mockResolutionResult.source, "mock-fixture");
+  const mockWriteResult = await mockProvider.logFood({ query: "banana", meal: "Breakfast", amount: 100, unit: "g" });
+  assert.equal(mockWriteResult.status, "dry_run");
   const ambiguousResponse = toMcpToolResponse({
     provider: "browser",
     mode: "browser",
@@ -641,6 +1145,47 @@ try {
   releaseResetFirst();
   assert.equal(await resetFirst, "reset-first");
   await assert.rejects(resetQueued, /queue was reset/);
+
+  __resetBrowserQueueForTests();
+  let releaseDeadlineBlocker;
+  let signalDeadlineBlockerStarted;
+  const deadlineBlockerStarted = new Promise((resolve) => { signalDeadlineBlockerStarted = resolve; });
+  const deadlineBlockerCanFinish = new Promise((resolve) => { releaseDeadlineBlocker = resolve; });
+  const deadlineBlocker = __runBrowserQueueJobForTests("deadline-blocker", async () => {
+    signalDeadlineBlockerStarted();
+    await deadlineBlockerCanFinish;
+  });
+  await deadlineBlockerStarted;
+  const deadlineProvider = new BrowserCronometerProvider({
+    localChromium: true,
+    writeEnabled: false,
+    requireFoodConfirmation: false,
+    navigationTimeoutMs: 100,
+    loginBackoffMs: 100,
+    operationTimeoutMs: 150,
+    browserRetryCount: 0,
+    timeZone: "Asia/Jerusalem",
+  });
+  deadlineProvider.newSession = async () => ({
+    context: { storageState: async () => ({ cookies: [], origins: [] }) },
+    page: {},
+    closeContext: false,
+    closeBrowser: false,
+  });
+  deadlineProvider.currentLoginBackoff = () => ({ until: 0, reason: undefined, source: "test" });
+  const queuedDeadlineStartedAt = Date.now();
+  const queuedDeadlineResultPromise = deadlineProvider.withPage("log_food", async () => {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return { provider: "browser", mode: "browser", feature: "log_food", status: "ok" };
+  });
+  setTimeout(() => releaseDeadlineBlocker(), 100);
+  const queuedDeadlineResult = await queuedDeadlineResultPromise;
+  const queuedDeadlineElapsedMs = Date.now() - queuedDeadlineStartedAt;
+  await deadlineBlocker;
+  assert.equal(queuedDeadlineResult.status, "error");
+  assert.match(queuedDeadlineResult.warning, /shared 150ms browser-operation deadline/i);
+  assert.ok(queuedDeadlineElapsedMs < 230, `queue wait and handler must share 150ms, elapsed=${queuedDeadlineElapsedMs}`);
+  __resetBrowserQueueForTests();
 
   console.log("runtime safety checks passed");
 } finally {

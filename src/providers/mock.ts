@@ -17,9 +17,11 @@ import type {
   RecipeDeleteInput,
   RecipeInput,
   RecipeRetireInput,
+  ResolveRecipeIngredientsInput,
   RecipeUpdateInput,
   RepeatItemInput,
   SearchFoodsInput,
+  StabilityCheckInput,
   TargetsInput,
 } from "../domain.js";
 import { isoDateInTimeZone, systemClock, type Clock } from "../determinism.js";
@@ -40,9 +42,18 @@ export class MockCronometerProvider extends BaseCronometerProvider {
     this.timeZone = config.timeZone ?? "UTC";
   }
 
+  async stabilityCheck(input: StabilityCheckInput) {
+    return this.fixtureRead("cronometer_stability_check", {
+      input,
+      provider: this.name,
+      mode: this.mode,
+      ready: true,
+    });
+  }
+
   async getDailySummary(input: DateRangeInput) {
     const date = this.requestedDate(input);
-    return this.result("get_daily_summary", "dry_run", {
+    return this.fixtureRead("get_daily_summary", {
       date,
       calories: { consumed: 2140, burned: 640, net: 1500 },
       macros: { protein_g: 142, carbs_g: 188, fat_g: 72 },
@@ -55,7 +66,7 @@ export class MockCronometerProvider extends BaseCronometerProvider {
 
   async listFoodEntries(input: DateRangeInput) {
     const date = this.requestedDate(input);
-    return this.result("list_food_entries", "dry_run", {
+    return this.fixtureRead("list_food_entries", {
       date,
       entries: [
         { id: "sample-food-1", meal: "Breakfast", name: "Greek yogurt", calories: 190, protein_g: 20 },
@@ -66,7 +77,7 @@ export class MockCronometerProvider extends BaseCronometerProvider {
 
   async listBiometrics(input: DateRangeInput) {
     const date = this.requestedDate(input);
-    return this.result("list_biometrics", "dry_run", {
+    return this.fixtureRead("list_biometrics", {
       date,
       entries: [{ id: "sample-bio-1", metric: "Weight", value: 78.4, unit: "kg" }],
     });
@@ -74,7 +85,7 @@ export class MockCronometerProvider extends BaseCronometerProvider {
 
   async listExercises(input: DateRangeInput) {
     const date = this.requestedDate(input);
-    return this.result("list_exercises", "dry_run", {
+    return this.fixtureRead("list_exercises", {
       date,
       entries: [{ id: "sample-exercise-1", name: "Walking", minutes: 45, calories: 210 }],
     });
@@ -82,14 +93,14 @@ export class MockCronometerProvider extends BaseCronometerProvider {
 
   async listNotes(input: DateRangeInput) {
     const date = this.requestedDate(input);
-    return this.result("list_notes", "dry_run", {
+    return this.fixtureRead("list_notes", {
       date,
       entries: [{ id: "sample-note-1", note: "Energy felt steady after lunch." }],
     });
   }
 
   async searchFoods(input: SearchFoodsInput) {
-    return this.result("search_foods", "dry_run", {
+    return this.fixtureRead("search_foods", {
       query: input.query,
       searchScope: input.searchScope ?? "auto",
       selectedSource: input.selectedSource,
@@ -98,6 +109,15 @@ export class MockCronometerProvider extends BaseCronometerProvider {
         { id: "sample-result-2", name: `${input.query} - branded`, source: "mock" },
       ].slice(0, input.limit ?? 10),
     });
+  }
+
+  async resolveRecipeIngredients(input: ResolveRecipeIngredientsInput) {
+    const result = await super.resolveRecipeIngredients(input);
+    return {
+      ...result,
+      status: "ok" as const,
+      source: "mock-fixture",
+    };
   }
 
   async logFood(input: FoodLogInput) {
@@ -121,7 +141,7 @@ export class MockCronometerProvider extends BaseCronometerProvider {
   }
 
   async listCustomFoods(input: CustomFoodListInput) {
-    return this.result("list_custom_foods", "dry_run", {
+    return this.fixtureRead("list_custom_foods", {
       input,
       foods: [
         {
@@ -135,7 +155,7 @@ export class MockCronometerProvider extends BaseCronometerProvider {
   }
 
   async findDuplicateCustomFoods(input: CustomFoodDuplicateInput) {
-    return this.result("find_duplicate_custom_foods", "dry_run", {
+    return this.fixtureRead("find_duplicate_custom_foods", {
       input,
       matches: [],
       duplicateGroups: [],
@@ -163,7 +183,7 @@ export class MockCronometerProvider extends BaseCronometerProvider {
   }
 
   async listCustomRecipes(input: CustomFoodListInput) {
-    return this.result("list_custom_recipes", "dry_run", {
+    return this.fixtureRead("list_custom_recipes", {
       input,
       recipes: [{ recipeId: "sample-custom-recipe-1", name: "Protein cookie" }],
     });
@@ -186,7 +206,7 @@ export class MockCronometerProvider extends BaseCronometerProvider {
   }
 
   async getTargets(input: DateRangeInput) {
-    return this.result("get_targets", "dry_run", {
+    return this.fixtureRead("get_targets", {
       date: this.requestedDate(input),
       targets: { calories: 2300, protein_g: 150, carbs_g: 230, fat_g: 75 },
     });
@@ -222,6 +242,10 @@ export class MockCronometerProvider extends BaseCronometerProvider {
       { input },
       "Mock backend did not write to Cronometer. Configure Terra or browser automation for real data.",
     );
+  }
+
+  private fixtureRead<T>(feature: string, data: T) {
+    return this.result(feature, "ok", data, undefined, "mock-fixture");
   }
 
   private requestedDate(input: DateRangeInput) {

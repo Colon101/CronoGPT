@@ -5,6 +5,8 @@ services:
       dockerfile: Dockerfile
     image: cronogpt:oracle
     restart: unless-stopped
+    init: true
+    stop_grace_period: 4m
     env_file:
       - /opt/cronogpt/config/oracle.env
       - /opt/cronogpt/secrets/cronogpt.env
@@ -24,10 +26,16 @@ services:
     shm_size: "1gb"
     volumes:
       - /opt/cronogpt/state:/opt/cronogpt/state
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   caddy:
     image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
     restart: unless-stopped
+    stop_grace_period: 30s
     depends_on:
       app:
         condition: service_healthy
@@ -40,6 +48,11 @@ services:
       - /opt/cronogpt/app/deploy/oracle/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   caddy_data:

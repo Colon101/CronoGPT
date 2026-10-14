@@ -156,11 +156,25 @@ EOF_REMOTE_HEALTH
 
 if [[ "${ORACLE_SKIP_SMOKE:-false}" != "true" ]]; then
   CRONOGPT_SMOKE_URL="https://${ORACLE_DOMAIN}/mcp" \
+    CRONOGPT_LINK_SECRET="$LINK_SECRET" \
+    npm run smoke:oauth:production
+
+  CRONOGPT_SMOKE_URL="https://${ORACLE_DOMAIN}/mcp" \
     CRONOGPT_API_TOKEN="$API_TOKEN" \
     CRONOGPT_SMOKE_RECIPE_NAME="${CRONOGPT_SMOKE_RECIPE_NAME:-}" \
     CRONOGPT_SMOKE_RECIPE_INGREDIENT_COUNT="${CRONOGPT_SMOKE_RECIPE_INGREDIENT_COUNT:-}" \
     npm run smoke:production
 fi
+
+ssh "${SSH_ARGS[@]}" "$SSH_TARGET" "bash -s" <<'EOF_REMOTE_CLEANUP'
+set -u
+if ! sudo docker image prune --force --filter "until=168h" >/dev/null; then
+  echo "Warning: old dangling image cleanup failed; deployment remains healthy." >&2
+fi
+if ! sudo docker builder prune --force --filter "until=168h" --keep-storage "2GB" >/dev/null; then
+  echo "Warning: old build-cache cleanup failed; deployment remains healthy." >&2
+fi
+EOF_REMOTE_CLEANUP
 
 echo "Deployed cronogpt to https://${ORACLE_DOMAIN}/mcp"
 echo "Use the CRONOGPT_API_TOKEN and CRONOGPT_LINK_SECRET values from the remote secret file; they were not printed."
