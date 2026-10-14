@@ -36,7 +36,7 @@ import {
 } from "./oauth.js";
 
 export const MCP_PATH = "/mcp";
-export const MCP_SERVER_VERSION = "0.1.24";
+export const MCP_SERVER_VERSION = "0.1.25";
 export const WIDGET_URI = `ui://widget/cronometer-dashboard-v${MCP_SERVER_VERSION}.html`;
 
 const widgetHtml = readFileSync(new URL("../public/cronometer-widget.html", import.meta.url), "utf8")
@@ -199,6 +199,7 @@ const appCallableReadTools = new Set<string>(APP_CALLABLE_READ_TOOLS);
 const MCP_SERVER_INSTRUCTIONS = [
   "For a clear single-food request, call log_food directly once with the user's date, meal, query, amount, and unit. Do not call search_foods, list_food_entries, or a dry-run first: CronoGPT owns the fresh diary baseline, unique high-confidence food selection, idempotency, write, reload, and persisted verification. Use search_foods only after log_food reports ambiguity or not-found.",
   "Choose exactly one diary-write shape: log_food for one food; log_foods for multiple foods that all share one date and one meal; log_food_plan only when the request spans dates or meal sections. Never split one intent across overlapping write tools.",
+  "When a verified food write returns mealNutrition, use those Cronometer diary meal totals for the reply without additional searches or daily-summary calls. They include existing foods in that meal and are rounded by Cronometer. Do not substitute daily totals or guessed macros for meal totals. list_food_entries also returns these saved meal headers when visible.",
   "Use create_and_log_custom_food as the preferred single-step workflow when a packaged food is missing from Cronometer and the user wants it logged.",
   "After not_written_not_found, use ChatGPT web search or the user's package label to obtain that exact product's nutrition, then call create_and_log_custom_food with the same date, meal and amount. Include nutritionSource; do not invent missing nutrients or substitute a different product. Ask for a label only when reliable product facts cannot be found.",
   "Use ensure_private_recipe for every private-recipe write. Unconfirmed calls preview without opening Cronometer; confirmed calls compare full recipe contents and safely repair an incomplete same-named recipe when possible.",

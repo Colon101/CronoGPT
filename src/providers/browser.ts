@@ -123,6 +123,16 @@ interface DiaryFoodEntryMatch {
   entryText: string;
 }
 
+interface DiaryMealNutrition {
+  meal: string;
+  energyKcal: number;
+  proteinG: number;
+  carbsG: number;
+  fatG: number;
+  rounded: true;
+  source: "persisted_diary_meal_header";
+}
+
 interface FoodSearchOutcome {
   results: SearchResult[];
   dateStatus: DiaryDateStatus;
@@ -657,6 +667,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
           date,
           dateStatus,
           mealSections: diary.mealSections,
+          mealNutrition: "mealNutrition" in diary ? diary.mealNutrition : undefined,
           entries: diary.entries.map((entry) => ({ date, ...entry })),
           structureVerified,
           snapshot: structureVerified ? undefined : snapshot,
@@ -675,6 +686,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         count: entries.length,
         dayCount: days.length,
         mealSections: single?.mealSections,
+        mealNutrition: single?.mealNutrition,
         entries,
         days,
         structureVerified: complete,
@@ -1024,6 +1036,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       writeAttempted: itemResults.some((item) => item.writeAttempted === true),
       counts,
       items: itemResults,
+      mealNutrition: completed ? itemResults.at(-1)?.mealNutrition : undefined,
       retry: status === "written"
         ? "No retry needed; every batch item was written or already existed."
         : "Do not blindly retry the full batch. Inspect items and retry only entries that are not written, not already_exists, and not possibly_written_verify_failed.",
@@ -1504,6 +1517,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       preCommitDateStatus: dateStatus,
       persistedStructureVerified,
       persistedSnapshot,
+      mealNutrition: countVerified ? persistedSnapshot?.diary.mealNutrition?.find((meal) => meal.meal === normalized.meal) : undefined,
       selection,
       unitFill,
       amountFill,
@@ -5446,6 +5460,7 @@ function summarizeBatchFoodLogResult(index: number, normalized: NormalizedFoodLo
     queryUsed: stringValue(data.queryUsed),
     writeAttempted: data.writeAttempted === true,
     verification: data.verification,
+    mealNutrition: data.mealNutrition,
     selection: result.status === "not_written_ambiguous" ? data.selection : undefined,
     nextStep: stringValue(data.nextStep),
     retry: data.retry,
@@ -5912,7 +5927,7 @@ async function deleteConfirmationVisible(page: Page) {
   return /Delete Items\?\s*Delete the selected entries\?/i.test(text);
 }
 
-async function extractDiaryFoodEntries(page: Page): Promise<{ mealSections: string[]; entries: DiaryFoodEntry[] }> {
+async function extractDiaryFoodEntries(page: Page): Promise<{ mealSections: string[]; entries: DiaryFoodEntry[]; mealNutrition?: DiaryMealNutrition[] }> {
   return page.evaluate((knownMeals) => {
     const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
     const numberValue = (value: string | null | undefined) => {
@@ -5927,6 +5942,7 @@ async function extractDiaryFoodEntries(page: Page): Promise<{ mealSections: stri
     const mealSet = new Set(knownMeals.map((meal) => meal.toLowerCase()));
     const mealSections: string[] = [];
     const entries: DiaryFoodEntry[] = [];
+    const mealNutrition: DiaryMealNutrition[] = [];
     let currentMeal: string | undefined;
     let currentTable: Element | null = null;
 
@@ -5951,6 +5967,20 @@ async function extractDiaryFoodEntries(page: Page): Promise<{ mealSections: stri
           ? knownMeals.find((meal) => meal.toLowerCase() === title.toLowerCase())
           : undefined;
         if (currentMeal && !mealSections.includes(currentMeal)) mealSections.push(currentMeal);
+        if (currentMeal) {
+          const header = normalize((row as HTMLElement).innerText);
+          const metric = (pattern: RegExp) => {
+            const match = header.match(pattern);
+            return match ? Number(match[1].replace(/,/g, "")) : undefined;
+          };
+          const energyKcal = metric(/([\d,.]+)\s*kcal\b/i);
+          const proteinG = metric(/([\d,.]+)\s*g\s*protein\b/i);
+          const carbsG = metric(/([\d,.]+)\s*g\s*(?:net\s*)?carbs\b/i);
+          const fatG = metric(/([\d,.]+)\s*g\s*fat\b/i);
+          if ([energyKcal, proteinG, carbsG, fatG].every((value) => value !== undefined && Number.isFinite(value) && value >= 0)) {
+            mealNutrition.push({ meal: currentMeal, energyKcal: energyKcal!, proteinG: proteinG!, carbsG: carbsG!, fatG: fatG!, rounded: true, source: "persisted_diary_meal_header" });
+          }
+        }
         continue;
       }
       if (!currentMeal) continue;
@@ -5971,7 +6001,7 @@ async function extractDiaryFoodEntries(page: Page): Promise<{ mealSections: stri
       });
     }
 
-    return { mealSections, entries };
+    return { mealSections, entries, mealNutrition };
   }, [...FOOD_LOG_MEALS]);
 }
 
@@ -5994,7 +6024,7 @@ async function waitForStableDiaryFoodEntries(
     diary = await extractDiaryFoodEntries(page).catch(() => ({ mealSections: [], entries: [] }));
     const exactDate = diaryDateLabelMatches(displayedDateLabel, expectedDate, currentDate);
     const completeStructure = FOOD_LOG_MEALS.every((meal) => diary.mealSections.includes(meal));
-    const key = JSON.stringify({ displayedDateLabel, mealSections: diary.mealSections, entries: diary.entries });
+    const key = JSON.stringify({ displayedDateLabel, mealSections: diary.mealSections, entries: diary.entries, mealNutrition: diary.mealNutrition });
 
     if (exactDate && completeStructure && key === lastKey) {
       identicalSamples += 1;

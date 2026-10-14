@@ -788,6 +788,28 @@ try {
     assert.equal(exactPersisted.result.countDelta.actualDelta, 1);
     assert.equal(exactPersisted.result.countVerified, true);
   });
+
+  // A meal header is authoritative rounded nutrition for that meal, even
+  // when another meal makes the whole day's totals different.
+  const withMealHeader = (meal, header, rows) => mealSection(meal, rows)
+    .replace(`>${meal}</td>`, `>${meal}</td><td>${header}</td>`);
+  await page.setContent(`
+    <style>button,table,tr,td{display:block;width:280px;min-height:24px}</style>
+    <nav>Dashboard Diary Trends Foods</nav><div class="diary-date-btn">Today</div>
+    ${withMealHeader("Breakfast", "422 kcal • 13 g protein • 81 g carbs • 6 g fat", foodRow("Cocoa Pebbles",82))}
+    ${withMealHeader("Lunch", "236 kcal • 3 g protein • 26 g carbs • 13 g fat", foodRow("Kif Kaf",45))}
+    ${mealSection("Dinner")}${mealSection("Snacks")}${mealSection("Supplements")}
+    <div role="dialog">${withMealHeader("Breakfast", "999 kcal • 99 g protein • 99 g carbs • 99 g fat", foodRow("Draft",1))}</div>
+  `);
+  const mealRead = await providerForFixture(page).listFoodEntries({date:today});
+  checkFixture("saved meal macros exclude other meals and draft dialogs", () => {
+    assert.equal(mealRead.status,"ok");
+    assert.deepEqual(mealRead.data.mealNutrition, [
+      {meal:"Breakfast",energyKcal:422,proteinG:13,carbsG:81,fatG:6,rounded:true,source:"persisted_diary_meal_header"},
+      {meal:"Lunch",energyKcal:236,proteinG:3,carbsG:26,fatG:13,rounded:true,source:"persisted_diary_meal_header"},
+    ]);
+    assert.equal(mealRead.data.entries.length,2);
+  });
 } finally {
   await browser.close();
 }
