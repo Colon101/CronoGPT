@@ -7,6 +7,7 @@ import {
   __collectFoodSearchResultsForTests,
   __exerciseFoodEditorSafetyForTests,
   __fillFoodAmountForTests,
+  __fillRecipeCookedWeightForTests,
   __readFoodEditorIdentityForTests,
   __searchCurrentFoodDialogForTests,
   chooseFoodLogResult,
@@ -181,6 +182,41 @@ try {
   const wrongSourceIdentity = await __readFoodEditorIdentityForTests(page, "#identity", "Banana", "CRDB");
   assert.equal(matchingIdentity.matches, true);
   assert.equal(wrongSourceIdentity.matches, false, "a visible different source must fail the editor identity gate");
+
+  // Cronometer exposes cooked weight behind Advanced Info and an unlabelled
+  // gram-only modal. Original weight must not mask the saved cooked weight.
+  await page.setContent(`
+    <style>input,button,.row{display:block;width:240px;min-height:24px}.pretty-dialog{display:none}</style>
+    <input class="text-box" value="Recipe fixture">
+    <input class="text-box" value="bowl"><input class="number-box" value="1">
+    <button id="advanced" aria-expanded="false">Advanced Info</button>
+    <div id="advanced-fields" hidden>
+      <div>Original Recipe Weight 239 g</div>
+      <div class="row"><div>Cooked Recipe Weight</div><button id="set-weight">Set Cooked Recipe Weight</button></div>
+    </div>
+    <div class="pretty-dialog"><div>Set Cooked Weight</div><div>Cooked Weight</div>
+      <input id="weight" class="text-box"><div>g</div><button id="save-weight">Save</button>
+    </div>
+    <script>
+      (()=>{
+      const advanced=document.querySelector('#advanced'), fields=document.querySelector('#advanced-fields');
+      const dialog=document.querySelector('.pretty-dialog'), input=document.querySelector('#weight');
+      const button=document.querySelector('#set-weight');
+      let typed=false, blurred=false;
+      advanced.onclick=()=>{fields.hidden=false;advanced.setAttribute('aria-expanded','true')};
+      button.onclick=()=>{dialog.style.display='block'};
+      input.onkeydown=()=>typed=true; input.onblur=()=>blurred=true;
+      document.querySelector('#save-weight').onclick=()=>{
+        if(typed&&blurred){button.textContent=input.value+' g';dialog.style.display='none'}
+      };
+      })();
+    </script>
+  `);
+  assert.equal(await __fillRecipeCookedWeightForTests(page, 0.321, "kg"), true);
+  assert.equal(await page.locator('#set-weight').innerText(), "321 g");
+  assert.equal(await __fillRecipeCookedWeightForTests(page, 0.3, "kg"), true, "the existing weight button must remain editable");
+  assert.equal(await page.locator('#set-weight').innerText(), "300 g");
+  assert.equal(await __fillRecipeCookedWeightForTests(page, 321, "cups"), false, "unknown weight units must not be silently treated as grams");
 } finally {
   await browser.close();
 }

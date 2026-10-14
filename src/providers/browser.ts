@@ -2694,9 +2694,12 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
       await page.waitForTimeout(450);
       trace("fill_basics_start");
-      const basics = await fillRecipeBasics(page, input);
+      // Cronometer cannot set cooked weight on an ingredient-free draft.
+      // Fill and verify that field only after all ingredients are present.
+      const initialBasicsInput = { ...input, cookedWeight: undefined, cookedWeightUnit: undefined };
+      const basics = await fillRecipeBasics(page, initialBasicsInput);
       trace("fill_basics_done", basics);
-      if (!recipeBasicsVerified(basics, input)) {
+      if (!recipeBasicsVerified(basics, initialBasicsInput)) {
         return this.result("create_recipe", "needs_manual_step", {
           recipeName: input.name,
           basics,
@@ -9448,7 +9451,8 @@ async function extractCustomRecipeDetail(page: Page): Promise<CustomRecipeDetail
     return match ? Number(match[0]) : undefined;
   };
   const parsedIngredients = parseCustomRecipeIngredientTables(snapshot.tables);
-  const cookedWeightMatch = snapshot.bodyText.match(/(?:Cooked|Final|Total|Recipe)\s+Weight\s*:?[ ]*([0-9]+(?:\.[0-9]+)?)\s*(g|kg|oz|lb)?/i);
+  const cookedWeightMatch = snapshot.bodyText.match(/(?:Cooked(?:\s+Recipe)?|Final|Total)\s+Weight\s*:?[ ]*([0-9]+(?:\.[0-9]+)?)\s*(g|kg|oz|lb)?/i)
+    ?? snapshot.bodyText.match(/Recipe\s+Weight\s*:?[ ]*([0-9]+(?:\.[0-9]+)?)\s*(g|kg|oz|lb)?/i);
   const ingredientsStatus = parsedIngredients.ingredients.length > 0
     ? "parsed" as const
     : parsedIngredients.ingredientsTableFound
@@ -9469,9 +9473,13 @@ async function extractCustomRecipeDetail(page: Page): Promise<CustomRecipeDetail
 }
 
 function recipeServingsVerified(detail: CustomRecipeDetail | undefined, input: RecipeInput) {
-  if (input.servings === undefined) return true;
-  if (detail?.servings === undefined) return false;
-  return Math.abs(detail.servings - input.servings) <= 0.000001;
+  if (input.servings !== undefined && (detail?.servings === undefined || Math.abs(detail.servings - input.servings) > 0.000001)) return false;
+  if (input.cookedWeight !== undefined) {
+    const expected = recipeWeightInGrams(input.cookedWeight, input.cookedWeightUnit);
+    const actual = detail?.cookedWeight === undefined ? undefined : recipeWeightInGrams(detail.cookedWeight, detail.cookedWeightUnit);
+    if (expected === undefined || actual === undefined || Math.abs(expected - actual) > 0.001) return false;
+  }
+  return true;
 }
 
 function recipeIngredientsVerified(
@@ -9864,31 +9872,46 @@ async function fillRecipeEditorInput(page: Page, index: number, value: string) {
 }
 
 async function fillRecipeCookedWeight(page: Page, cookedWeight: number, unit?: string) {
-  const labels = [/cooked.*weight/i, /final.*weight/i, /total.*weight/i, /recipe.*weight/i];
-  for (const label of labels) {
-    const labelled = page.getByLabel(label).first();
-    if (await labelled.isVisible().catch(() => false)) {
-      await labelled.fill(String(cookedWeight)).catch(() => undefined);
-      await page.keyboard.press("Tab").catch(() => undefined);
-      if (unit) await fillLikelyUnit(page, unit);
-      return true;
-    }
+  const grams = recipeWeightInGrams(cookedWeight, unit);
+  if (grams === undefined) return false;
+  const advanced = page.getByRole("button", { name: /^Advanced Info/i }).first();
+  if (await advanced.isVisible().catch(() => false) && await advanced.getAttribute("aria-expanded") !== "true") {
+    await advanced.click();
   }
+  const setWeight = page.getByText(/^Set Cooked Recipe Weight$/i);
+  const cookedRow = page.getByText(/^Cooked Recipe Weight$/i).locator("..").locator("..");
+  const rowButton = cookedRow.getByRole("button");
+  const opened = await setWeight.isVisible().catch(() => false)
+    ? await setWeight.click().then(() => true).catch(() => false)
+    : await rowButton.count().catch(() => 0) === 1
+      ? await rowButton.click().then(() => true).catch(() => false)
+      : false;
+  if (opened) {
+    const dialog = page.locator(".pretty-dialog:visible").filter({ hasText: /Set Cooked Weight/i });
+    if (await dialog.count() !== 1) return false;
+    const weightInput = dialog.locator("input:visible");
+    if (await weightInput.count() !== 1) return false;
+    await weightInput.click();
+    await weightInput.press("Control+A");
+    await weightInput.pressSequentially(String(grams), { delay: 15 });
+    await weightInput.press("Tab");
+    if (!numericInputMatches(await weightInput.inputValue(), grams)) return false;
+    await dialog.getByRole("button", { name: /^Save$/i }).click();
+    await dialog.waitFor({ state: "hidden", timeout: 5000 });
+    const detail = await extractCustomRecipeDetailWithRetry(page, 4, 200);
+    return detail?.cookedWeight !== undefined && Math.abs((recipeWeightInGrams(detail.cookedWeight, detail.cookedWeightUnit) ?? NaN) - grams) <= 0.001;
+  }
+  return false;
+}
 
-  const clicked = await clickByText(page, /^(Cooked Weight|Final Weight|Total Weight|Recipe Weight)$/i);
-  if (!clicked) return false;
-  await page.waitForTimeout(400);
-  const input = await firstVisibleLocator(page, [
-    page.locator("input.number-box:focus").first(),
-    page.locator("input.text-box:focus").first(),
-    page.locator("input.number-box:visible").last(),
-    page.locator("input.text-box:visible").last(),
-  ]);
-  if (!input) return false;
-  const filled = await input.fill(String(cookedWeight)).then(() => true).catch(() => false);
-  await page.keyboard.press("Enter").catch(() => undefined);
-  if (unit) await fillLikelyUnit(page, unit);
-  return filled;
+function recipeWeightInGrams(amount: number, unit = "g") {
+  const factors: Record<string, number> = { g: 1, gram: 1, grams: 1, kg: 1000, oz: 28.349523125, lb: 453.59237 };
+  const factor = factors[unit.trim().toLowerCase()];
+  return Number.isFinite(amount) && amount > 0 && factor ? amount * factor : undefined;
+}
+
+export async function __fillRecipeCookedWeightForTests(page: Page, amount: number, unit?: string) {
+  return fillRecipeCookedWeight(page, amount, unit);
 }
 
 export function chooseRecipeIngredientCandidate(ingredient: RecipeInput["ingredients"][number], candidates: SearchResult[]) {

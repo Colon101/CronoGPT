@@ -36,7 +36,7 @@ import {
 } from "./oauth.js";
 
 export const MCP_PATH = "/mcp";
-export const MCP_SERVER_VERSION = "0.1.23";
+export const MCP_SERVER_VERSION = "0.1.24";
 export const WIDGET_URI = `ui://widget/cronometer-dashboard-v${MCP_SERVER_VERSION}.html`;
 
 const widgetHtml = readFileSync(new URL("../public/cronometer-widget.html", import.meta.url), "utf8")
@@ -761,7 +761,7 @@ export function createCronoServer(options: { grantedScopes?: readonly string[]; 
   register(
     "log_foods",
     "Log multiple foods",
-    "Call this directly when two or more distinct foods all belong to one Cronometer date and meal; do not preflight with search_foods, list_food_entries, or dryRun for clear items. CronoGPT owns each baseline, bounded search, write, and persisted verification. Do not use it for a single food (use log_food) or items with different dates/meals (use log_food_plan). Semantic duplicates are rejected and every saved row is reported separately.",
+    "Call this directly when two or more distinct foods all belong to one Cronometer date and meal; pass the user's ordinary food queries and weights without preflight search, diary reads, or dryRun. Omit selectedName/selectedSource unless the user chose an exact food or a prior ambiguity was resolved to one unique result; never guess a database source. CronoGPT owns each baseline, bounded search, write, and persisted verification. Do not use it for a single food (use log_food) or items with different dates/meals (use log_food_plan). Semantic duplicates are rejected and every saved row is reported separately.",
     {
       date: diaryDateInputSchema.optional(),
       meal: diaryMealInputSchema,
