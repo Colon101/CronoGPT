@@ -19,6 +19,7 @@ import {
   __removeRecipeIngredientForTests,
   __recipeEditIngredientsVerifiedForTests,
   __searchCurrentFoodDialogForTests,
+  __waitForCustomItemListTextForTests,
   chooseFoodLogResult,
 } from "../dist/providers/browser.js";
 
@@ -510,6 +511,52 @@ try {
   assert.equal(await __fillRecipeCookedWeightForTests(page, 0.3, "kg"), true, "the existing weight button must remain editable");
   assert.equal(await page.locator('#set-weight').innerText(), "300 g");
   assert.equal(await __fillRecipeCookedWeightForTests(page, 321, "cups"), false, "unknown weight units must not be silently treated as grams");
+
+  // The shell and its instructional empty prompt precede asynchronously
+  // fetched custom-item rows. They must never establish recipe absence.
+  const listPage = await browser.newPage();
+  try {
+    await listPage.setContent(`<div>Custom Recipes</div><div><button>CREATE RECIPE</button></div><div><button>Sorted by</button></div>
+      <div id="items">Create your own recipe or import a recipe from a website using the buttons above.</div>
+      <script>setTimeout(()=>document.querySelector('#items').innerHTML='<div role="button"><div class="gwt-Label">Existing Vanilla Ice Cream</div></div>',1000)</script>`);
+    const delayedListText = await __waitForCustomItemListTextForTests(listPage, "Custom Recipes");
+    assert.match(delayedListText, /Existing Vanilla Ice Cream/, "the initial shell must wait for native saved-item rows before reporting names");
+
+    await listPage.setContent(`<div>Custom Recipes</div><div><button>CREATE RECIPE</button></div><div><button>Sorted by</button></div>
+      <div role="button"><div class="gwt-Label">Older Recipe</div></div><div id="new-item"></div>
+      <script>setTimeout(()=>document.querySelector('#new-item').innerHTML='<div role="button"><div class="gwt-Label">Newly Saved Recipe</div></div>',1000)</script>`);
+    assert.match(await __waitForCustomItemListTextForTests(listPage, "Custom Recipes", 4000, "Newly Saved Recipe"), /Newly Saved Recipe/, "post-save verification must keep waiting when an older populated row arrives before the expected saved recipe");
+
+    let mountingListNavigations = 0;
+    await listPage.route("https://cronometer.com/**", (route) => { mountingListNavigations++; return route.abort(); });
+    await listPage.setContent(`<div>Custom Recipes</div><div><button>CREATE RECIPE</button></div><div><button>Sorted by</button></div><div id="late-item"></div>
+      <script>setTimeout(()=>document.querySelector('#late-item').innerHTML='<div role="button"><div class="gwt-Label">Slowly Mounted Recipe</div></div>',2300)</script>`);
+    assert.match(await __waitForCustomItemListTextForTests(listPage, "Custom Recipes"), /Slowly Mounted Recipe/);
+    assert.equal(mountingListNavigations, 0, "a correct list mounting rows near the first wait boundary must keep its document instead of resetting its fetch");
+    await listPage.unroute("https://cronometer.com/**");
+
+    const largeLibraryNames = Array.from({ length: 150 }, (_, index) => `Saved Mix ${index}`);
+    await listPage.setContent(`<div>Custom Recipes</div><div><button>CREATE RECIPE</button></div><div><button>Sorted by</button></div>${largeLibraryNames.map((name) => `<div role="button"><div class="gwt-Label">${name}</div></div>`).join("")}`);
+    const largeLibraryProvider = new BrowserCronometerProvider({
+      localChromium: true, writeEnabled: false, requireFoodConfirmation: true,
+      navigationTimeoutMs: 4000, loginBackoffMs: 1000, operationTimeoutMs: 60000,
+      browserRetryCount: 0, timeZone: "Asia/Jerusalem",
+    });
+    largeLibraryProvider.withPage = async (_feature, handler) => handler(listPage);
+    largeLibraryProvider.openApp = async () => {};
+    const lastListedRecipe = await largeLibraryProvider.listCustomRecipes({ query: largeLibraryNames.at(-1) });
+    assert.deepEqual(lastListedRecipe.data.names, [largeLibraryNames.at(-1)], "a recipe after the first120 visible names must still prevent unsafe absence decisions");
+
+    await listPage.setContent('<div>Custom Recipes</div><div><button>CREATE RECIPE</button></div><div><button>Sorted by</button></div><div>No custom recipes found.</div>');
+    assert.match(await __waitForCustomItemListTextForTests(listPage, "Custom Recipes"), /No custom recipes found/, "an explicit settled empty state may establish an empty library");
+
+    const unprovenEmptyHtml = '<div>Custom Recipes</div><div><button>CREATE RECIPE</button></div><div><button>Sorted by</button></div><div>Create your own recipe or import a recipe from a website using the buttons above.</div>';
+    await listPage.route("https://cronometer.com/**", (route) => route.fulfill({ contentType: "text/html", body: unprovenEmptyHtml }));
+    await listPage.setContent(unprovenEmptyHtml);
+    await assert.rejects(__waitForCustomItemListTextForTests(listPage, "Custom Recipes"), /absence is unproven/, "an instructional default without fetched rows must fail closed");
+  } finally {
+    await listPage.close();
+  }
 
   // Retiring a failed draft starts a cold authenticated app. Its shell can
   // mount after the old 1.2-second delay without requiring credential login.

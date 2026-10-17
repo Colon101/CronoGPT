@@ -2874,7 +2874,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         trace("persisted_recipe_reopen_start");
         await page.reload();
         await this.openApp(page, "#custom-recipes");
-        const reopened = await resolveCustomRecipeTargets(page, { name: input.name }, { maxDetails: 1, timeoutMs: this.config.navigationTimeoutMs });
+        const reopened = await resolveCustomRecipeTargets(page, { name: input.name }, { maxDetails: 1, timeoutMs: this.config.navigationTimeoutMs, expectedName: input.name });
         const exactNameCount = reopened.names.filter((name) => name.toLowerCase() === input.name.trim().toLowerCase()).length;
         listVerified = exactNameCount === 1 && reopened.targets.length === 1;
         finalDetail = listVerified ? reopened.targets[0] : undefined;
@@ -3075,7 +3075,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       await page.waitForTimeout(1000);
       await page.reload();
       await this.openApp(page, "#custom-recipes");
-      const reopened = await resolveCustomRecipeTargets(page, { name: basicsInput.name, recipeId: before.recipeId }, { maxDetails: 1, timeoutMs: this.config.navigationTimeoutMs });
+      const reopened = await resolveCustomRecipeTargets(page, { name: basicsInput.name, recipeId: before.recipeId }, { maxDetails: 1, timeoutMs: this.config.navigationTimeoutMs, expectedName: basicsInput.name });
       const finalDetail = reopened.targets.length === 1 ? reopened.targets[0] : undefined;
       const nameVerified = normalizeCustomFoodName(finalDetail?.name ?? "") === normalizeCustomFoodName(basicsInput.name);
       const servingsVerified = recipeServingsVerified(finalDetail, basicsInput);
@@ -9150,8 +9150,7 @@ function parseCustomItemListNames(rawText: string, sectionTitle: string) {
     .slice(Math.max(0, startIndex + 1))
     .filter((line) => !navAndAction.test(line))
     .filter((line) => !isCustomItemEmptyStateLine(line))
-    .filter((line) => !/^(Food #\d+|Recipe #\d+|Data Source:|Info|Serving Sizes|Nutrition Label|Nutrition Facts|ADD TO DIARY|more_horiz)$/i.test(line))
-    .slice(0, 120);
+    .filter((line) => !/^(Food #\d+|Recipe #\d+|Data Source:|Info|Serving Sizes|Nutrition Label|Nutrition Facts|ADD TO DIARY|more_horiz)$/i.test(line));
 }
 
 function isCustomItemEmptyStateLine(line: string) {
@@ -9257,7 +9256,7 @@ async function waitForCustomFoodGone(page: Page, target: CustomFoodDetail, timeo
       maxDetails: 5,
       timeoutMs: Math.min(remaining, 12000),
     }).catch(() => lastResolved);
-    if (!lastResolved || lastResolved.targets.length === 0) {
+    if (lastResolved && lastResolved.targets.length === 0) {
       return {
         gone: true,
         visibleNameCount: lastResolved?.names.length ?? 0,
@@ -9275,7 +9274,7 @@ async function waitForCustomFoodGone(page: Page, target: CustomFoodDetail, timeo
   };
 }
 
-async function customRecipeDetailsForNames(page: Page, names: string[], maxDetails: number) {
+async function customRecipeDetailsForNames(page: Page, names: string[], maxDetails: number, expectedName?: string) {
   const details: CustomRecipeDetail[] = [];
   const occurrences = new Map<string, number>();
   const limitedNames = names.slice(0, maxDetails);
@@ -9285,7 +9284,7 @@ async function customRecipeDetailsForNames(page: Page, names: string[], maxDetai
     occurrences.set(normalized, occurrence + 1);
     await page.goto(`${CRONOMETER_ORIGIN}/#custom-recipes`);
     await page.waitForLoadState("domcontentloaded").catch(() => undefined);
-    const listText = await waitForCustomItemListText(page, "Custom Recipes", 12000).catch(() => "");
+    const listText = await waitForCustomItemListText(page, "Custom Recipes", 12000, expectedName).catch(() => "");
     if (!customItemTextIsReady(listText, "Custom Recipes")) continue;
     const clicked = await clickCustomListItemByName(page, name, occurrence);
     if (!clicked) continue;
@@ -9316,13 +9315,13 @@ async function extractCustomRecipeDetailWithRetry(page: Page, attempts: number, 
   return last;
 }
 
-async function resolveCustomRecipeTargets(page: Page, selector: CustomRecipeSelectorInput, options: { maxDetails: number; timeoutMs?: number }) {
-  const rawText = await waitForCustomItemListText(page, "Custom Recipes", options.timeoutMs ?? 12000);
+async function resolveCustomRecipeTargets(page: Page, selector: CustomRecipeSelectorInput, options: { maxDetails: number; timeoutMs?: number; expectedName?: string }) {
+  const rawText = await waitForCustomItemListText(page, "Custom Recipes", options.timeoutMs ?? 12000, options.expectedName);
   const names = parseCustomItemListNames(rawText, "Custom Recipes");
   const query = selector.name;
   const matchingNames = query ? exactOrFuzzyCustomItemNames(names, query) : names;
   const candidateNames = query && matchingNames.length === 0 ? [query] : matchingNames;
-  const details = await customRecipeDetailsForNames(page, candidateNames, options.maxDetails);
+  const details = await customRecipeDetailsForNames(page, candidateNames, options.maxDetails, options.expectedName);
   const targets = details.filter((detail) => {
     if (selector.recipeId && detail.recipeId !== selector.recipeId) return false;
     if (selector.name && detail.name.toLowerCase() !== selector.name.toLowerCase()) return false;
@@ -9504,45 +9503,91 @@ async function clickCustomListItemByName(page: Page, name: string, occurrence: n
   return true;
 }
 
-async function waitForCustomItemListText(page: Page, sectionTitle: string, timeoutMs: number) {
+async function waitForCustomItemListText(page: Page, sectionTitle: string, timeoutMs: number, expectedName?: string) {
   const hash = sectionTitle === "Custom Foods" ? "#custom-foods" : "#custom-recipes";
   const backPattern = sectionTitle === "Custom Foods" ? /^BACK TO FOODS LIST$/i : /^BACK TO RECIPES? LIST$/i;
   const hasBackLink = (value: string) => sectionTitle === "Custom Foods" ? /BACK TO FOODS LIST/i.test(value) : /BACK TO RECIPES? LIST/i.test(value);
   const budget = Math.max(4000, Math.min(timeoutMs, 20000));
-  const bodyText = () => page.locator("body").innerText({ timeout: 2000 }).catch(() => "");
-  const waitForListOrDetail = (waitMs: number) => waitForVisibleText(
-    page,
-    (value) => customItemTextIsReady(value, sectionTitle) || hasBackLink(value),
-    waitMs,
-  ).catch(bodyText);
-  let text = await waitForListOrDetail(Math.min(2500, budget));
+  const deadline = Date.now() + budget;
+  const remainingMs = () => Math.max(1, deadline - Date.now());
+  const waitForListOrDetail = async (waitMs: number, allowDetail = true) => {
+    const waitDeadline = Math.min(deadline, Date.now() + waitMs);
+    let text = "";
+    let stableKey = "";
+    let stableSince = 0;
+    let shellSince = 0;
+    let hasShell = false;
+    do {
+      text = await page.locator("body").innerText({ timeout: Math.min(1000, remainingMs()) }).catch(() => "");
+      hasShell = new RegExp(`\\b${escapeRegExp(sectionTitle)}\\b`, "i").test(text) && /Sorted by/i.test(text)
+        && (sectionTitle === "Custom Foods" ? /\bCREATE FOOD\b/i : /\bCREATE RECIPE\b/i).test(text);
+      if (hasShell && !shellSince) shellSince = Date.now();
+      const names = hasShell ? parseCustomItemListNames(text, sectionTitle) : [];
+      const rowNames = hasShell ? await page.locator("div[role='button'] > .gwt-Label").evaluateAll((elements) =>
+        elements.filter((element) => {
+          const style = window.getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+        }).map((element) => (element.textContent ?? "").replace(/\s+/g, " ").trim()).filter(Boolean),
+      ).catch(() => [] as string[]) : [];
+      const populated = names.length > 0 && rowNames.some((name) => names.includes(name))
+        && (!expectedName || rowNames.some((name) => name.toLowerCase() === expectedName.trim().toLowerCase()));
+      // Cronometer renders the instructional "Create a custom..." prompt
+      // before existing rows arrive. That prompt never proves an empty list.
+      const explicitEmpty = !expectedName && names.length === 0 && rowNames.length === 0
+        && text.split(/\n+/).some((line) => /^(?:No custom (?:foods|recipes|meals)(?: found)?|You have no custom (?:foods|recipes|meals))\.?$/i.test(line.trim()));
+      const candidateKey = customItemTextIsReady(text, sectionTitle) && (populated || explicitEmpty)
+        ? JSON.stringify({ names, rowNames, explicitEmpty }) : "";
+      if (candidateKey && candidateKey === stableKey) {
+        if (Date.now() - stableSince >= 500 && (!explicitEmpty || Date.now() - shellSince >= 2000)) {
+          return { text, ready: true, hasShell };
+        }
+      } else {
+        stableKey = candidateKey;
+        stableSince = Date.now();
+      }
+      if (!candidateKey && allowDetail && hasBackLink(text)) return { text, ready: false, hasShell };
+      const wait = Math.min(150, waitDeadline - Date.now());
+      if (wait > 0) await page.waitForTimeout(wait);
+    } while (Date.now() < waitDeadline);
+    return { text, ready: false, hasShell };
+  };
+  let state = await waitForListOrDetail(Math.min(2500, remainingMs()));
 
-  if (!customItemTextIsReady(text, sectionTitle) && hasBackLink(text)) {
+  if (!state.ready && hasBackLink(state.text)) {
     await clickByText(page, backPattern).catch(() => false);
     await page.waitForTimeout(250);
     await discardUnsavedCustomItemPrompt(page);
-    text = await waitForVisibleText(page, (value) => customItemTextIsReady(value, sectionTitle), Math.min(5000, budget)).catch(bodyText);
+    state = await waitForListOrDetail(Math.min(5000, remainingMs()), false);
   }
 
-  if (!customItemTextIsReady(text, sectionTitle)) {
+  if (!state.ready && state.hasShell && Date.now() < deadline) {
+    // The right list is mounting data. Restarting its document here would
+    // discard progress, especially when the expected saved row arrives late.
+    state = await waitForListOrDetail(remainingMs(), false);
+  }
+
+  if (!state.ready && Date.now() < deadline) {
     // A same-hash SPA navigation can leave Cronometer inside the recipe editor.
     // A cache-busting query forces a real document navigation back to the list.
-    await page.goto(`${CRONOMETER_ORIGIN}/?cronogpt_list=${Date.now()}${hash}`).catch(() => undefined);
-    await page.waitForLoadState("domcontentloaded").catch(() => undefined);
-    await page.waitForTimeout(600);
-    text = await waitForListOrDetail(Math.min(7000, budget));
-    if (!customItemTextIsReady(text, sectionTitle) && hasBackLink(text)) {
+    await page.goto(`${CRONOMETER_ORIGIN}/?cronogpt_list=${Date.now()}${hash}`, { waitUntil: "domcontentloaded", timeout: remainingMs() }).catch(() => undefined);
+    state = await waitForListOrDetail(Math.min(7000, remainingMs()));
+    if (!state.ready && hasBackLink(state.text)) {
       await clickByText(page, backPattern).catch(() => false);
       await page.waitForTimeout(250);
       await discardUnsavedCustomItemPrompt(page);
-      text = await waitForVisibleText(page, (value) => customItemTextIsReady(value, sectionTitle), Math.min(5000, budget)).catch(bodyText);
+      state = await waitForListOrDetail(Math.min(5000, remainingMs()), false);
     }
   }
 
-  if (!customItemTextIsReady(text, sectionTitle)) {
-    throw new Error(`Cronometer did not reach the ${sectionTitle} list view within ${budget}ms.`);
+  if (!state.ready) {
+    throw new Error(`Cronometer did not verify populated rows or an explicitly empty ${sectionTitle} list within ${budget}ms. The list may still be loading; absence is unproven.`);
   }
-  return text;
+  return state.text;
+}
+
+export async function __waitForCustomItemListTextForTests(page: Page, sectionTitle: string, timeoutMs = 4000, expectedName?: string) {
+  return waitForCustomItemListText(page, sectionTitle, timeoutMs, expectedName);
 }
 
 async function discardUnsavedCustomItemPrompt(page: Page) {
@@ -9558,7 +9603,10 @@ async function discardUnsavedCustomItemPrompt(page: Page) {
 
 function customItemTextIsReady(text: string, sectionTitle: string) {
   if (!new RegExp(`\\b${escapeRegExp(sectionTitle)}\\b`, "i").test(text)) return false;
-  return /Sorted by/i.test(text);
+  if (!/Sorted by/i.test(text)) return false;
+  if (!(sectionTitle === "Custom Foods" ? /\bCREATE FOOD\b/i : /\bCREATE RECIPE\b/i).test(text)) return false;
+  return parseCustomItemListNames(text, sectionTitle).length > 0
+    || text.split(/\n+/).some((line) => /^(?:No custom (?:foods|recipes|meals)(?: found)?|You have no custom (?:foods|recipes|meals))\.?$/i.test(line.trim()));
 }
 
 async function extractCustomFoodDetail(page: Page): Promise<CustomFoodDetail | undefined> {
