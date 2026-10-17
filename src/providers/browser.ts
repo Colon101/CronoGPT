@@ -44,6 +44,8 @@ import { compareStringsOrdinal, isoDateInTimeZone, stableJson } from "../determi
 import { customFoodNutrientMetadataForKey } from "../nutrients.js";
 import { validateBarcode } from "../barcode.js";
 import { normalizeDateRange } from "../date-range.js";
+import { recipeIngredientAmountMatches } from "../recipe-quantity.js";
+export { recipeIngredientAmountMatches } from "../recipe-quantity.js";
 import {
   FOOD_LOG_MEALS,
   foodLogBatchIdempotencyKey,
@@ -171,6 +173,7 @@ interface CustomRecipeDetail {
     unit?: string;
     energyKcal?: number;
     weight?: string;
+    amountReadback?: { source: "row_editor"; displayedAmount?: number; actualValue: string };
   }>;
   rawText?: string;
 }
@@ -2690,7 +2693,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         }
       };
       trace("open_app_start");
-      await this.openApp(page, "#custom-recipes");
+      await this.openApp(page, "#custom-recipes", trace);
       trace("open_app_done");
       const rawText = await waitForCustomItemListText(page, "Custom Recipes", this.config.navigationTimeoutMs);
       const names = filterCustomItemNames(parseCustomItemListNames(rawText, "Custom Recipes"), input.query);
@@ -3762,25 +3765,39 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     };
   }
 
-  private async openApp(page: Page, hash = "") {
+  private async openApp(page: Page, hash = "", trace?: (step: string, details?: Record<string, unknown>) => void) {
+    trace?.("open_app_dismiss_notice_start");
     await dismissSavedItemSuccessNotice(page);
+    trace?.("open_app_dismiss_notice_done");
     // Defend against modal state left by an older server version or an
     // interrupted reused-context operation before navigating the app shell.
-    await closeFoodDialog(page, Math.min(this.config.navigationTimeoutMs, 10000)).catch(() => undefined);
+    trace?.("open_app_close_food_dialog_start");
+    const closedFoodDialog = await closeFoodDialog(page, Math.min(this.config.navigationTimeoutMs, 10000)).catch(() => undefined);
+    trace?.("open_app_close_food_dialog_done", { closedFoodDialog });
     const targetUrl = `${CRONOMETER_ORIGIN}/${hash}`;
     // Reuse the already authenticated app document for reads and searches.
     // Writes still establish a fresh document in openDiaryForWrite and reload
     // after Save before reporting persisted success.
+    trace?.("open_app_reuse_check_start", { sameTargetUrl: page.url() === targetUrl });
     if (page.url() === targetUrl && await this.isLoggedIn(page)) {
+      trace?.("open_app_reuse_account_start");
       await this.ensureConfiguredAccount(page, hash);
+      trace?.("open_app_reuse_account_done");
       return;
     }
+    trace?.("open_app_navigation_start");
     await gotoAllowingAbort(page, targetUrl, this.config.navigationTimeoutMs);
+    trace?.("open_app_navigation_done");
     await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
-    await page.waitForTimeout(1200);
+    trace?.("open_app_document_loaded");
     await dismissCronometerMarketingOverlays(page);
-    if (await this.isLoggedIn(page)) {
+    trace?.("open_app_readiness_start");
+    const readiness = await this.waitForAppOrLogin(page);
+    trace?.("open_app_readiness_done", { readiness });
+    if (readiness === "authenticated") {
+      trace?.("open_app_account_start");
       await this.ensureConfiguredAccount(page, hash);
+      trace?.("open_app_account_done");
       if (hash && !page.url().includes(hash)) {
         await gotoAllowingAbort(page, targetUrl, this.config.navigationTimeoutMs);
         await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
@@ -3790,12 +3807,13 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       return;
     }
 
+    trace?.("open_app_login_start");
     await this.login(page);
+    trace?.("open_app_login_done");
     await gotoAllowingAbort(page, targetUrl, this.config.navigationTimeoutMs);
     await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
-    await page.waitForTimeout(1200);
     await dismissCronometerMarketingOverlays(page);
-    if (!(await this.isLoggedIn(page))) {
+    if (await this.waitForAppOrLogin(page) !== "authenticated") {
       const reason = "Cronometer login succeeded but the app page did not load.";
       this.pauseLoginAttempts(reason);
       throw new Error(reason);
@@ -3807,6 +3825,30 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
       await page.waitForTimeout(900);
       await dismissCronometerMarketingOverlays(page);
     }
+  }
+
+  private async waitForAppOrLogin(page: Page): Promise<"authenticated" | "login"> {
+    // Closing a failed recipe draft retires its browser. The replacement app
+    // document can finish loading after DOMContentLoaded; a fixed delay must
+    // not turn that authenticated startup into another credential login.
+    const deadline = Date.now() + Math.max(1, Math.min(this.config.navigationTimeoutMs, 8000));
+    do {
+      const remainingMs = Math.max(1, deadline - Date.now());
+      const text = await page.locator("body").innerText({ timeout: Math.min(1000, remainingMs) }).catch(() => "");
+      if (isLoggedInText(text)) return "authenticated";
+      const failure = loginFailureReason(text);
+      if (failure) {
+        this.pauseLoginAttempts(failure);
+        throw new Error(failure);
+      }
+      if (/\bWelcome Back\b|Science-backed nutrition tracking|Sign Up For Free/i.test(text)
+        || /\bLog In\b/i.test(text) && /\b(Email|Password)\b/i.test(text)) {
+        return "login";
+      }
+      const waitMs = Math.min(150, deadline - Date.now());
+      if (waitMs > 0) await page.waitForTimeout(waitMs);
+    } while (Date.now() < deadline);
+    throw new Error("Timed out waiting for Cronometer's authenticated app or an explicit login page. No credentials were submitted.");
   }
 
   private async ensureConfiguredAccount(page: Page, returnHash: string) {
@@ -3898,15 +3940,7 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
     }
     await gotoAllowingAbort(page, `${CRONOMETER_ORIGIN}/login/`, this.config.navigationTimeoutMs);
     await page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => undefined);
-    await page.waitForTimeout(600);
-
-    const bodyText = await this.visibleText(page);
-    if (await this.isLoggedIn(page, bodyText)) return;
-    const initialFailure = loginFailureReason(bodyText);
-    if (initialFailure) {
-      this.pauseLoginAttempts(initialFailure);
-      throw new Error(initialFailure);
-    }
+    if (await this.waitForAppOrLogin(page) === "authenticated") return;
 
     if (!this.config.email || !this.config.password) {
       throw new Error("Missing CRONOMETER_EMAIL/CRONOMETER_PASSWORD.");
@@ -9717,9 +9751,13 @@ async function extractCustomRecipeDetail(page: Page): Promise<CustomRecipeDetail
     cookedWeight: cookedWeightMatch ? Number(cookedWeightMatch[1]) : undefined,
     cookedWeightUnit: cookedWeightMatch?.[2],
     ingredientsStatus,
-    ingredients: parsedIngredients.ingredients,
+    ingredients: await readPreciseCustomRecipeIngredientAmounts(page, parsedIngredients.ingredients),
     rawText: snapshot.bodyText.slice(0, 8000),
   };
+}
+
+export async function __extractCustomRecipeDetailForTests(page: Page) {
+  return extractCustomRecipeDetail(page);
 }
 
 function recipeServingsVerified(detail: CustomRecipeDetail | undefined, input: RecipeInput) {
@@ -9816,45 +9854,6 @@ function recipeIngredientSourceMatches(actual?: string, expected?: string) {
   if (!expected) return true;
   const normalize = (value: string) => value.replace(/\s+/g, " ").trim().toLowerCase().replace(/^custom$/, "custom food");
   return Boolean(actual && normalize(actual) === normalize(expected));
-}
-
-export function recipeIngredientAmountMatches(
-  actualAmount?: number,
-  actualUnit?: string,
-  expectedAmount?: number,
-  expectedUnit?: string,
-  actualWeight?: string,
-) {
-  if (expectedAmount === undefined) return true;
-  if (actualAmount === undefined) return false;
-  const expectedNormalizedUnit = expectedUnit?.replace(/\s+/g, " ").trim().toLowerCase();
-  const actualNormalizedUnit = actualUnit?.replace(/\s+/g, " ").trim().toLowerCase();
-  if (expectedNormalizedUnit === "g" && actualWeight) {
-    const weightMatch = actualWeight.replace(/\s+/g, " ").trim().toLowerCase().match(/(-?[0-9]+(?:\.[0-9]+)?)\s*(kg|g|oz|lb)\b/);
-    if (weightMatch) {
-      const weightAmount = Number(weightMatch[1]);
-      const gramsPerUnit = weightMatch[2] === "kg" ? 1000
-        : weightMatch[2] === "oz" ? 28.349523125
-          : weightMatch[2] === "lb" ? 453.59237
-            : 1;
-      const weightInGrams = weightAmount * gramsPerUnit;
-      if (Number.isFinite(weightInGrams)
-        && Math.abs(weightInGrams - expectedAmount) <= Math.max(0.0001, Math.abs(expectedAmount) * 0.00001)) return true;
-    }
-  }
-  const actualInExpectedUnit = expectedNormalizedUnit === "g"
-    ? actualAmount * (gramsPerServingUnit(actualNormalizedUnit ?? "") ?? (actualNormalizedUnit === "g" ? 1 : Number.NaN))
-    : actualAmount;
-  if (!Number.isFinite(actualInExpectedUnit)) return false;
-  if (expectedNormalizedUnit && expectedNormalizedUnit !== "g" && actualNormalizedUnit !== expectedNormalizedUnit) return false;
-  // Cronometer stores converted serving counts to four decimal places. A
-  // 65 g serving can therefore differ from the requested gram weight by up
-  // to a few thousandths of a gram after UI rounding (for example 56 g is
-  // stored as 0.8615 servings = 55.9975 g).
-  const tolerance = expectedNormalizedUnit === "g"
-    ? Math.max(0.01, Math.abs(expectedAmount) * 0.00001)
-    : Math.max(0.0001, Math.abs(expectedAmount) * 0.00001);
-  return Math.abs(actualInExpectedUnit - expectedAmount) <= tolerance;
 }
 
 async function retireOpenCustomFood(page: Page, target: CustomFoodDetail, retiredName: string) {
@@ -10668,7 +10667,7 @@ async function waitForRecipeIngredientAdded(
 }
 
 async function readVisibleRecipeIngredientRows(page: Page, selectedName?: string) {
-  return page.evaluate((selectedName) => {
+  const ingredients = await page.evaluate((selectedName) => {
     const normalize = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
     const normalizeName = (value: string | null | undefined) => normalize(value).toLowerCase();
     const target = normalizeName(selectedName);
@@ -10700,6 +10699,71 @@ async function readVisibleRecipeIngredientRows(page: Page, selectedName?: string
         weight: cells[5] || undefined,
       }));
   }, selectedName);
+  return readPreciseCustomRecipeIngredientAmounts(page, ingredients);
+}
+
+async function readPreciseCustomRecipeIngredientAmounts(page: Page, ingredients: CustomRecipeIngredientDetail[]) {
+  const preciseIngredients: CustomRecipeIngredientDetail[] = [];
+  for (const ingredient of ingredients) {
+    const gramsPerServing = gramsPerServingUnit(ingredient.unit ?? "");
+    const knownWeight = Boolean(ingredient.weight && /[0-9]+(?:\.[0-9]+)?\s*(?:g|kg|oz|lb)\b/i.test(ingredient.weight));
+    if (!recipeIngredientSourceMatches(ingredient.database, "Custom Food") || !gramsPerServing || gramsPerServing === 1 || knownWeight) {
+      preciseIngredients.push(ingredient);
+      continue;
+    }
+    // Custom servings can have a gram name without native gram metadata.
+    // Their recipe table rounds quantities to two decimals and says Unknown
+    // for weight. Read the committed quantity from that exact row's editor;
+    // a pre-add input value cannot prove what Cronometer actually retained.
+    const precise = await readRecipeIngredientRowAmount(page, ingredient.name, ingredient.database, ingredient.unit);
+    preciseIngredients.push({
+      ...ingredient,
+      amount: precise?.amount,
+      ...(precise ? { amountReadback: { source: "row_editor" as const, displayedAmount: ingredient.amount, actualValue: precise.actualValue } } : {}),
+    });
+  }
+  return preciseIngredients;
+}
+
+async function readRecipeIngredientRowAmount(page: Page, name: string, source?: string, unit?: string) {
+  let row = page.locator("tr:not(:has(tr)):visible").filter({ has: page.getByText(name, { exact: true }) });
+  if (source) {
+    const sourceText = recipeIngredientSourceMatches(source, "Custom Food") ? /^Custom(?: Food)?$/i : new RegExp(`^${escapeRegExp(source)}$`, "i");
+    row = row.filter({ has: page.getByText(sourceText, { exact: true }) });
+  }
+  if (await row.count().catch(() => 0) !== 1) return undefined;
+  const cells = row.locator(":scope > td");
+  if (await cells.count().catch(() => 0) < 6) return undefined;
+  const amountCell = cells.nth(2);
+  const editor = amountCell.locator("input:visible");
+  const originalDisplay = await amountCell.innerText().catch(() => "");
+  const normalize = (value: string) => value.replace(/\s+/g, " ").trim().toLowerCase();
+  const rowIdentityMatches = async () => recipeIngredientSourceMatches(await cells.nth(1).innerText().catch(() => ""), source)
+    && normalize(await cells.nth(3).innerText().catch(() => "")) === normalize(unit ?? "");
+  if (!(await rowIdentityMatches())) return undefined;
+  let precise: { amount: number; actualValue: string } | undefined;
+  let editorClosed = false;
+  try {
+    await amountCell.dblclick({ timeout: 1500 });
+    await editor.first().waitFor({ state: "visible", timeout: 900 });
+    if (await editor.count() === 1 && await rowIdentityMatches()) {
+      const actualValue = await editor.inputValue();
+      const amount = Number(actualValue.trim());
+      if (actualValue.trim() && Number.isFinite(amount) && amount > 0) precise = { amount, actualValue };
+    }
+  } catch {
+    precise = undefined;
+  } finally {
+    // Cancel the editor unchanged. Never fill or commit this readback editor,
+    // or use the rounded display amount as a replacement value.
+    if (await editor.count().catch(() => 0) > 0) {
+      await editor.first().press("Escape", { timeout: 1000 }).catch(() => undefined);
+    }
+    editorClosed = await editor.first().waitFor({ state: "hidden", timeout: 900 }).then(() => true).catch(() => false);
+  }
+  const unchanged = editorClosed && await row.count().catch(() => 0) === 1 && await rowIdentityMatches()
+    && await amountCell.innerText().catch(() => "") === originalDisplay;
+  return unchanged ? precise : undefined;
 }
 
 async function recipeIngredientSelectedPanel(page: Page, selectedName?: string) {

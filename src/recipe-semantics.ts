@@ -1,4 +1,5 @@
 import type { RecipeIngredientInput, RecipeInput } from "./domain.js";
+import { recipeIngredientAmountMatches } from "./recipe-quantity.js";
 
 export type RecipeIngredientsStatus = "parsed" | "empty_confirmed" | "extraction_failed";
 
@@ -8,6 +9,7 @@ export interface ExistingRecipeIngredient {
   database?: unknown;
   amount?: unknown;
   unit?: unknown;
+  weight?: unknown;
 }
 
 export interface ExistingRecipeSummary {
@@ -64,8 +66,17 @@ export function comparePrivateRecipe(
     unmatchedActual.delete(matchIndex);
     const actual = actualIngredients[matchIndex];
     const mismatches: string[] = [];
-    if (ingredient.amount !== undefined && !numbersEqual(ingredient.amount, actual.amount)) mismatches.push("amount");
-    if (ingredient.unit !== undefined && normalizeUnit(ingredient.unit) !== normalizeUnit(actual.unit)) mismatches.push("unit");
+    const equivalentQuantity = ingredient.amount !== undefined && recipeIngredientAmountMatches(
+      finiteNumber(actual.amount),
+      typeof actual.unit === "string" ? actual.unit : undefined,
+      ingredient.amount,
+      ingredient.unit,
+      typeof actual.weight === "string" ? actual.weight : undefined,
+    );
+    if (!equivalentQuantity) {
+      if (ingredient.amount !== undefined && !numbersEqual(ingredient.amount, actual.amount)) mismatches.push("amount");
+      if (ingredient.unit !== undefined && normalizeUnit(ingredient.unit) !== normalizeUnit(actual.unit)) mismatches.push("unit");
+    }
     if (ingredient.selectedSource !== undefined && normalizeSource(ingredient.selectedSource) !== normalizeSource(actual.source ?? actual.database)) {
       mismatches.push("source");
     }
@@ -146,6 +157,12 @@ function numbersEqual(left: unknown, right: unknown) {
   const a = typeof left === "number" ? left : Number(String(left ?? "").trim());
   const b = typeof right === "number" ? right : Number(String(right ?? "").trim());
   return Number.isFinite(a) && Number.isFinite(b) && Math.abs(a - b) <= 0.000001;
+}
+
+function finiteNumber(value: unknown) {
+  if (typeof value !== "number" && (typeof value !== "string" || !value.trim())) return undefined;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : undefined;
 }
 
 function normalizeName(value: unknown) {

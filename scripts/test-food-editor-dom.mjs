@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { chromium } from "playwright-core";
 import {
+  BrowserCronometerProvider,
   __addRecipeIngredientForTests,
   __closeFoodDialogForTests,
   __dismissSavedItemSuccessNoticeForTests,
@@ -13,6 +14,7 @@ import {
   __fillRecipeBasicsForTests,
   __fillRecipeIngredientFieldsForTests,
   __fillRecipeCookedWeightForTests,
+  __extractCustomRecipeDetailForTests,
   __readFoodEditorIdentityForTests,
   __removeRecipeIngredientForTests,
   __recipeEditIngredientsVerifiedForTests,
@@ -189,10 +191,12 @@ try {
       <h1>Recipe scope fixture</h1><button id="add-ingredients">ADD INGREDIENTS</button>
       <table><tbody id="recipe-ingredients"><tr><th>Description</th><th>Database</th><th>Amount</th><th>Unit</th><th>Energy</th><th>Weight</th></tr></tbody></table>
     `);
-    await page.evaluate(({ missingScope, ignoredScope }) => {
+    await page.evaluate(({ missingScope, ignoredScope, customServingUnit, storedCustomAmount, missingAmountEditor, duplicateCustomRow, changedReadbackUnit, ignoredReadbackEscape }) => {
       window.stickyFoodScope = "Custom";
       window.recipeSearches = [];
       window.recipeAdds = [];
+      window.preciseRowReads = 0;
+      window.preciseRowWrites = 0;
       document.querySelector('#add-ingredients').onclick = () => {
         const dialog = document.createElement('div');
         dialog.className = 'pretty-dialog';dialog.setAttribute('role', 'dialog');
@@ -221,17 +225,46 @@ try {
             row.innerHTML = '<td><span class="gwt-HTML"></span></td><td class="source"></td>';
             row.querySelector('.gwt-HTML').textContent = food.name;row.querySelector('.source').textContent = food.source;
             row.onclick = () => {
-              dialog.innerHTML = '<div class="food-search-name"></div><div class="selected-source"></div><input class="text-box" aria-label="Amount" value="100"><button class="dropdown-btn dropdown-toggle">g</button><button id="scope-add">ADD</button>';
+              const unit = food.source === 'Custom Food' && customServingUnit ? customServingUnit : 'g';
+              dialog.innerHTML = '<div class="food-search-name"></div><div class="selected-source"></div><input class="text-box" aria-label="Amount" value="100"><button class="dropdown-btn dropdown-toggle"></button><button id="scope-add">ADD</button>';
               dialog.querySelector('.food-search-name').textContent = food.name;dialog.querySelector('.selected-source').textContent = food.source;
+              const unitButton = dialog.querySelector('.dropdown-toggle');unitButton.textContent = unit;
+              unitButton.onclick = () => {
+                const menu = document.createElement('div');menu.className = 'dropdown-menu';
+                const option = document.createElement('div');option.className = 'dropdown-item';option.textContent = unit;
+                option.onclick = () => menu.remove();menu.append(option);dialog.append(menu);
+              };
+              if (customServingUnit && food.source === 'Custom Food') {
+                const input = dialog.querySelector('input');
+                input.onblur = () => input.value = (Math.trunc(Number(input.value) * 10000) / 10000).toFixed(4);
+              }
               dialog.querySelector('#scope-add').onclick = () => {
                 const amount = Number(dialog.querySelector('input').value);
                 const added = { name: food.name, source: food.source, amount };
                 window.recipeAdds.push(added);
                 const saved = document.createElement('tr');
-                for (const text of [food.name, food.source, String(amount), 'g', '100', amount + ' g']) {
+                const preciseAmount = storedCustomAmount ?? amount;
+                const displayedAmount = customServingUnit ? preciseAmount.toFixed(2) : String(amount);
+                for (const text of [food.name, food.source, displayedAmount, unit, '100', customServingUnit ? 'Unknown' : amount + ' g']) {
                   const cell = document.createElement('td');cell.textContent = text;saved.append(cell);
                 }
+                if (customServingUnit && !missingAmountEditor) {
+                  const amountCell = saved.children[2];
+                  amountCell.ondblclick = () => {
+                    if (amountCell.querySelector('input')) return;
+                    window.preciseRowReads++;
+                    if (changedReadbackUnit) saved.children[3].textContent = changedReadbackUnit;
+                    const input = document.createElement('input');input.className = 'number-box';input.value = preciseAmount.toFixed(4);
+                    input.oninput = () => window.preciseRowWrites++;
+                    input.onkeydown = (event) => {
+                      if (event.key === 'Enter' || event.key === 'Tab') window.preciseRowWrites++;
+                      if (event.key === 'Escape' && !ignoredReadbackEscape) amountCell.textContent = displayedAmount;
+                    };
+                    amountCell.textContent = '';amountCell.append(input);input.focus();
+                  };
+                }
                 document.querySelector('#recipe-ingredients').append(saved);dialog.remove();
+                if (duplicateCustomRow) document.querySelector('#recipe-ingredients').append(saved.cloneNode(true));
               };
             };
             table.append(row);
@@ -266,6 +299,28 @@ try {
   const missingCustomScope = await __addRecipeIngredientForTests(page, wheyIngredient);
   assert.equal(missingCustomScope.status, 'search_scope_not_selected', JSON.stringify(missingCustomScope));
   assert.deepEqual(await page.evaluate(() => window.recipeSearches), [], 'custom ingredients must not fall back to a different scope');
+
+  const convertedWhey = { ...wheyIngredient, amount: 43 };
+  await mountRecipeSearch({ customServingUnit: '31 g' });
+  const preciseWhey = await __addRecipeIngredientForTests(page, convertedWhey);
+  assert.equal(preciseWhey.status, 'ok', JSON.stringify(preciseWhey));
+  assert.equal(await page.locator('#recipe-ingredients tr').nth(1).locator('td').nth(2).innerText(), '1.39', 'the recipe display deliberately rounds the committed amount');
+  assert.equal(await page.evaluate(() => window.preciseRowReads), 1, 'verification must reopen the added row and read its saved amount');
+  assert.equal(await page.evaluate(() => window.preciseRowWrites), 0, 'precision readback must not type or commit any value');
+  await page.evaluate(() => {
+    const input = document.createElement('input');input.className = 'text-box';input.value = 'Recipe scope fixture';document.body.prepend(input);
+  });
+  const persistedWhey = await __extractCustomRecipeDetailForTests(page);
+  assert.equal(persistedWhey.ingredients[0].amount, 1.387);
+  assert.deepEqual(persistedWhey.ingredients[0].amountReadback, { source: 'row_editor', displayedAmount: 1.39, actualValue: '1.3870' });
+  assert.equal(await page.evaluate(() => window.preciseRowReads), 2, 'saved recipe extraction must independently reread the current row');
+  assert.equal(await page.evaluate(() => window.preciseRowWrites), 0);
+  for (const options of [{ storedCustomAmount: 1.38 }, { missingAmountEditor: true }, { duplicateCustomRow: true }, { changedReadbackUnit: '30 g' }, { ignoredReadbackEscape: true }]) {
+    await mountRecipeSearch({ customServingUnit: '31 g', ...options });
+    const wrongWhey = await __addRecipeIngredientForTests(page, convertedWhey);
+    assert.equal(wrongWhey.status, 'added_ingredient_not_verified', JSON.stringify(wrongWhey));
+    assert.equal(await page.evaluate(() => window.preciseRowWrites), 0, 'failed verification must not repair or commit the value it reads');
+  }
 
   // The ingredient control depends on the widget model, not the visible DOM
   // value. Real typing and blur must commit all recipe fields before adding.
@@ -448,6 +503,53 @@ try {
   assert.equal(await __fillRecipeCookedWeightForTests(page, 0.3, "kg"), true, "the existing weight button must remain editable");
   assert.equal(await page.locator('#set-weight').innerText(), "300 g");
   assert.equal(await __fillRecipeCookedWeightForTests(page, 321, "cups"), false, "unknown weight units must not be silently treated as grams");
+
+  // Retiring a failed draft starts a cold authenticated app. Its shell can
+  // mount after the old 1.2-second delay without requiring credential login.
+  const readinessPage = await browser.newPage();
+  try {
+    let readinessMode = "delayed-shell";
+    let authenticated = false;
+    await readinessPage.route("https://cronometer.com/**", (route) => route.fulfill({
+      contentType: "text/html",
+      body: authenticated
+        ? "<body>Dashboard Diary Foods Custom Recipes CREATE RECIPE Sorted by</body>"
+        : readinessMode === "delayed-shell"
+          ? '<body>Loading...<script>setTimeout(()=>document.body.textContent="Dashboard Diary Foods Custom Recipes CREATE RECIPE Sorted by",2000)</script></body>'
+          : readinessMode === "login"
+            ? "<body>Welcome Back Email Password <button>Log In</button></body>"
+            : "<body>Loading...</body>",
+    }));
+    const readinessProvider = new BrowserCronometerProvider({
+      localChromium: true, writeEnabled: false, requireFoodConfirmation: true,
+      navigationTimeoutMs: 3000, loginBackoffMs: 1000, operationTimeoutMs: 60000,
+      browserRetryCount: 0, timeZone: "Asia/Jerusalem",
+    });
+    let credentialLoginCalls = 0;
+    readinessProvider.login = async () => {
+      credentialLoginCalls++;
+      authenticated = true;
+      await readinessPage.goto("https://cronometer.com/login/");
+    };
+    await readinessProvider.openApp(readinessPage, "#custom-recipes");
+    assert.equal(credentialLoginCalls, 0, "a delayed authenticated shell must not trigger credential login after failed-draft cleanup");
+    assert.equal(await readinessProvider.isLoggedIn(readinessPage), true);
+
+    readinessMode = "login";
+    await readinessPage.goto("about:blank");
+    await readinessProvider.openApp(readinessPage, "#custom-recipes");
+    assert.equal(credentialLoginCalls, 1, "an explicit login page must still use the existing login workflow");
+    assert.equal(await readinessProvider.isLoggedIn(readinessPage), true);
+
+    readinessMode = "unknown";
+    authenticated = false;
+    readinessProvider.config.navigationTimeoutMs = 500;
+    await readinessPage.goto("about:blank");
+    await assert.rejects(readinessProvider.openApp(readinessPage, "#custom-recipes"), /explicit login page.*No credentials were submitted/);
+    assert.equal(credentialLoginCalls, 1, "an unfinished app must fail within its readiness budget without trying credentials");
+  } finally {
+    await readinessPage.close();
+  }
 } finally {
   await browser.close();
 }

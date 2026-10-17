@@ -29,6 +29,7 @@ import {
 } from "../dist/domain.js";
 import { customFoodNutrientLabelForKey } from "../dist/nutrients.js";
 import { gtinCheckDigit, validateBarcode } from "../dist/barcode.js";
+import { comparePrivateRecipe } from "../dist/recipe-semantics.js";
 import {
   FOOD_LOG_MEALS,
   foodLogBatchIdempotencyKey,
@@ -64,6 +65,51 @@ assert.equal(recipeIngredientAmountMatches(2, "2 tbsp", 26, "g", "26.0 g"), true
 assert.equal(recipeIngredientAmountMatches(2, "2 tbsp", 26, "g", "25.0 g"), false);
 assert.equal(recipeIngredientAmountMatches(0.8615, "2 scoops — 65 g", 56, "g"), true);
 assert.equal(recipeIngredientAmountMatches(0.861, "2 scoops — 65 g", 56, "g"), false);
+assert.equal(recipeIngredientAmountMatches(1.387, "31 g", 43, "g"), true);
+assert.equal(recipeIngredientAmountMatches(1.39, "31 g", 43, "g"), false);
+assert.equal(recipeIngredientAmountMatches(1, "kg", 1000, "g"), true);
+assert.equal(recipeIngredientAmountMatches(1000, "grams", 1, "kilogram"), true);
+assert.equal(recipeIngredientAmountMatches(2, "ounces", 56.69904625, "g"), true);
+assert.equal(recipeIngredientAmountMatches(1, "lb", 453.59237, "grams"), true);
+assert.equal(recipeIngredientAmountMatches(1.00005, "kg", 1, "kg"), true);
+assert.equal(recipeIngredientAmountMatches(1.0002, "kg", 1, "kg"), false);
+assert.equal(recipeIngredientAmountMatches(43, "g", 1.387, "31 g"), true);
+assert.equal(recipeIngredientAmountMatches(1, "cup", 1, "g"), false);
+assert.equal(recipeIngredientAmountMatches(undefined, "g", 43, "g", "43 g"), false);
+
+// Reopening a recipe exposes its serving counts and units, which can be
+// equivalent to the requested gram amounts despite their different text.
+const compareRecipeQuantity = (actual, amount = 43, unit = "g") => comparePrivateRecipe({
+  name: "Precise whey recipe",
+  ingredients: [{ query: "Whey", selectedName: "Impact Whey Protein", selectedSource: "Custom Food", amount, unit }],
+}, {
+  name: "Precise whey recipe",
+  ingredientsStatus: "parsed",
+  ingredients: [{ name: "Impact Whey Protein", database: "Custom Food", ...actual }],
+});
+assert.equal(compareRecipeQuantity({ amount: 1.387, unit: "31 g" }).matches, true);
+assert.equal(compareRecipeQuantity({ amount: "1.3870", unit: "31 g" }).matches, true);
+assert.equal(compareRecipeQuantity({ amount: 1.39, unit: "31 g" }).matches, false);
+assert.equal(compareRecipeQuantity({ amount: 0.8615, unit: "2 scoops — 65 g" }, 56).matches, true);
+assert.equal(compareRecipeQuantity({ amount: 0.861, unit: "2 scoops — 65 g" }, 56).matches, false);
+assert.equal(compareRecipeQuantity({ amount: 1, unit: "kg" }, 1000).matches, true);
+assert.equal(compareRecipeQuantity({ amount: 1000, unit: "grams" }, 1, "kg").matches, true);
+assert.equal(compareRecipeQuantity({ amount: 43, unit: "g" }, 1.387, "31 g").matches, true);
+assert.equal(compareRecipeQuantity({ amount: 2, unit: "2 tbsp", weight: "26.0 g" }, 26).matches, true);
+assert.equal(compareRecipeQuantity({ amount: 2, unit: "2 tbsp", weight: "25.0 g" }, 26).matches, false);
+assert.equal(compareRecipeQuantity({ amount: 1.387, unit: "31 g", database: "CRDB" }).matches, false);
+assert.equal(compareRecipeQuantity({ amount: 1.387, unit: "31 g", name: "Other Whey" }).matches, false);
+const unitOnlyRecipe = { name: "Unit only", ingredients: [{ query: "Whey", unit: "g" }] };
+assert.equal(comparePrivateRecipe(unitOnlyRecipe, {
+  name: unitOnlyRecipe.name,
+  ingredientsStatus: "parsed",
+  ingredients: [{ name: "Whey", amount: 43, unit: "grams" }],
+}).matches, true);
+assert.equal(comparePrivateRecipe(unitOnlyRecipe, {
+  name: unitOnlyRecipe.name,
+  ingredientsStatus: "parsed",
+  ingredients: [{ name: "Whey", amount: 1.387, unit: "31 g" }],
+}).matches, false);
 const roundedDiaryServingLog = normalizeFoodLogInput({
   query: "Protein Powder",
   selectedName: "Protein Powder",

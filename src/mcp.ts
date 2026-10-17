@@ -37,7 +37,7 @@ import {
 } from "./oauth.js";
 
 export const MCP_PATH = "/mcp";
-export const MCP_SERVER_VERSION = "0.1.33";
+export const MCP_SERVER_VERSION = "0.1.34";
 export const WIDGET_URI = `ui://widget/cronometer-dashboard-v${MCP_SERVER_VERSION}.html`;
 
 const widgetHtml = readFileSync(new URL("../public/cronometer-widget.html", import.meta.url), "utf8")
