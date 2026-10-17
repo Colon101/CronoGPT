@@ -189,14 +189,15 @@ try {
     await page.setContent(`
       <style>input,button{min-width:100px;min-height:24px}.pretty-dialog{width:700px;min-height:250px}</style>
       <h1>Recipe scope fixture</h1><button id="add-ingredients">ADD INGREDIENTS</button>
-      <table><tbody id="recipe-ingredients"><tr><th>Description</th><th>Database</th><th>Amount</th><th>Unit</th><th>Energy</th><th>Weight</th></tr></tbody></table>
+      <table><tbody id="recipe-ingredients"><tr><th>Description</th><th>Database</th><th id="recipe-amount-header">Amount</th><th>Unit</th><th>Energy</th><th>Weight</th></tr></tbody></table>
     `);
-    await page.evaluate(({ missingScope, ignoredScope, customServingUnit, storedCustomAmount, missingAmountEditor, duplicateCustomRow, changedReadbackUnit, ignoredReadbackEscape }) => {
+    await page.evaluate(({ missingScope, ignoredScope, customServingUnit, storedCustomAmount, missingAmountEditor, duplicateCustomRow, changedReadbackUnit, ignoredReadbackHeader, mutatedAfterHeaderAmount }) => {
       window.stickyFoodScope = "Custom";
       window.recipeSearches = [];
       window.recipeAdds = [];
       window.preciseRowReads = 0;
       window.preciseRowWrites = 0;
+      window.preciseRowKeyPresses = 0;
       document.querySelector('#add-ingredients').onclick = () => {
         const dialog = document.createElement('div');
         dialog.className = 'pretty-dialog';dialog.setAttribute('role', 'dialog');
@@ -243,22 +244,26 @@ try {
                 const added = { name: food.name, source: food.source, amount };
                 window.recipeAdds.push(added);
                 const saved = document.createElement('tr');
-                const preciseAmount = storedCustomAmount ?? amount;
+                let preciseAmount = storedCustomAmount ?? amount;
                 const displayedAmount = customServingUnit ? preciseAmount.toFixed(2) : String(amount);
                 for (const text of [food.name, food.source, displayedAmount, unit, '100', customServingUnit ? 'Unknown' : amount + ' g']) {
                   const cell = document.createElement('td');cell.textContent = text;saved.append(cell);
                 }
                 if (customServingUnit && !missingAmountEditor) {
                   const amountCell = saved.children[2];
-                  amountCell.ondblclick = () => {
+                  amountCell.onclick = () => {
                     if (amountCell.querySelector('input')) return;
                     window.preciseRowReads++;
                     if (changedReadbackUnit) saved.children[3].textContent = changedReadbackUnit;
                     const input = document.createElement('input');input.className = 'number-box';input.value = preciseAmount.toFixed(4);
                     input.oninput = () => window.preciseRowWrites++;
-                    input.onkeydown = (event) => {
-                      if (event.key === 'Enter' || event.key === 'Tab') window.preciseRowWrites++;
-                      if (event.key === 'Escape' && !ignoredReadbackEscape) amountCell.textContent = displayedAmount;
+                    input.onkeydown = () => window.preciseRowKeyPresses++;
+                    // The real widget ignores Escape, Enter, Tab and ordinary
+                    // blur. Only its own Amount column header ends this edit.
+                    document.querySelector('#recipe-amount-header').onclick = () => {
+                      if (ignoredReadbackHeader) return;
+                      if (mutatedAfterHeaderAmount !== undefined) preciseAmount = mutatedAfterHeaderAmount;
+                      amountCell.textContent = displayedAmount;
                     };
                     amountCell.textContent = '';amountCell.append(input);input.focus();
                   };
@@ -305,21 +310,23 @@ try {
   const preciseWhey = await __addRecipeIngredientForTests(page, convertedWhey);
   assert.equal(preciseWhey.status, 'ok', JSON.stringify(preciseWhey));
   assert.equal(await page.locator('#recipe-ingredients tr').nth(1).locator('td').nth(2).innerText(), '1.39', 'the recipe display deliberately rounds the committed amount');
-  assert.equal(await page.evaluate(() => window.preciseRowReads), 1, 'verification must reopen the added row and read its saved amount');
-  assert.equal(await page.evaluate(() => window.preciseRowWrites), 0, 'precision readback must not type or commit any value');
+  assert.equal(await page.evaluate(() => window.preciseRowReads), 2, 'verification must reopen the added row and confirm its saved amount survives unchanged header closure');
+  assert.equal(await page.evaluate(() => window.preciseRowWrites), 0, 'precision readback must not type or submit any value');
+  assert.equal(await page.evaluate(() => window.preciseRowKeyPresses), 0, 'precision readback must use the actual row and same-table header UI, without keyboard guesses');
   await page.evaluate(() => {
     const input = document.createElement('input');input.className = 'text-box';input.value = 'Recipe scope fixture';document.body.prepend(input);
   });
   const persistedWhey = await __extractCustomRecipeDetailForTests(page);
   assert.equal(persistedWhey.ingredients[0].amount, 1.387);
   assert.deepEqual(persistedWhey.ingredients[0].amountReadback, { source: 'row_editor', displayedAmount: 1.39, actualValue: '1.3870' });
-  assert.equal(await page.evaluate(() => window.preciseRowReads), 2, 'saved recipe extraction must independently reread the current row');
+  assert.equal(await page.evaluate(() => window.preciseRowReads), 4, 'saved recipe extraction must independently reread the current row and confirm unchanged header closure');
   assert.equal(await page.evaluate(() => window.preciseRowWrites), 0);
-  for (const options of [{ storedCustomAmount: 1.38 }, { missingAmountEditor: true }, { duplicateCustomRow: true }, { changedReadbackUnit: '30 g' }, { ignoredReadbackEscape: true }]) {
+  for (const options of [{ storedCustomAmount: 1.38 }, { missingAmountEditor: true }, { duplicateCustomRow: true }, { changedReadbackUnit: '30 g' }, { ignoredReadbackHeader: true }, { mutatedAfterHeaderAmount: 1.38 }]) {
     await mountRecipeSearch({ customServingUnit: '31 g', ...options });
     const wrongWhey = await __addRecipeIngredientForTests(page, convertedWhey);
     assert.equal(wrongWhey.status, 'added_ingredient_not_verified', JSON.stringify(wrongWhey));
     assert.equal(await page.evaluate(() => window.preciseRowWrites), 0, 'failed verification must not repair or commit the value it reads');
+    assert.equal(await page.evaluate(() => window.preciseRowKeyPresses), 0);
   }
 
   // The ingredient control depends on the widget model, not the visible DOM

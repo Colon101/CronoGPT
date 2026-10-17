@@ -10734,6 +10734,14 @@ async function readRecipeIngredientRowAmount(page: Page, name: string, source?: 
   if (await row.count().catch(() => 0) !== 1) return undefined;
   const cells = row.locator(":scope > td");
   if (await cells.count().catch(() => 0) < 6) return undefined;
+  const table = row.locator("xpath=ancestor::table[1]");
+  const header = table.locator("tr").filter({ has: page.getByText(/^Description$/i, { exact: true }) })
+    .filter({ has: page.getByText(/^(Database|Source)$/i, { exact: true }) })
+    .filter({ has: page.getByText(/^Amount$/i, { exact: true }) });
+  if (await header.count().catch(() => 0) !== 1) return undefined;
+  const headerCells = header.locator(":scope > td, :scope > th");
+  if (await headerCells.count().catch(() => 0) < 6 || !/^Amount$/i.test((await headerCells.nth(2).innerText()).trim())) return undefined;
+  const amountHeader = headerCells.nth(2);
   const amountCell = cells.nth(2);
   const editor = amountCell.locator("input:visible");
   const originalDisplay = await amountCell.innerText().catch(() => "");
@@ -10741,29 +10749,38 @@ async function readRecipeIngredientRowAmount(page: Page, name: string, source?: 
   const rowIdentityMatches = async () => recipeIngredientSourceMatches(await cells.nth(1).innerText().catch(() => ""), source)
     && normalize(await cells.nth(3).innerText().catch(() => "")) === normalize(unit ?? "");
   if (!(await rowIdentityMatches())) return undefined;
-  let precise: { amount: number; actualValue: string } | undefined;
-  let editorClosed = false;
-  try {
-    await amountCell.dblclick({ timeout: 1500 });
-    await editor.first().waitFor({ state: "visible", timeout: 900 });
-    if (await editor.count() === 1 && await rowIdentityMatches()) {
-      const actualValue = await editor.inputValue();
-      const amount = Number(actualValue.trim());
-      if (actualValue.trim() && Number.isFinite(amount) && amount > 0) precise = { amount, actualValue };
+  const inspect = async () => {
+    let precise: { amount: number; actualValue: string } | undefined;
+    let editorClosed = false;
+    try {
+      await amountCell.click({ timeout: 1500 });
+      await editor.first().waitFor({ state: "visible", timeout: 900 });
+      if (await editor.count() === 1 && await rowIdentityMatches()) {
+        const actualValue = await editor.inputValue();
+        const amount = Number(actualValue.trim());
+        if (actualValue.trim() && Number.isFinite(amount) && amount > 0) precise = { amount, actualValue };
+      }
+    } catch {
+      precise = undefined;
+    } finally {
+      // Cronometer ignores Escape, Enter and ordinary blur here. Clicking the
+      // Amount header in this same table closes the editor without changing
+      // its value or opening the source-cell replacement dialog.
+      if (await editor.count().catch(() => 0) > 0) {
+        await amountHeader.click({ timeout: 1000 }).catch(() => undefined);
+      }
+      editorClosed = await editor.first().waitFor({ state: "hidden", timeout: 900 }).then(() => true).catch(() => false);
     }
-  } catch {
-    precise = undefined;
-  } finally {
-    // Cancel the editor unchanged. Never fill or commit this readback editor,
-    // or use the rounded display amount as a replacement value.
-    if (await editor.count().catch(() => 0) > 0) {
-      await editor.first().press("Escape", { timeout: 1000 }).catch(() => undefined);
-    }
-    editorClosed = await editor.first().waitFor({ state: "hidden", timeout: 900 }).then(() => true).catch(() => false);
-  }
-  const unchanged = editorClosed && await row.count().catch(() => 0) === 1 && await rowIdentityMatches()
-    && await amountCell.innerText().catch(() => "") === originalDisplay;
-  return unchanged ? precise : undefined;
+    const unchanged = editorClosed && await row.count().catch(() => 0) === 1 && await rowIdentityMatches()
+      && await amountCell.innerText().catch(() => "") === originalDisplay;
+    return unchanged ? precise : undefined;
+  };
+  const first = await inspect();
+  if (!first) return undefined;
+  // Reopen after closure to prove that leaving the editor retained its exact
+  // quantity rather than writing the rounded two-decimal display value.
+  const second = await inspect();
+  return second && Math.abs(second.amount - first.amount) <= 0.000000001 ? second : undefined;
 }
 
 async function recipeIngredientSelectedPanel(page: Page, selectedName?: string) {
