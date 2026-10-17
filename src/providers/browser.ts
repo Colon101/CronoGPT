@@ -2681,12 +2681,25 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
 
   async listCustomRecipes(input: CustomFoodListInput = {}) {
     return this.withPage("list_custom_recipes", async (page) => {
+      const startedAt = Date.now();
+      const trace = (step: string, details: Record<string, unknown> = {}) => {
+        try {
+          console.log(JSON.stringify({ feature: "list_custom_recipes", step, elapsedMs: Date.now() - startedAt, ...details }));
+        } catch {
+          // Diagnostics must never affect recipe reads.
+        }
+      };
+      trace("open_app_start");
       await this.openApp(page, "#custom-recipes");
+      trace("open_app_done");
       const rawText = await waitForCustomItemListText(page, "Custom Recipes", this.config.navigationTimeoutMs);
       const names = filterCustomItemNames(parseCustomItemListNames(rawText, "Custom Recipes"), input.query);
+      trace("list_ready", { matchingNameCount: names.length });
       const includeDetails = input.includeDetails === true;
       const maxDetails = Math.max(0, Math.min(input.maxDetails ?? 10, 25));
+      trace("details_start", { includeDetails, maxDetails, requestedDetailCount: includeDetails ? Math.min(names.length, maxDetails) : 0 });
       const details = includeDetails ? await customRecipeDetailsForNames(page, names, maxDetails) : [];
+      trace("details_done", { detailCount: details.length });
       return this.result("list_custom_recipes", "ok", {
         query: input.query,
         count: names.length,
@@ -2853,16 +2866,20 @@ export class BrowserCronometerProvider extends BaseCronometerProvider {
         await page.waitForTimeout(1200);
         await clickOptionalSaveConfirmation(page).catch(() => false);
         await page.waitForTimeout(1000);
-        trace("extract_final_detail_start");
-        finalDetail = await extractCustomRecipeDetailWithRetry(page, 4, 350).catch(() => undefined);
+        // A saved-looking draft is not evidence of persistence. Reload and
+        // reopen the exact saved recipe before verifying any recipe fields.
+        trace("persisted_recipe_reopen_start");
+        await page.reload();
+        await this.openApp(page, "#custom-recipes");
+        const reopened = await resolveCustomRecipeTargets(page, { name: input.name }, { maxDetails: 1, timeoutMs: this.config.navigationTimeoutMs });
+        const exactNameCount = reopened.names.filter((name) => name.toLowerCase() === input.name.trim().toLowerCase()).length;
+        listVerified = exactNameCount === 1 && reopened.targets.length === 1;
+        finalDetail = listVerified ? reopened.targets[0] : undefined;
         postSaveText = await this.visibleText(page).catch(() => "");
-        trace("extract_final_detail_done", { finalDetailName: finalDetail?.name, hasPostSaveText: Boolean(postSaveText) });
-        trace("list_verify_start");
-        listVerified = await customRecipeExistsInList(page, input.name, this.config.navigationTimeoutMs).catch(() => false);
-        trace("list_verify_done", { listVerified });
+        trace("persisted_recipe_reopen_done", { listVerified, exactNameCount, hasFinalDetail: Boolean(finalDetail) });
       }
 
-      const editorVerified = Boolean(finalDetail?.name.toLowerCase() === input.name.toLowerCase() || textHasFoodName(postSaveText, input.name));
+      const editorVerified = finalDetail?.name.toLowerCase() === input.name.trim().toLowerCase();
       const servingsVerified = recipeServingsVerified(finalDetail, input);
       const ingredientsVerified = recipeIngredientsVerified(finalDetail, addedIngredients);
       const basicsVerified = basicsVerifiedBeforeSave;
@@ -10284,6 +10301,22 @@ async function addRecipeIngredient(page: Page, ingredient: RecipeInput["ingredie
     return { status: "search_input_not_found", warning: "Ingredient search input was not found.", editorDebug: await recipeIngredientEditorDebug(page) };
   }
 
+  // Cronometer remembers the last food-search tab across dialog openings.
+  // Resolve each ingredient against its requested source instead of inheriting
+  // a preceding custom-food lookup's Custom tab.
+  const searchScope = normalizeSource(ingredient.selectedSource).includes("custom") ? "Custom" : "All";
+  options.trace?.("ingredient_search_scope_start", { searchScope });
+  const scopeSelected = await selectRecipeIngredientSearchScope(page, searchScope);
+  options.trace?.("ingredient_search_scope_done", { searchScope, scopeSelected });
+  if (!scopeSelected) {
+    return {
+      status: "search_scope_not_selected",
+      warning: `The ${searchScope} ingredient search scope could not be selected. No ingredient search or add was attempted.`,
+      searchScope,
+      editorDebug: await recipeIngredientEditorDebug(page),
+    };
+  }
+
   const searchText = ingredient.selectedName ?? ingredient.query;
   options.trace?.("ingredient_search_submit_start");
   const searchResults = await searchCurrentFoodDialog(page, searchText, 20);
@@ -10380,6 +10413,31 @@ async function addRecipeIngredient(page: Page, ingredient: RecipeInput["ingredie
   };
 
   return { status: "ok", selectedCandidate, amount, unit, convertedAmount, addVerified };
+}
+
+export async function __addRecipeIngredientForTests(page: Page, ingredient: RecipeInput["ingredients"][number]) {
+  return addRecipeIngredient(page, ingredient);
+}
+
+async function selectRecipeIngredientSearchScope(page: Page, scope: "All" | "Custom") {
+  if (!(await clickFoodDialogFilter(page, scope))) return false;
+  // GWT versions expose selection through either ARIA or selected/down
+  // classes. When that state is available, an ignored click must fail closed.
+  return activeDialog(page).evaluate((dialog, expected) => {
+    const visible = (element: Element) => {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    };
+    const filters = Array.from(dialog.querySelectorAll("button,[role='tab'],.gwt-TabBarItem,.gwt-ToggleButton"))
+      .filter(visible)
+      .filter((element) => /^(All|Custom|Favorites)$/i.test((element.textContent ?? "").trim()));
+    const selected = filters.filter((element) => element.getAttribute("aria-selected") === "true"
+      || element.getAttribute("aria-pressed") === "true"
+      || /(?:^|[-_\s])(active|selected|down)(?:$|[-_\s])/i.test(String(element.className)));
+    const exposesState = selected.length > 0 || filters.some((element) => element.hasAttribute("aria-selected") || element.hasAttribute("aria-pressed"));
+    return !exposesState || selected.some((element) => (element.textContent ?? "").trim().toLowerCase() === expected.toLowerCase());
+  }, scope).catch(() => false);
 }
 
 async function recipeIngredientEditorDebug(page: Page) {

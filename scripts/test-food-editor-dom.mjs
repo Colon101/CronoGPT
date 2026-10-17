@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { chromium } from "playwright-core";
 import {
+  __addRecipeIngredientForTests,
   __closeFoodDialogForTests,
   __dismissSavedItemSuccessNoticeForTests,
   __clickFoodSearchResultForTests,
@@ -178,6 +179,93 @@ try {
   const lateIngredients = await __searchCurrentFoodDialogForTests(page,"Banana",20);
   assert.deepEqual(lateIngredients.map(({name,source})=>({name,source})),[{name:"Banana",source:"NCCDB"}]);
   assert.equal(await page.evaluate(()=>window.ingredientSearchSubmissions),1);
+
+  // Food-search tabs persist across dialog openings. Recipe ingredients must
+  // switch away from a stale Custom tab for official foods, then switch back
+  // for a pinned custom food without changing the selected source.
+  const mountRecipeSearch = async (options = {}) => {
+    await page.setContent(`
+      <style>input,button{min-width:100px;min-height:24px}.pretty-dialog{width:700px;min-height:250px}</style>
+      <h1>Recipe scope fixture</h1><button id="add-ingredients">ADD INGREDIENTS</button>
+      <table><tbody id="recipe-ingredients"><tr><th>Description</th><th>Database</th><th>Amount</th><th>Unit</th><th>Energy</th><th>Weight</th></tr></tbody></table>
+    `);
+    await page.evaluate(({ missingScope, ignoredScope }) => {
+      window.stickyFoodScope = "Custom";
+      window.recipeSearches = [];
+      window.recipeAdds = [];
+      document.querySelector('#add-ingredients').onclick = () => {
+        const dialog = document.createElement('div');
+        dialog.className = 'pretty-dialog';dialog.setAttribute('role', 'dialog');
+        dialog.innerHTML = '<div>Add Ingredients</div><div role="tablist"></div><input placeholder="Search all foods"><button id="scope-search">SEARCH</button><div class="results-container"><table class="crono-table"><tbody></tbody></table></div>';
+        document.body.append(dialog);
+        for (const scope of ['All', 'Custom', 'Favorites'].filter((scope) => scope !== missingScope)) {
+          const button = document.createElement('button');button.setAttribute('role', 'tab');button.textContent = scope;
+          button.setAttribute('aria-selected', String(scope === window.stickyFoodScope));
+          button.onclick = () => {
+            if (scope === ignoredScope) return;
+            window.stickyFoodScope = scope;
+            dialog.querySelectorAll('[role="tab"]').forEach((tab) => tab.setAttribute('aria-selected', String(tab.textContent === scope)));
+          };
+          dialog.querySelector('[role="tablist"]').append(button);
+        }
+        dialog.querySelector('#scope-search').onclick = () => {
+          const query = dialog.querySelector('input').value;
+          window.recipeSearches.push({ scope: window.stickyFoodScope, query });
+          const foods = window.stickyFoodScope === 'Custom'
+            ? [{ name: 'Impact Whey Protein', source: 'Custom Food' }]
+            : [{ name: 'Milk, 1% Fat, Lowfat', source: 'CRDB' }, { name: 'Milk, 1% Fat, Lowfat', source: 'NCCDB' }];
+          const table = dialog.querySelector('tbody');
+          table.innerHTML = '<tr class="table-header"><td>Description</td><td>Source</td></tr>';
+          for (const food of foods) {
+            const row = document.createElement('tr');
+            row.innerHTML = '<td><span class="gwt-HTML"></span></td><td class="source"></td>';
+            row.querySelector('.gwt-HTML').textContent = food.name;row.querySelector('.source').textContent = food.source;
+            row.onclick = () => {
+              dialog.innerHTML = '<div class="food-search-name"></div><div class="selected-source"></div><input class="text-box" aria-label="Amount" value="100"><button class="dropdown-btn dropdown-toggle">g</button><button id="scope-add">ADD</button>';
+              dialog.querySelector('.food-search-name').textContent = food.name;dialog.querySelector('.selected-source').textContent = food.source;
+              dialog.querySelector('#scope-add').onclick = () => {
+                const amount = Number(dialog.querySelector('input').value);
+                const added = { name: food.name, source: food.source, amount };
+                window.recipeAdds.push(added);
+                const saved = document.createElement('tr');
+                for (const text of [food.name, food.source, String(amount), 'g', '100', amount + ' g']) {
+                  const cell = document.createElement('td');cell.textContent = text;saved.append(cell);
+                }
+                document.querySelector('#recipe-ingredients').append(saved);dialog.remove();
+              };
+            };
+            table.append(row);
+          }
+        };
+      };
+    }, options);
+  };
+  const milkIngredient = { query: 'lowfat milk', selectedName: 'Milk, 1% Fat, Lowfat', selectedSource: 'NCCDB', amount: 300, unit: 'g' };
+  const wheyIngredient = { query: 'whey', selectedName: 'Impact Whey Protein', selectedSource: 'Custom Food', amount: 60, unit: 'g' };
+  await mountRecipeSearch();
+  const milkAdded = await __addRecipeIngredientForTests(page, milkIngredient);
+  assert.equal(milkAdded.status, 'ok', JSON.stringify(milkAdded));
+  const wheyAdded = await __addRecipeIngredientForTests(page, wheyIngredient);
+  assert.equal(wheyAdded.status, 'ok', JSON.stringify(wheyAdded));
+  assert.deepEqual(await page.evaluate(() => window.recipeSearches), [
+    { scope: 'All', query: milkIngredient.selectedName },
+    { scope: 'Custom', query: wheyIngredient.selectedName },
+  ]);
+  assert.deepEqual(await page.evaluate(() => window.recipeAdds), [
+    { name: milkIngredient.selectedName, source: 'NCCDB', amount: 300 },
+    { name: wheyIngredient.selectedName, source: 'Custom Food', amount: 60 },
+  ]);
+  for (const options of [{ missingScope: 'All' }, { ignoredScope: 'All' }]) {
+    await mountRecipeSearch(options);
+    const blocked = await __addRecipeIngredientForTests(page, milkIngredient);
+    assert.equal(blocked.status, 'search_scope_not_selected', JSON.stringify(blocked));
+    assert.deepEqual(await page.evaluate(() => window.recipeSearches), [], 'an unavailable or unchanged scope must prevent searching');
+    assert.deepEqual(await page.evaluate(() => window.recipeAdds), [], 'a failed scope selection must not add an ingredient');
+  }
+  await mountRecipeSearch({ missingScope: 'Custom' });
+  const missingCustomScope = await __addRecipeIngredientForTests(page, wheyIngredient);
+  assert.equal(missingCustomScope.status, 'search_scope_not_selected', JSON.stringify(missingCustomScope));
+  assert.deepEqual(await page.evaluate(() => window.recipeSearches), [], 'custom ingredients must not fall back to a different scope');
 
   // The ingredient control depends on the widget model, not the visible DOM
   // value. Real typing and blur must commit all recipe fields before adding.
